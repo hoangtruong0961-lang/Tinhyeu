@@ -222,7 +222,7 @@ public class VieNeuPlugin extends Plugin {
         int maxFrames = call.getInt("maxFrames", 250);
 
         Long seed = null;
-        if (call.hasOption("seed") && !call.isNull("seed")) {
+        if (call.hasOption("seed") && !call.getData().isNull("seed")) {
             seed = call.getLong("seed");
         }
 
