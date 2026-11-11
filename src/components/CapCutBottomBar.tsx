@@ -2185,13 +2185,17 @@ export const CapCutBottomBar: React.FC<CapCutBottomBarProps> = ({
                           : "Xin chào, đây là giọng đọc thử nghiệm với tốc độ và cao độ tùy chỉnh.";
                         const activeVoice = selectedTtsProvider === 'capcut_tts'
                           ? selectedCapcutVoice
-                          : (selectedTtsProvider === 'edge_tts'
-                              ? (appSettings.edgeVoice || 'vi-VN-HoaiMyNeural')
-                              : (selectedTtsProvider === 'nghi_tts'
-                                  ? (appSettings.nghiVoice || 'lacphi')
-                                  : (appSettings.tiktokVoice || 'BV074_streaming')));
+                          : (selectedTtsProvider === 'vieneu_tts'
+                              ? (appSettings.vieneuVoice || 'Minh Đức')
+                              : (selectedTtsProvider === 'edge_tts'
+                                  ? (appSettings.edgeVoice || 'vi-VN-HoaiMyNeural')
+                                  : (selectedTtsProvider === 'nghi_tts'
+                                      ? (appSettings.nghiVoice || 'lacphi')
+                                      : (appSettings.tiktokVoice || 'BV074_streaming'))));
                         try {
                           await onPlayTTS(sampleText, ttsSpeed, ttsPitch, selectedTtsProvider, activeVoice);
+                        } catch (auditionErr) {
+                          console.error('[CapCutBottomBar Audition Failure]', auditionErr);
                         } finally {
                           setTimeout(() => setIsTestingTts(false), 800);
                         }

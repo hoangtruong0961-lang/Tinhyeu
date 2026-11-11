@@ -48,12 +48,15 @@ import { CapCutBottomBar } from './CapCutBottomBar';
 import { SubtitleList } from './SubtitleList';
 import { ExportModal } from './ExportModal';
 import { TopExportSettingsDropdown } from './TopExportSettingsDropdown';
+import { TtsErrorModal, TtsErrorInfo } from './TtsErrorModal';
+import { VieNeuModelDownloadModal } from './VieNeuModelDownloadModal';
+import { diagnoseTtsError } from '../utils/ttsErrorDiagnoser';
+import { VieNeuNative } from '../plugins/vieneuPlugin';
+import { convertTextToTokenIds } from '../utils/vieneuTextProcessor';
+import { Capacitor } from '@capacitor/core';
 import { HelpModal } from './HelpModal';
 import { ConfigView } from './ConfigView';
 import { ExportSettingsConfig } from '../types';
-import { Capacitor } from '@capacitor/core';
-import { VieNeuNative } from '../plugins/vieneuPlugin';
-import { convertTextToTokenIds } from '../utils/vieneuTextProcessor';
 
 interface CapCutEditorViewProps {
   project: Project;
@@ -292,6 +295,18 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
 
   // Target Language
   const [targetLang, setTargetLang] = useState<string>(project.targetLang || 'Tiếng Việt');
+
+  // TTS Audition Error Diagnostics & VieNeu Modal State
+  const [ttsErrorInfo, setTtsErrorInfo] = useState<TtsErrorInfo | null>(null);
+  const [isTtsErrorModalOpen, setIsTtsErrorModalOpen] = useState(false);
+  const [isVieNeuModalOpen, setIsVieNeuModalOpen] = useState(false);
+  const [lastTtsRetryParams, setLastTtsRetryParams] = useState<{
+    text: string;
+    speed?: number;
+    pitch?: number;
+    providerOverride?: TTSProviderOption;
+    voiceOverride?: string;
+  } | null>(null);
 
   // Style Config with persisted user font preferences
   const [styleConfig, setStyleConfig] = useState<SubtitleStyleConfig>(() => {
@@ -2721,19 +2736,30 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
     speed: number,
     provider: TTSProviderOption,
     voiceOverride?: string
-  ): Promise<string | null> => {
+  ): Promise<{ b64: string | null; error?: any; httpStatus?: number; rawResponse?: string }> => {
     try {
       const currentSettings = appSettingsRef.current || appSettings;
       const actualProvider = provider || currentSettings.ttsProvider || 'capcut_tts';
+      const voiceName = (actualProvider === 'vieneu_tts' && voiceOverride)
+        ? voiceOverride
+        : (actualProvider === 'vieneu_tts' ? (currentSettings.vieneuVoice || 'Minh Đức') : voiceOverride || '');
 
       // Native Android VieNeu-TTS v3 Turbo Offline Synthesis
       if (actualProvider === 'vieneu_tts' && Capacitor.isNativePlatform()) {
         try {
-          const voiceName = (provider === 'vieneu_tts' && voiceOverride) ? voiceOverride : (currentSettings.vieneuVoice || 'Minh Đức');
+          const st = await VieNeuNative.checkStatus().catch(() => null);
+          if (st && !st.isReady) {
+            console.error('[VieNeu Native TTS Error] Models not ready on device:', st);
+            return {
+              b64: null,
+              error: new Error('Mô hình VieNeu-TTS v3 Turbo offline (~147 MB) chưa được nạp/tải về máy Android.'),
+            };
+          }
+
           const tokenIds = await convertTextToTokenIds(textChunk);
           const synRes = await VieNeuNative.synthesize({
             tokenIds,
-            voiceName,
+            voiceName: voiceName || 'Minh Đức',
             temperature: 0.8,
             topP: 0.95,
             repPenalty: 1.2,
@@ -2743,19 +2769,23 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
             const webUrl = Capacitor.convertFileSrc(synRes.audioPath);
             const aRes = await fetch(webUrl);
             const blob = await aRes.blob();
-            return await new Promise<string>((resolve, reject) => {
+            const b64 = await new Promise<string>((resolve, reject) => {
               const reader = new FileReader();
               reader.onloadend = () => {
                 const dataUrl = reader.result as string;
-                const b64 = dataUrl.includes(',') ? dataUrl.split(',')[1] : dataUrl;
-                resolve(b64);
+                const base64Str = dataUrl.includes(',') ? dataUrl.split(',')[1] : dataUrl;
+                resolve(base64Str);
               };
               reader.onerror = reject;
               reader.readAsDataURL(blob);
             });
+            return { b64 };
+          } else {
+            return { b64: null, error: new Error('Không nhận được đường dẫn tệp âm thanh từ VieNeu Native Engine') };
           }
-        } catch (nativeErr) {
-          console.warn('[VieNeu Native TTS Synthesis Exception - falling back to server preview]', nativeErr);
+        } catch (nativeErr: any) {
+          console.error('[VieNeu Native TTS Synthesis Exception]', nativeErr);
+          return { b64: null, error: nativeErr };
         }
       }
 
@@ -2790,12 +2820,17 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
       try {
         data = JSON.parse(rawText);
       } catch {
-        console.warn('[Chunk TTS Server Response Error]', res.status, rawText.slice(0, 150));
-        return null;
+        console.error('[Chunk TTS Server Response Parse Error]', res.status, rawText.slice(0, 200));
+        return {
+          b64: null,
+          httpStatus: res.status,
+          rawResponse: rawText,
+          error: new Error(`Phản hồi từ server không phải định dạng JSON hợp lệ (Mã HTTP ${res.status})`),
+        };
       }
 
       if (!res.ok || !data.success || !data.audioBase64) {
-        console.warn('[Chunk TTS Primary Failed - Retrying Edge TTS Fallback]', res.status, data.error || data.message || rawText.slice(0, 150));
+        console.warn('[Chunk TTS Primary Failed - Attempting Fallback]', res.status, data.error || data.message || rawText.slice(0, 150));
         const fbRes = await fetch('/api/tts', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -2808,35 +2843,21 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
         });
         const fbData = await fbRes.json().catch(() => ({}));
         if (fbData && fbData.audioBase64) {
-          return fbData.audioBase64;
+          return { b64: fbData.audioBase64 };
         }
-        return null;
+        return {
+          b64: null,
+          httpStatus: res.status,
+          rawResponse: rawText,
+          error: new Error(data.error || data.message || `Lỗi HTTP ${res.status} từ máy chủ giọng đọc`),
+        };
       }
 
-      if (data.audioBase64) {
-        return data.audioBase64;
-      }
-    } catch (e) {
-      console.warn('Error fetching chunk TTS, trying fallback:', e);
-      try {
-        const currentSettings = appSettingsRef.current || appSettings;
-        const fbRes = await fetch('/api/tts', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            text: textChunk,
-            provider: 'edge_tts',
-            edgeVoice: currentSettings.edgeVoice || 'vi-VN-HoaiMyNeural',
-            ttsSpeed: speed,
-          }),
-        });
-        const fbData = await fbRes.json().catch(() => ({}));
-        if (fbData && fbData.audioBase64) {
-          return fbData.audioBase64;
-        }
-      } catch (_) {}
+      return { b64: data.audioBase64 };
+    } catch (e: any) {
+      console.error('Error fetching chunk TTS:', e);
+      return { b64: null, error: e };
     }
-    return null;
   };
 
   const handlePlayTTS = async (
@@ -2847,6 +2868,9 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
     voiceOverride?: string
   ) => {
     if (!text || !text.trim()) return;
+
+    // Save retry parameters
+    setLastTtsRetryParams({ text, speed, pitch, providerOverride, voiceOverride });
 
     // Cancel previous playback pipeline
     if (activeAudioSourceRef.current) {
@@ -2860,32 +2884,50 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
 
     const currentSettings = appSettingsRef.current || appSettings;
     const provider = providerOverride || currentSettings.ttsProvider || 'capcut_tts';
+    const voiceName = voiceOverride || (
+      provider === 'vieneu_tts'
+        ? (currentSettings.vieneuVoice || 'Minh Đức')
+        : (provider === 'capcut_tts' ? (currentSettings.capcutVoice || 'BV074_streaming') : 'MacDinh')
+    );
+
     const chunks = splitTextIntoSentenceChunks(text);
-
     if (chunks.length === 0) return;
-
-    let hasError = false;
 
     // Single short sentence: simple immediate fetch & play
     if (chunks.length === 1) {
-      const b64 = await fetchChunkAudioBase64(chunks[0], speed, provider, voiceOverride);
+      const fetchRes = await fetchChunkAudioBase64(chunks[0], speed, provider, voiceOverride);
       if (ttsPipelineIdRef.current !== currentPipelineId) return;
-      if (b64) {
-        await playBase64AudioWithControls(b64, speed, pitch);
-      } else if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+
+      if (fetchRes.b64) {
+        await playBase64AudioWithControls(fetchRes.b64, speed, pitch);
+      } else if (typeof window !== 'undefined' && 'speechSynthesis' in window && provider === 'browser') {
         const utterance = new SpeechSynthesisUtterance(chunks[0]);
         utterance.rate = Math.max(0.5, Math.min(2.0, speed));
         utterance.pitch = Math.max(0.5, Math.min(1.5, 1 + pitch / 10));
         utterance.lang = 'vi-VN';
         window.speechSynthesis.speak(utterance);
       } else {
-        console.warn(`[TTS Error] Cannot generate audio with ${provider}`);
-        alert(`Lỗi: Không thể tạo giọng đọc với nhà cung cấp ${provider}. Vui lòng thử lại hoặc chọn giọng đọc khác.`);
+        // Detailed error diagnoser modal instead of generic unhelpful alert!
+        const diagInfo = await diagnoseTtsError({
+          provider,
+          voiceName,
+          textSnippet: text,
+          error: fetchRes.error,
+          httpStatus: fetchRes.httpStatus,
+          rawResponseBody: fetchRes.rawResponse,
+        });
+        setTtsErrorInfo(diagInfo);
+        setIsTtsErrorModalOpen(true);
       }
       return;
     }
 
-    // Paragraph Chunking Pipeline: Render Chunk 1 -> Play Chunk 1 while pre-rendering Chunk 2 in background
+    // Paragraph Chunking Pipeline
+    let lastError: any = null;
+    let lastHttpStatus: number | undefined = undefined;
+    let lastRawResp: string | undefined = undefined;
+    let hasFailedChunk = false;
+
     const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
     const audioCtx = new AudioCtx();
     if (audioCtx.state === 'suspended') {
@@ -2901,10 +2943,15 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
       }
 
       const promise = (async () => {
-        const b64 = await fetchChunkAudioBase64(chunks[index], speed, provider, voiceOverride);
-        if (!b64 || ttsPipelineIdRef.current !== currentPipelineId) return null;
+        const fetchRes = await fetchChunkAudioBase64(chunks[index], speed, provider, voiceOverride);
+        if (!fetchRes.b64 || ttsPipelineIdRef.current !== currentPipelineId) {
+          if (fetchRes.error) lastError = fetchRes.error;
+          if (fetchRes.httpStatus) lastHttpStatus = fetchRes.httpStatus;
+          if (fetchRes.rawResponse) lastRawResp = fetchRes.rawResponse;
+          return null;
+        }
         try {
-          const binaryStr = atob(b64);
+          const binaryStr = atob(fetchRes.b64);
           const len = binaryStr.length;
           const bytes = new Uint8Array(len);
           for (let k = 0; k < len; k++) {
@@ -2913,6 +2960,7 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
           return await audioCtx.decodeAudioData(bytes.buffer);
         } catch (e) {
           console.warn(`Failed to decode chunk ${index}:`, e);
+          lastError = e;
           return null;
         }
       })();
@@ -2921,14 +2969,12 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
       return promise;
     };
 
-    // Immediately start pre-fetching Chunk 0 & Chunk 1 in parallel
     getOrFetchChunkBuffer(0);
     getOrFetchChunkBuffer(1);
 
     for (let i = 0; i < chunks.length; i++) {
       if (ttsPipelineIdRef.current !== currentPipelineId) break;
 
-      // Pipeline trigger for next chunks
       if (i + 1 < chunks.length) getOrFetchChunkBuffer(i + 1);
       if (i + 2 < chunks.length) getOrFetchChunkBuffer(i + 2);
 
@@ -2951,29 +2997,22 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
           source.start(0);
           activeAudioSourceRef.current = source;
         });
-      } else if (provider === 'browser') {
-        // SpeechSynthesis for browser provider only
-        await new Promise<void>((resolve) => {
-          if (ttsPipelineIdRef.current !== currentPipelineId) {
-            resolve();
-            return;
-          }
-          const utterance = new SpeechSynthesisUtterance(chunks[i]);
-          utterance.rate = Math.max(0.5, Math.min(2.0, speed));
-          utterance.pitch = Math.max(0.5, Math.min(1.5, 1 + pitch / 10));
-          utterance.lang = 'vi-VN';
-          utterance.onend = () => resolve();
-          utterance.onerror = () => resolve();
-          window.speechSynthesis.speak(utterance);
-        });
       } else {
-        hasError = true;
-        console.warn(`[TTS Error] Segment ${i} failed for provider: ${provider}`);
+        hasFailedChunk = true;
       }
     }
 
-    if (hasError && ttsPipelineIdRef.current === currentPipelineId) {
-      alert(`Một số phân đoạn không thể tạo được giọng đọc bằng ${provider}. Vui lòng thử lại hoặc chọn giọng khác.`);
+    if (hasFailedChunk && ttsPipelineIdRef.current === currentPipelineId) {
+      const diagInfo = await diagnoseTtsError({
+        provider,
+        voiceName,
+        textSnippet: text,
+        error: lastError || new Error('Không thể nạp được phân đoạn âm thanh'),
+        httpStatus: lastHttpStatus,
+        rawResponseBody: lastRawResp,
+      });
+      setTtsErrorInfo(diagInfo);
+      setIsTtsErrorModalOpen(true);
     }
   };
 
@@ -3970,6 +4009,31 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
             </div>
           </div>
         )}
+
+        {/* TTS Audition Diagnostic Error Modal */}
+        <TtsErrorModal
+          isOpen={isTtsErrorModalOpen}
+          onClose={() => setIsTtsErrorModalOpen(false)}
+          errorInfo={ttsErrorInfo}
+          onRetry={() => {
+            if (lastTtsRetryParams) {
+              handlePlayTTS(
+                lastTtsRetryParams.text,
+                lastTtsRetryParams.speed,
+                lastTtsRetryParams.pitch,
+                lastTtsRetryParams.providerOverride,
+                lastTtsRetryParams.voiceOverride
+              );
+            }
+          }}
+          onOpenVieNeuDownloadModal={() => setIsVieNeuModalOpen(true)}
+        />
+
+        {/* VieNeu Model Download Management Modal */}
+        <VieNeuModelDownloadModal
+          isOpen={isVieNeuModalOpen}
+          onClose={() => setIsVieNeuModalOpen(false)}
+        />
 
         <HelpModal isOpen={isHelpOpen} onClose={() => setIsHelpOpen(false)} />
       </div>
