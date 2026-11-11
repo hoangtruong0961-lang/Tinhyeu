@@ -164,7 +164,8 @@ function getBytesToUnicode(): Record<number, string> {
 const b2u = getBytesToUnicode();
 
 function stringToByteLevel(str: string): string {
-  const bytes = Buffer.from(str, 'utf-8');
+  const encoder = new TextEncoder();
+  const bytes = encoder.encode(str);
   let result = '';
   for (let i = 0; i < bytes.length; i++) {
     result += b2u[bytes[i]];
