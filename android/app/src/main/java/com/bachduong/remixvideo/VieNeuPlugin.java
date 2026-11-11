@@ -224,10 +224,9 @@ public class VieNeuPlugin extends Plugin {
         int repWindow = call.getInt("repWindow", 64);
         int maxFrames = call.getInt("maxFrames", 250);
 
-        Long seed = null;
-        if (call.hasOption("seed") && !call.getData().isNull("seed")) {
-            seed = call.getLong("seed");
-        }
+        final Long finalSeed = (call.hasOption("seed") && !call.getData().isNull("seed"))
+                ? call.getLong("seed")
+                : null;
 
         int[] tokenIds = new int[tokenIdsArray.length()];
         try {
@@ -266,7 +265,7 @@ public class VieNeuPlugin extends Plugin {
                     repPenalty,
                     repWindow,
                     maxFrames,
-                    seed,
+                    finalSeed,
                     cancelSynthesisRequested
                 );
 
