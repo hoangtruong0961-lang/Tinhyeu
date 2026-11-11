@@ -94,13 +94,7 @@ public class VieNeuEngine {
         opts.setInterOpNumThreads(1);
         int intraThreads = Math.min(Math.max((Runtime.getRuntime().availableProcessors()) / 2, 1), 4);
         opts.setIntraOpNumThreads(intraThreads);
-
-        try {
-            opts.addXnnpack();
-            Log.d(TAG, "Added XNNPACK execution provider optimization");
-        } catch (Throwable t) {
-            Log.w(TAG, "XNNPACK unavailable, falling back to standard CPU execution provider");
-        }
+        opts.addConfigEntry("session.intra_op.allow_spinning", "0");
 
         File prefillFile = new File(modelsDir, "vieneu_prefill.onnx");
         File decodeStepFile = new File(modelsDir, "vieneu_decode_step.onnx");
@@ -370,7 +364,8 @@ public class VieNeuEngine {
                 OnnxTensor embTensor = OnnxTensor.createTensor(env, embBuffer, new long[]{1, 1, HIDDEN_SIZE});
                 OnnxTensor posTensor = OnnxTensor.createTensor(env, IntBuffer.wrap(new int[]{ch + 1}), new long[]{1, 1});
 
-                long[] acKvShape = new long[]{1, LOCAL_KV_HEADS, acPk[0].length, LOCAL_HEAD_DIM};
+                int acSeqLen = acPk[0][0].length;
+                long[] acKvShape = new long[]{1, LOCAL_KV_HEADS, acSeqLen, LOCAL_HEAD_DIM};
                 FloatBuffer pkBuf = flatten4D(acPk);
                 FloatBuffer pvBuf = flatten4D(acPv);
 
