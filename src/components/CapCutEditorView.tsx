@@ -3068,6 +3068,55 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
       return;
     }
 
+    const currentSettings = appSettingsRef.current || appSettings;
+    const provider = currentSettings.ttsProvider || 'capcut_tts';
+    const speed = currentSettings.ttsSpeed || 1.0;
+
+    // Native Android VieNeu-TTS Offline Batch Generation
+    if (provider === 'vieneu_tts' && Capacitor.isNativePlatform()) {
+      let completedCount = 0;
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      let tempCtx: AudioContext | null = null;
+      if (AudioCtx) tempCtx = new AudioCtx();
+
+      try {
+        for (const item of itemsToGen) {
+          try {
+            const fetchRes = await fetchChunkAudioBase64(item.text, speed, 'vieneu_tts', currentSettings.vieneuVoice);
+            if (fetchRes.b64) {
+              const audioUrl = `data:audio/wav;base64,${fetchRes.b64}`;
+              const binaryStr = atob(fetchRes.b64);
+              const bytes = new Uint8Array(binaryStr.length);
+              for (let k = 0; k < binaryStr.length; k++) {
+                bytes[k] = binaryStr.charCodeAt(k);
+              }
+              let roundedDuration = 1.5;
+              if (tempCtx) {
+                try {
+                  const decoded = await tempCtx.decodeAudioData(bytes.buffer.slice(0));
+                  roundedDuration = Math.round(decoded.duration * 1000) / 1000;
+                } catch {}
+              }
+              setSubtitles((prev) => updateSubtitleAudioAndRippleTimeline(prev, item.id, audioUrl, roundedDuration));
+            } else if (fetchRes.error) {
+              console.warn('[VieNeu Native Generate All Error for item]', item.id, fetchRes.error);
+            }
+          } catch (itemErr) {
+            console.warn('[VieNeu Native Generate All Exception]', itemErr);
+          }
+          completedCount++;
+          setAudioGenProgress({ current: completedCount, total: itemsToGen.length });
+        }
+        setSubtitles((prev) => normalizeSubtitles(prev));
+      } finally {
+        if (tempCtx) {
+          try { tempCtx.close(); } catch {}
+        }
+        setIsGeneratingAllAudio(false);
+      }
+      return;
+    }
+
     let completedCount = 0;
     const CHUNK_SIZE = 10; // Process 10 items per batch to prevent HTTP timeouts & rate limits
     const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
@@ -3082,13 +3131,13 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
         const chunkItems = itemsToGen.slice(i, i + CHUNK_SIZE);
 
         try {
-          const currentSettings = appSettingsRef.current || appSettings;
           const res = await fetch('/api/tts/batch', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               items: chunkItems,
               provider: currentSettings.ttsProvider || 'capcut_tts',
+              vieneuVoice: currentSettings.vieneuVoice || 'Minh Đức',
               capcutVoice: currentSettings.capcutVoice || 'BV074_streaming',
               nghiVoice: currentSettings.nghiVoice || 'lacphi',
               edgeVoice: currentSettings.edgeVoice || 'vi-VN-HoaiMyNeural',
@@ -3142,12 +3191,9 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
                     }
 
                     let roundedDuration = r.duration || 1.5;
-                    let speedMultiplier = 1.0;
-                    let finalEndTime = 0;
 
                     if (tempCtx) {
                       try {
-                        // Pass a cloned buffer slice to decodeAudioData to avoid neutering ArrayBuffer
                         const decodedBuffer = await tempCtx.decodeAudioData(bytes.buffer.slice(0));
                         roundedDuration = Math.round(decodedBuffer.duration * 1000) / 1000;
                       } catch (decErr) {
@@ -3220,12 +3266,44 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
 
     try {
       const currentSettings = appSettingsRef.current || appSettings;
+      const provider = currentSettings.ttsProvider || 'capcut_tts';
+      const speed = currentSettings.ttsSpeed || 1.0;
+
+      // Native Android VieNeu-TTS Single Item Synthesis
+      if (provider === 'vieneu_tts' && Capacitor.isNativePlatform()) {
+        const fetchRes = await fetchChunkAudioBase64(text, speed, 'vieneu_tts', currentSettings.vieneuVoice);
+        if (fetchRes.b64) {
+          const audioUrl = `data:audio/wav;base64,${fetchRes.b64}`;
+          const binaryStr = atob(fetchRes.b64);
+          const bytes = new Uint8Array(binaryStr.length);
+          for (let k = 0; k < binaryStr.length; k++) {
+            bytes[k] = binaryStr.charCodeAt(k);
+          }
+          let roundedDuration = 1.5;
+          const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+          if (AudioCtx) {
+            try {
+              const ctx = new AudioCtx();
+              const decoded = await ctx.decodeAudioData(bytes.buffer.slice(0));
+              roundedDuration = Math.round(decoded.duration * 1000) / 1000;
+              ctx.close();
+            } catch {}
+          }
+          setSubtitles((prev) => updateSubtitleAudioAndRippleTimeline(prev, subId, audioUrl, roundedDuration));
+        } else if (fetchRes.error) {
+          throw fetchRes.error;
+        }
+        setIsGeneratingSingleAudio(null);
+        return;
+      }
+
       const res = await fetch('/api/tts/batch', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           items: [{ id: sub.id, text, targetDuration }],
           provider: currentSettings.ttsProvider || 'capcut_tts',
+          vieneuVoice: currentSettings.vieneuVoice || 'Minh Đức',
           capcutVoice: currentSettings.capcutVoice || 'BV074_streaming',
           nghiVoice: currentSettings.nghiVoice || 'lacphi',
           edgeVoice: currentSettings.edgeVoice || 'vi-VN-HoaiMyNeural',

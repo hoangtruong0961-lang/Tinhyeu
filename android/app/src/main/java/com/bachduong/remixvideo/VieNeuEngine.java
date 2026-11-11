@@ -193,9 +193,7 @@ public class VieNeuEngine {
 
         // Load voice preset (speaker_emb and ref_codes)
         JSONObject presets = voicesJsonObject.getJSONObject("presets");
-        if (!presets.has(voiceName)) {
-            voiceName = "Minh Đức"; // Fallback default
-        }
+        voiceName = resolvePresetName(presets, voiceName);
         JSONObject voiceData = presets.getJSONObject(voiceName);
 
         JSONArray spkArr = voiceData.getJSONArray("speaker_emb");
@@ -536,6 +534,27 @@ public class VieNeuEngine {
         } else {
             return OnnxTensor.createTensor(env, LongBuffer.wrap(values), shape);
         }
+    }
+
+    private String resolvePresetName(JSONObject presets, String requested) {
+        if (requested == null || requested.trim().isEmpty()) return "Minh Đức";
+        String cleanReq = requested.trim();
+        if (presets.has(cleanReq)) return cleanReq;
+
+        JSONArray names = presets.names();
+        if (names != null) {
+            String reqLower = cleanReq.toLowerCase();
+            for (int i = 0; i < names.length(); i++) {
+                String candidate = names.optString(i, "");
+                if (candidate.equalsIgnoreCase(cleanReq) || candidate.toLowerCase().contains(reqLower) || reqLower.contains(candidate.toLowerCase())) {
+                    Log.d(TAG, "Resolved requested voice '" + requested + "' -> preset '" + candidate + "'");
+                    return candidate;
+                }
+            }
+        }
+
+        Log.w(TAG, "Requested voice '" + requested + "' not found in presets, falling back to 'Minh Đức'");
+        return "Minh Đức";
     }
 
     private float[] computeSpeakerAnchor(float[] speakerEmb) {
