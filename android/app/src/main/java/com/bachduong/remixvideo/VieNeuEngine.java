@@ -2,10 +2,13 @@ package com.bachduong.remixvideo;
 
 import android.util.Log;
 
+import ai.onnxruntime.NodeInfo;
+import ai.onnxruntime.OnnxJavaType;
 import ai.onnxruntime.OnnxTensor;
 import ai.onnxruntime.OnnxValue;
 import ai.onnxruntime.OrtEnvironment;
 import ai.onnxruntime.OrtSession;
+import ai.onnxruntime.TensorInfo;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -323,7 +326,7 @@ public class VieNeuEngine {
 
             FloatBuffer acTokBuffer = FloatBuffer.wrap(tokStepFlat);
             OnnxTensor acTokTensor = OnnxTensor.createTensor(env, acTokBuffer, new long[]{1, 2, HIDDEN_SIZE});
-            OnnxTensor acPosTensor = OnnxTensor.createTensor(env, LongBuffer.wrap(new long[]{0L, 1L}), new long[]{1, 2});
+            OnnxTensor acPosTensor = createIntTensorForSession(env, sessAcoustic, "position_ids", new long[]{0L, 1L}, new long[]{1, 2});
 
             // Initial empty past_k_0, past_v_0: shape [1, 8, 0, 96]
             FloatBuffer emptyBuffer = FloatBuffer.wrap(new float[0]);
@@ -363,7 +366,7 @@ public class VieNeuEngine {
 
                 FloatBuffer embBuffer = FloatBuffer.wrap(embCh);
                 OnnxTensor embTensor = OnnxTensor.createTensor(env, embBuffer, new long[]{1, 1, HIDDEN_SIZE});
-                OnnxTensor posTensor = OnnxTensor.createTensor(env, LongBuffer.wrap(new long[]{(long)(ch + 1)}), new long[]{1, 1});
+                OnnxTensor posTensor = createIntTensorForSession(env, sessAcoustic, "position_ids", new long[]{(long)(ch + 1)}, new long[]{1, 1});
 
                 int acSeqLen = acPk[0][0].length;
                 long[] acKvShape = new long[]{1, LOCAL_KV_HEADS, acSeqLen, LOCAL_HEAD_DIM};
@@ -421,7 +424,7 @@ public class VieNeuEngine {
 
             FloatBuffer decEmbBuffer = FloatBuffer.wrap(slotEmb);
             OnnxTensor decEmbTensor = OnnxTensor.createTensor(env, decEmbBuffer, new long[]{1, 1, HIDDEN_SIZE});
-            OnnxTensor decPosTensor = OnnxTensor.createTensor(env, LongBuffer.wrap(new long[]{(long)(totalPromptLength + frameIdx)}), new long[]{1, 1});
+            OnnxTensor decPosTensor = createIntTensorForSession(env, sessDecodeStep, "position_ids", new long[]{(long)(totalPromptLength + frameIdx)}, new long[]{1, 1});
 
             Map<String, OnnxTensor> decFeed = new HashMap<>();
             decFeed.put("inputs_embeds", decEmbTensor);
@@ -467,7 +470,7 @@ public class VieNeuEngine {
         Log.d(TAG, String.format("Generated %d frames (~%.2fs). Running MOSS Codec decoder...", totalFrames, totalFrames / 25.0));
 
         // Step 5: Decode audio frames with MOSS Codec
-        // Prepare audio_codes (int64 / long): shape [1, totalFrames, 16]
+        // Prepare audio_codes (int32 or int64): shape [1, totalFrames, 16]
         long[] flatCodes = new long[totalFrames * N_VQ];
         for (int f = 0; f < totalFrames; f++) {
             int[] frame = generatedFrames.get(f);
@@ -476,9 +479,8 @@ public class VieNeuEngine {
             }
         }
 
-        LongBuffer codesBuffer = LongBuffer.wrap(flatCodes);
-        OnnxTensor codesTensor = OnnxTensor.createTensor(env, codesBuffer, new long[]{1, totalFrames, N_VQ});
-        OnnxTensor lensTensor = OnnxTensor.createTensor(env, LongBuffer.wrap(new long[]{(long) totalFrames}), new long[]{1});
+        OnnxTensor codesTensor = createIntTensorForSession(env, sessCodecDecode, "audio_codes", flatCodes, new long[]{1, totalFrames, N_VQ});
+        OnnxTensor lensTensor = createIntTensorForSession(env, sessCodecDecode, "audio_code_lengths", new long[]{(long) totalFrames}, new long[]{1});
 
         Map<String, OnnxTensor> codecFeed = new HashMap<>();
         codecFeed.put("audio_codes", codesTensor);
@@ -501,6 +503,39 @@ public class VieNeuEngine {
         Log.d(TAG, String.format("SUCCESS: Saved audio WAV to %s (Duration: %.2fs, Elapsed: %d ms)", outputFile.getAbsolutePath(), durationSec, elapsedMs));
 
         return outputFile.getAbsolutePath();
+    }
+
+    private OnnxTensor createIntTensorForSession(
+            OrtEnvironment env,
+            OrtSession session,
+            String inputName,
+            long[] values,
+            long[] shape
+    ) throws Exception {
+        OnnxJavaType expectedType = OnnxJavaType.INT64;
+        try {
+            Map<String, NodeInfo> inputInfo = session.getInputInfo();
+            if (inputInfo != null && inputInfo.containsKey(inputName)) {
+                NodeInfo nInfo = inputInfo.get(inputName);
+                if (nInfo != null && nInfo.getInfo() instanceof TensorInfo) {
+                    TensorInfo tInfo = (TensorInfo) nInfo.getInfo();
+                    expectedType = tInfo.type;
+                    Log.d(TAG, "ONNX Input '" + inputName + "' expected type: " + expectedType);
+                }
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to inspect type for ONNX input '" + inputName + "': " + e.getMessage());
+        }
+
+        if (expectedType == OnnxJavaType.INT32) {
+            int[] intVals = new int[values.length];
+            for (int i = 0; i < values.length; i++) {
+                intVals[i] = (int) values[i];
+            }
+            return OnnxTensor.createTensor(env, IntBuffer.wrap(intVals), shape);
+        } else {
+            return OnnxTensor.createTensor(env, LongBuffer.wrap(values), shape);
+        }
     }
 
     private float[] computeSpeakerAnchor(float[] speakerEmb) {
