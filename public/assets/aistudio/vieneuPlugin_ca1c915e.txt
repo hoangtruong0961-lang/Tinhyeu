@@ -1,0 +1,83 @@
+import { registerPlugin } from '@capacitor/core';
+
+export interface VieNeuStatus {
+  isReady: boolean;
+  isDownloading: boolean;
+  modelsPath?: string;
+  totalSizeMB?: number;
+  platform?: string;
+}
+
+export interface VieNeuProgressEvent {
+  status: 'downloading' | 'extracting' | 'completed' | 'cancelled' | 'error';
+  percent: number;
+  message: string;
+}
+
+export interface VieNeuPluginInterface {
+  checkStatus(): Promise<VieNeuStatus>;
+  downloadModels(options?: { includeCloning?: boolean }): Promise<{ success: boolean; modelsPath: string; isReady: boolean }>;
+  cancelDownload(): Promise<{ success: boolean }>;
+  deleteModels(): Promise<{ success: boolean; message: string }>;
+  /** tokenIds do TypeScript tạo (xem reference_tts.py: [style, TEXT_PROMPT_START, ...phone ids, TEXT_PROMPT_END]) */
+  synthesize(options: {
+    tokenIds: number[];
+    voiceName?: string;
+    temperature?: number;
+    topK?: number;
+    topP?: number;
+    repPenalty?: number;
+    maxFrames?: number;
+    seed?: number;
+  }): Promise<{ success: boolean; audioPath: string; duration: number; sampleRate: number; elapsedMs: number }>;
+  cancelSynthesis(): Promise<{ success: boolean }>;
+  releaseModels(): Promise<{ success: boolean }>;
+  listVoices(): Promise<{ voices: string[] }>;
+  addListener(
+    eventName: 'vieneu_synth_progress',
+    listenerFunc: (event: { frame: number; maxFrames: number }) => void
+  ): Promise<{ remove: () => Promise<void> }>;
+  addListener(
+    eventName: 'vieneu_download_progress',
+    listenerFunc: (event: VieNeuProgressEvent) => void
+  ): Promise<{ remove: () => Promise<void> }>;
+}
+
+export const VieNeuNative = registerPlugin<VieNeuPluginInterface>('VieNeuNative', {
+  web: {
+    async checkStatus() {
+      // Web/desktop: không có engine native nên luôn báo chưa sẵn sàng
+      const isDownloaded = false;
+      return {
+        isReady: isDownloaded,
+        isDownloading: false,
+        platform: 'web',
+        totalSizeMB: isDownloaded ? 147.4 : 0,
+      };
+    },
+    async downloadModels(_options?: { includeCloning?: boolean }) {
+      throw new Error('Chỉ tải được mô hình VieNeu trên app Android.');
+    },
+    async cancelDownload() {
+      return { success: true };
+    },
+    async synthesize() {
+      throw new Error('VieNeu TTS offline chỉ chạy trên Android (app native).');
+    },
+    async cancelSynthesis() {
+      return { success: true };
+    },
+    async releaseModels() {
+      return { success: true };
+    },
+    async listVoices() {
+      return { voices: [] };
+    },
+    async deleteModels() {
+      return { success: true, message: 'Không có mô hình trên web.' };
+    },
+    async addListener(_eventName: string, _listenerFunc: (event: any) => void) {
+      return { remove: async () => {} };
+    },
+  },
+});

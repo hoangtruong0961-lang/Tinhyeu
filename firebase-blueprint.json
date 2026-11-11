@@ -1,0 +1,103 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "User account and license ownership linked to authenticated Google UID",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "description": "Google Firebase User UID" },
+        "email": { "type": "string", "description": "Google Email" },
+        "displayName": { "type": "string" },
+        "photoURL": { "type": "string" },
+        "role": { "type": "string", "enum": ["user", "pro", "admin"] },
+        "plan": { "type": "string", "enum": ["free", "trial", "month", "quarter", "year", "lifetime", "admin"] },
+        "status": { "type": "string", "enum": ["active", "expired", "suspended"] },
+        "expiresAt": { "type": "number" },
+        "licenseKey": { "type": "string" },
+        "maxDevices": { "type": "number" },
+        "boundDevices": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "deviceId": { "type": "string" },
+              "deviceName": { "type": "string" },
+              "boundAt": { "type": "number" },
+              "lastActiveAt": { "type": "number" }
+            }
+          }
+        },
+        "createdAt": { "type": "number" },
+        "lastLoginAt": { "type": "number" },
+        "note": { "type": "string" }
+      },
+      "required": ["uid", "email", "role", "plan", "status", "createdAt"]
+    },
+    "License": {
+      "title": "License",
+      "description": "Software license key configuration, plan type, and device binding constraints",
+      "type": "object",
+      "properties": {
+        "key": { "type": "string", "description": "Unique license key string" },
+        "plan": { "type": "string", "enum": ["trial", "month", "quarter", "year", "lifetime", "admin"] },
+        "role": { "type": "string", "enum": ["user", "pro", "admin"] },
+        "maxDevices": { "type": "number" },
+        "activatedDevices": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "deviceId": { "type": "string" },
+              "deviceName": { "type": "string" },
+              "imei": { "type": "string" },
+              "ip": { "type": "string" },
+              "activatedAt": { "type": "number" },
+              "lastUsedAt": { "type": "number" }
+            }
+          }
+        },
+        "createdAt": { "type": "number" },
+        "expiresAt": { "type": "number" },
+        "status": { "type": "string", "enum": ["active", "suspended", "revoked"] },
+        "note": { "type": "string" },
+        "createdBatch": { "type": "string" }
+      },
+      "required": ["key", "plan", "role", "status", "createdAt"]
+    },
+    "Device": {
+      "title": "Device",
+      "description": "Connected client hardware registration and current license status",
+      "type": "object",
+      "properties": {
+        "deviceId": { "type": "string" },
+        "deviceName": { "type": "string" },
+        "imei": { "type": "string" },
+        "ip": { "type": "string" },
+        "licenseKey": { "type": "string" },
+        "plan": { "type": "string" },
+        "role": { "type": "string" },
+        "status": { "type": "string" },
+        "expiresAt": { "type": "number" },
+        "lastActiveAt": { "type": "number" },
+        "createdAt": { "type": "number" }
+      },
+      "required": ["deviceId", "createdAt", "lastActiveAt"]
+    }
+  },
+  "firestore": {
+    "collections": {
+      "users": {
+        "entity": "UserProfile",
+        "description": "Authenticated Google user profiles and license ownership"
+      },
+      "licenses": {
+        "entity": "License",
+        "description": "Master cloud license records"
+      },
+      "devices": {
+        "entity": "Device",
+        "description": "Client device registration records"
+      }
+    }
+  }
+}

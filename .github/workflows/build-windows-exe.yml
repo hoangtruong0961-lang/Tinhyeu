@@ -1,0 +1,42 @@
+name: Build Windows EXE (Desktop App)
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-windows-exe:
+    name: Build & Package Windows EXE (Setup Installer)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Node Dependencies
+        run: npm install --legacy-peer-deps --no-package-lock
+
+      - name: Build Web & Server Assets
+        run: npm run build
+
+      - name: Build Windows Desktop App (Electron Builder)
+        run: npx electron-builder --win nsis --publish never
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+
+      - name: Upload Windows Installer (.exe) Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Gemini-Video-Subtitles-Windows-EXE
+          path: |
+            dist-electron/*.exe
+            dist-electron/*.blockmap
+          retention-days: 14
+          if-no-files-found: warn

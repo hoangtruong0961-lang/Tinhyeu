@@ -1,0 +1,33 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // 1. User Profiles & Member Codes Collection (`/users/{userId}`)
+    match /users/{userId} {
+      allow read, write: if true;
+    }
+
+    // 2. Master License Keys (`/licenses/{licenseId}`)
+    match /licenses/{licenseId} {
+      allow read, write: if true;
+    }
+
+    // 3. Registered Devices Collection (`/devices/{deviceId}`)
+    match /devices/{deviceId} {
+      allow read, write: if true;
+    }
+
+    // 4. Admin Accounts (`/admins/{adminId}`)
+    match /admins/{adminId} {
+      allow read, write: if true;
+    }
+
+    // 5. System Configuration (`/system_config/{configId}`)
+    match /system_config/{configId} {
+      allow read, write: if true;
+    }
+  }
+}
+
+
+

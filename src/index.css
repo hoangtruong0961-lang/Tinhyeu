@@ -1,0 +1,129 @@
+@import "tailwindcss";
+
+html, body, #root {
+  background-color: #08080c;
+  color: #ffffff;
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  min-height: 100%;
+}
+
+@layer utilities {
+  /* Metallic background & card textures */
+  .bg-metallic-dark {
+    background: linear-gradient(135deg, #18191c 0%, #121316 50%, #0a0b0d 100%);
+  }
+  
+  .bg-metallic-card {
+    background: linear-gradient(145deg, #1f2126 0%, #16171a 100%);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+  }
+
+  .bg-metallic-panel {
+    background: linear-gradient(180deg, #22252b 0%, #17181c 100%);
+  }
+
+  /* Metallic Silver / Chrome / Platinum Button */
+  .btn-metallic {
+    background: linear-gradient(135deg, #f8fafc 0%, #cbd5e1 35%, #94a3b8 70%, #e2e8f0 100%);
+    color: #0f172a;
+    box-shadow: 0 4px 15px -3px rgba(255, 255, 255, 0.2), inset 0 1px 0 rgba(255, 255, 255, 0.8);
+    transition: all 0.2s ease-in-out;
+  }
+  .btn-metallic:hover {
+    background: linear-gradient(135deg, #ffffff 0%, #e2e8f0 35%, #cbd5e1 70%, #f1f5f9 100%);
+    box-shadow: 0 6px 20px -2px rgba(255, 255, 255, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.9);
+    transform: translateY(-1px);
+  }
+
+  /* Metallic Dark Button */
+  .btn-metallic-dark {
+    background: linear-gradient(135deg, #334155 0%, #1e293b 50%, #0f172a 100%);
+    border: 1px solid rgba(203, 213, 225, 0.25);
+    color: #f1f5f9;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.15);
+  }
+  .btn-metallic-dark:hover {
+    background: linear-gradient(135deg, #475569 0%, #334155 50%, #1e293b 100%);
+    border-color: rgba(255, 255, 255, 0.4);
+  }
+
+  /* Metallic Gold Accent Button for primary highlights */
+  .btn-metallic-amber {
+    background: linear-gradient(135deg, #fef08a 0%, #eab308 50%, #ca8a04 100%);
+    color: #0f172a;
+    box-shadow: 0 4px 15px -3px rgba(234, 179, 8, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.6);
+  }
+
+  /* Silver metallic text gradient */
+  .text-metallic-silver {
+    background: linear-gradient(135deg, #ffffff 0%, #e2e8f0 40%, #94a3b8 70%, #f1f5f9 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+
+  .text-metallic-gold {
+    background: linear-gradient(135deg, #fef08a 0%, #facc15 50%, #eab308 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+
+  /* Metallic Sheen Border */
+  .border-metallic {
+    border: 1px solid transparent;
+    background-image: linear-gradient(#16171a, #16171a), 
+                      linear-gradient(135deg, rgba(255,255,255,0.4) 0%, rgba(148,163,184,0.1) 50%, rgba(255,255,255,0.3) 100%);
+    background-origin: border-box;
+    background-clip: padding-box, border-box;
+  }
+
+  /* Shiny metallic shimmer animation */
+  @keyframes metallicShimmer {
+    0% { background-position: -200% 0; }
+    100% { background-position: 200% 0; }
+  }
+
+  .animate-metallic-sheen {
+    background: linear-gradient(90deg, rgba(255,255,255,0) 0%, rgba(255,255,255,0.2) 50%, rgba(255,255,255,0) 100%);
+    background-size: 200% 100%;
+    animation: metallicShimmer 3s infinite;
+  }
+}
+
+/* Custom Metallic Scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #0f1013;
+}
+::-webkit-scrollbar-thumb {
+  background: linear-gradient(180deg, #475569, #1e293b);
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: linear-gradient(180deg, #64748b, #334155);
+}
+
+/* Custom react-colorful styling for dark CapCut UI */
+.react-colorful {
+  width: 180px !important;
+  height: 180px !important;
+  border-radius: 14px !important;
+}
+.react-colorful__saturation {
+  border-radius: 12px 12px 0 0 !important;
+}
+.react-colorful__hue {
+  height: 14px !important;
+  border-radius: 0 0 12px 12px !important;
+}
+.react-colorful__pointer {
+  width: 18px !important;
+  height: 18px !important;
+  border-width: 2px !important;
+}
+

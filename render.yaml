@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: bachtranlastor-server
+    env: docker
+    plan: free
+    region: singapore
+    dockerfilePath: Dockerfile
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000

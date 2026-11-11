@@ -1,0 +1,121 @@
+{
+  "name": "gemini-video-subtitles",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "main": "electron/main.cjs",
+  "description": "Gemini Video Subtitles Studio Desktop Application",
+  "author": "Bach Tran",
+  "scripts": {
+    "dev": "tsx server.ts",
+    "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
+    "start": "node dist/server.cjs",
+    "clean": "rm -rf dist server.js",
+    "lint": "tsc --noEmit",
+    "cap:sync": "cap sync",
+    "cap:build": "vite build && cap sync",
+    "electron:dev": "concurrently -k \"npm run dev\" \"wait-on http-get://localhost:3000/api/health && electron electron/main.cjs\"",
+    "electron:pack": "npm run build && electron-builder --dir",
+    "electron:build": "npm run build && electron-builder"
+  },
+  "build": {
+    "appId": "com.bachtranlastor.app",
+    "productName": "BachTranlastor",
+    "directories": {
+      "output": "dist-electron"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        "nsis"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "BachTranlastor"
+    },
+    "mac": {
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "category": "public.app-category.video"
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "tar.gz"
+      ],
+      "category": "Video"
+    }
+  },
+  "dependencies": {
+    "@capacitor/android": "^8.5.0",
+    "@capacitor/app": "^8.1.1",
+    "@capacitor/cli": "^8.5.0",
+    "@capacitor/core": "^8.5.0",
+    "@capacitor/device": "^8.0.3",
+    "@capacitor/haptics": "^8.0.2",
+    "@capgo/capacitor-ffmpeg": "^0.0.8",
+    "@distube/ytdl-core": "^4.16.12",
+    "@fontsource-variable/inter": "^5.3.0",
+    "@fontsource-variable/roboto-condensed": "^5.3.0",
+    "@fontsource/be-vietnam-pro": "^5.3.0",
+    "@fontsource/dancing-script": "^5.3.0",
+    "@google/genai": "^2.4.0",
+    "@shofipwk/tiktok-tts": "^1.1.16",
+    "@tailwindcss/vite": "^4.3.3",
+    "@techstark/opencv-js": "^5.0.0-release.1",
+    "@types/jszip": "^3.4.1",
+    "@vitejs/plugin-react": "^6.1.1",
+    "axios": "^1.19.0",
+    "dotenv": "^17.2.3",
+    "express": "^4.21.2",
+    "firebase": "^12.18.0",
+    "fix-webm-duration": "^1.0.6",
+    "https-proxy-agent": "^9.1.0",
+    "jszip": "^3.10.2",
+    "lucide-react": "^0.546.0",
+    "mediabunny": "^1.53.0",
+    "motion": "^12.23.24",
+    "mp4-muxer": "^5.2.2",
+    "mp4box": "^2.4.1",
+    "msedge-tts": "^2.0.7",
+    "multer": "^2.2.0",
+    "onnxruntime-web": "1.23.2",
+    "ppu-paddle-ocr": "^6.2.0",
+    "proxifly": "^3.0.1",
+    "qrcode": "^1.5.4",
+    "react": "^19.0.1",
+    "react-colorful": "^5.8.1",
+    "react-dom": "^19.0.1",
+    "sherpa-onnx": "^1.13.4",
+    "sherpa-onnx-node": "^1.13.6",
+    "vite": "^8.2.2"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/multer": "^2.2.0",
+    "@types/node": "^22.14.0",
+    "@types/qrcode": "^1.5.6",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.5",
+    "autoprefixer": "^10.4.21",
+    "concurrently": "^10.0.5",
+    "electron": "^44.0.0",
+    "electron-builder": "^26.15.3",
+    "esbuild": "^0.28.2",
+    "onnxruntime-node": "1.23.2",
+    "tailwindcss": "^4.1.14",
+    "tsx": "^4.23.12",
+    "typescript": "^7.0.2",
+    "wait-on": "^9.1.0"
+  }
+}

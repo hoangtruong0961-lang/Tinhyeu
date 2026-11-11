@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">BachTranlastor</string>
+    <string name="title_activity_main">BachTranlastor</string>
+    <string name="package_name">com.bachtranlastor.app</string>
+    <string name="custom_url_scheme">com.bachtranlastor.app</string>
+</resources>

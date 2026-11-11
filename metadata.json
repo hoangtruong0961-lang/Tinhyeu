@@ -1,0 +1,8 @@
+{
+  "name": "Remix Remix Remix Bạch 6.0",
+  "description": "Tool dịch thuật video tự động, bóc tách phụ đề bằng OCR theo vùng chọn và đồng bộ phụ đề đa ngôn ngữ với AI Gemini.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
