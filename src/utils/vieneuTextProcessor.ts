@@ -3,6 +3,8 @@
  * 100% Client-side & Offline compatible for Capacitor Android and Web browser fallback.
  */
 
+import { resolveApiUrl } from './apiUrl';
+
 export function numberToVietnameseWords(num: number): string {
   if (isNaN(num)) return '';
   if (num === 0) return 'không';
@@ -284,38 +286,46 @@ export async function loadVieNeuResources(): Promise<{
     return { tokenizer: cachedTokenizer, g2pDict: cachedG2pDict };
   }
 
-  try {
-    const [tokRes, g2pRes] = await Promise.all([
-      fetch('/api/vieneu-models/tokenizer.json'),
-      fetch('/api/vieneu-models/vieneu_vi_g2p.json'),
-    ]);
+  // Candidate pairs in order of priority:
+  // 1. Bundled static assets in public/models (works offline in Android Capacitor APK & Web)
+  // 2. Relative models path
+  // 3. Backend API server URL
+  const candidatePairs = [
+    ['/models/tokenizer.json', '/models/vieneu_vi_g2p.json'],
+    ['./models/tokenizer.json', './models/vieneu_vi_g2p.json'],
+    ['models/tokenizer.json', 'models/vieneu_vi_g2p.json'],
+    [resolveApiUrl('/api/vieneu-models/tokenizer.json'), resolveApiUrl('/api/vieneu-models/vieneu_vi_g2p.json')],
+    [resolveApiUrl('/models/tokenizer.json'), resolveApiUrl('/models/vieneu_vi_g2p.json')],
+  ];
 
-    if (tokRes.ok && g2pRes.ok) {
-      const tokenizerJson = await tokRes.json();
-      const g2pDict = await g2pRes.json();
-      cachedTokenizer = new VieNeuBPETokenizer(tokenizerJson);
-      cachedG2pDict = g2pDict;
-      return { tokenizer: cachedTokenizer, g2pDict };
+  let lastError: any = null;
+
+  for (const [tokUrl, g2pUrl] of candidatePairs) {
+    try {
+      const [tokRes, g2pRes] = await Promise.all([
+        fetch(tokUrl),
+        fetch(g2pUrl),
+      ]);
+
+      if (tokRes.ok && g2pRes.ok) {
+        const tokenizerJson = await tokRes.json();
+        const g2pDict = await g2pRes.json();
+        if (tokenizerJson && tokenizerJson.model && g2pDict) {
+          cachedTokenizer = new VieNeuBPETokenizer(tokenizerJson);
+          cachedG2pDict = g2pDict;
+          console.log(`[VieNeuTextProcessor] Loaded tokenizer and G2P dictionary successfully from: ${tokUrl}`);
+          return { tokenizer: cachedTokenizer, g2pDict };
+        }
+      } else {
+        lastError = new Error(`HTTP Status tok: ${tokRes.status}, g2p: ${g2pRes.status} for ${tokUrl}`);
+      }
+    } catch (err) {
+      lastError = err;
+      console.warn(`[VieNeuTextProcessor] Fetch attempt failed for ${tokUrl}:`, err);
     }
-  } catch (err) {
-    console.warn('[VieNeuTextProcessor] Remote model fetch failed, trying local fallback:', err);
   }
 
-  // Fallback: fetch from /models/ directly
-  const [tokRes, g2pRes] = await Promise.all([
-    fetch('/models/tokenizer.json'),
-    fetch('/models/vieneu_vi_g2p.json'),
-  ]);
-
-  if (!tokRes.ok || !g2pRes.ok) {
-    throw new Error('Không thể nạp tệp tokenizer.json hoặc vieneu_vi_g2p.json từ máy chủ.');
-  }
-
-  const tokenizerJson = await tokRes.json();
-  const g2pDict = await g2pRes.json();
-  cachedTokenizer = new VieNeuBPETokenizer(tokenizerJson);
-  cachedG2pDict = g2pDict;
-  return { tokenizer: cachedTokenizer, g2pDict };
+  throw new Error(`Không thể nạp tệp tokenizer.json hoặc vieneu_vi_g2p.json từ ứng dụng/máy chủ. Chi tiết: ${lastError?.message || lastError || 'N/A'}`);
 }
 
 /**
