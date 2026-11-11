@@ -21,6 +21,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
 import java.nio.IntBuffer;
+import java.nio.LongBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -322,7 +323,7 @@ public class VieNeuEngine {
 
             FloatBuffer acTokBuffer = FloatBuffer.wrap(tokStepFlat);
             OnnxTensor acTokTensor = OnnxTensor.createTensor(env, acTokBuffer, new long[]{1, 2, HIDDEN_SIZE});
-            OnnxTensor acPosTensor = OnnxTensor.createTensor(env, IntBuffer.wrap(new int[]{0, 1}), new long[]{1, 2});
+            OnnxTensor acPosTensor = OnnxTensor.createTensor(env, LongBuffer.wrap(new long[]{0L, 1L}), new long[]{1, 2});
 
             // Initial empty past_k_0, past_v_0: shape [1, 8, 0, 96]
             FloatBuffer emptyBuffer = FloatBuffer.wrap(new float[0]);
@@ -362,7 +363,7 @@ public class VieNeuEngine {
 
                 FloatBuffer embBuffer = FloatBuffer.wrap(embCh);
                 OnnxTensor embTensor = OnnxTensor.createTensor(env, embBuffer, new long[]{1, 1, HIDDEN_SIZE});
-                OnnxTensor posTensor = OnnxTensor.createTensor(env, IntBuffer.wrap(new int[]{ch + 1}), new long[]{1, 1});
+                OnnxTensor posTensor = OnnxTensor.createTensor(env, LongBuffer.wrap(new long[]{(long)(ch + 1)}), new long[]{1, 1});
 
                 int acSeqLen = acPk[0][0].length;
                 long[] acKvShape = new long[]{1, LOCAL_KV_HEADS, acSeqLen, LOCAL_HEAD_DIM};
@@ -420,7 +421,7 @@ public class VieNeuEngine {
 
             FloatBuffer decEmbBuffer = FloatBuffer.wrap(slotEmb);
             OnnxTensor decEmbTensor = OnnxTensor.createTensor(env, decEmbBuffer, new long[]{1, 1, HIDDEN_SIZE});
-            OnnxTensor decPosTensor = OnnxTensor.createTensor(env, IntBuffer.wrap(new int[]{totalPromptLength + frameIdx}), new long[]{1, 1});
+            OnnxTensor decPosTensor = OnnxTensor.createTensor(env, LongBuffer.wrap(new long[]{(long)(totalPromptLength + frameIdx)}), new long[]{1, 1});
 
             Map<String, OnnxTensor> decFeed = new HashMap<>();
             decFeed.put("inputs_embeds", decEmbTensor);
@@ -466,16 +467,18 @@ public class VieNeuEngine {
         Log.d(TAG, String.format("Generated %d frames (~%.2fs). Running MOSS Codec decoder...", totalFrames, totalFrames / 25.0));
 
         // Step 5: Decode audio frames with MOSS Codec
-        // Prepare audio_codes (int32): shape [1, totalFrames, 16]
-        int[] flatCodes = new int[totalFrames * N_VQ];
+        // Prepare audio_codes (int64 / long): shape [1, totalFrames, 16]
+        long[] flatCodes = new long[totalFrames * N_VQ];
         for (int f = 0; f < totalFrames; f++) {
             int[] frame = generatedFrames.get(f);
-            System.arraycopy(frame, 0, flatCodes, f * N_VQ, N_VQ);
+            for (int c = 0; c < N_VQ; c++) {
+                flatCodes[f * N_VQ + c] = (long) frame[c];
+            }
         }
 
-        IntBuffer codesBuffer = IntBuffer.wrap(flatCodes);
+        LongBuffer codesBuffer = LongBuffer.wrap(flatCodes);
         OnnxTensor codesTensor = OnnxTensor.createTensor(env, codesBuffer, new long[]{1, totalFrames, N_VQ});
-        OnnxTensor lensTensor = OnnxTensor.createTensor(env, IntBuffer.wrap(new int[]{totalFrames}), new long[]{1});
+        OnnxTensor lensTensor = OnnxTensor.createTensor(env, LongBuffer.wrap(new long[]{(long) totalFrames}), new long[]{1});
 
         Map<String, OnnxTensor> codecFeed = new HashMap<>();
         codecFeed.put("audio_codes", codesTensor);
