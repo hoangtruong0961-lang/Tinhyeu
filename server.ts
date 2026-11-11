@@ -75,6 +75,12 @@ import {
   TARGET_APP_ID,
   parseDouyinMicroAppShareLink,
 } from './src/server/douyinHandoffService';
+import {
+  extractVoiceProfileFromAudio,
+  loadCustomVoices,
+  deleteCustomVoiceFromDisk,
+  ClonedVoicePreset,
+} from './src/server/vieneuCloneService';
 
 
 const execPromise = util.promisify(exec);
@@ -822,6 +828,73 @@ async function startServer() {
       }
     }
     res.status(404).json({ error: `VieNeu model file ${safeFilename} not found.` });
+  });
+
+  // VieNeu-TTS Voice Cloning Endpoint
+  const cloneAudioUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 50 * 1024 * 1024 },
+  });
+
+  app.post('/api/vieneu/clone-voice', cloneAudioUpload.single('audio'), async (req, res) => {
+    try {
+      let audioBuffer: Buffer | null = null;
+      let voiceName = (req.body.voiceName || '').trim();
+      const gender = req.body.gender === 'female' ? 'female' : 'male';
+      const accent = ['bac', 'trung', 'nam'].includes(req.body.accent) ? req.body.accent : 'bac';
+
+      if (req.file && req.file.buffer) {
+        audioBuffer = req.file.buffer;
+      } else if (req.body.audioBase64) {
+        const cleanB64 = req.body.audioBase64.replace(/^data:audio\/\w+;base64,/, '');
+        audioBuffer = Buffer.from(cleanB64, 'base64');
+      }
+
+      if (!audioBuffer || audioBuffer.length < 500) {
+        res.status(400).json({ error: 'Vui lòng cung cấp tệp âm thanh mẫu hoặc bản ghi âm (tối thiểu 1.5 - 3 giây).' });
+        return;
+      }
+
+      if (!voiceName) {
+        voiceName = `Giọng Nhân Bản ${new Date().toLocaleDateString('vi-VN')}`;
+      }
+
+      console.log(`[VieNeu Voice Cloning] Processing voice clone for '${voiceName}' (${audioBuffer.length} bytes)...`);
+      const preset = await extractVoiceProfileFromAudio(audioBuffer, {
+        voiceName,
+        gender,
+        accent,
+      });
+
+      res.json({
+        success: true,
+        voice: preset,
+        message: `Đã nhân bản thành công giọng '${preset.name}'!`,
+      });
+    } catch (err: any) {
+      console.error('[VieNeu Voice Cloning Error]', err);
+      res.status(500).json({ error: err?.message || 'Lỗi xử lý nhân bản giọng nói' });
+    }
+  });
+
+  app.get('/api/vieneu/custom-voices', (_req, res) => {
+    try {
+      const voices = loadCustomVoices();
+      const unique = Object.values(voices).filter((v, idx, arr) => arr.findIndex((x) => x.id === v.id) === idx);
+      res.json({ success: true, voices: unique });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'Lỗi nạp danh sách giọng nhân bản' });
+    }
+  });
+
+  app.delete('/api/vieneu/custom-voices/:id', (req, res) => {
+    try {
+      const id = req.params.id;
+      const ok = deleteCustomVoiceFromDisk(id);
+      res.json({ success: ok, message: ok ? 'Đã xóa giọng nhân bản thành công' : 'Không tìm thấy giọng cần xóa' });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'Lỗi xóa giọng nhân bản' });
+    }
   });
 
   // PaddleOCR Models & Dictionary Serving Endpoints
@@ -3549,23 +3622,37 @@ ${JSON.stringify(compactChunk)}`;
     // Option -1: VieNeu-TTS v3 Turbo (Offline AI Voice Engine)
     if (provider === 'vieneu_tts') {
       const vieneuVoiceName = (options as any).vieneuVoice || 'Minh Đức';
-      const isMaleVieNeu = ['Minh Đức', 'Mạnh Dũng', 'Tuấn Kiệt', 'Gia Huy', 'Quốc Bảo', 'Hoàng Nam', 'Văn Phong'].includes(vieneuVoiceName);
-      
+      const customVoices = loadCustomVoices();
+      const customVoice = customVoices[vieneuVoiceName];
+      const isCustomFemale = customVoice?.gender === 'female';
+      const isMaleVieNeu = customVoice
+        ? !isCustomFemale
+        : ['Minh Đức', 'Mạnh Dũng', 'Phạm Tuyên', 'Thái Sơn', 'Xuân Vĩnh', 'Thanh Bình', 'Minh Triết', 'Quang Sơn', 'Đức Trí', 'Minh Quân', 'Anh Khôi', 'Adam'].includes(vieneuVoiceName);
+
       const VIENEU_FALLBACK_MAP: Record<string, { voice: string; isMale: boolean }> = {
         'Minh Đức': { voice: 'multi_male_felipe_uranus_bigtts', isMale: true },
         'Mai Anh': { voice: 'BV074_streaming', isMale: false },
         'Mạnh Dũng': { voice: 'multi_male_felipe_uranus_bigtts', isMale: true },
-        'Lan Nhi': { voice: 'multi_female_yangguangnv_uranus_bigtts', isMale: false },
-        'Tuấn Kiệt': { voice: 'BV075_streaming', isMale: true },
-        'Phương Trang': { voice: 'multi_female_sisi_uranus_bigtts', isMale: false },
-        'Gia Huy': { voice: 'BV075_streaming', isMale: true },
-        'Thảo My': { voice: 'BV421_vivn_streaming', isMale: false },
-        'Quốc Bảo': { voice: 'multi_male_felipe_uranus_bigtts', isMale: true },
-        'Bích Ngọc': { voice: 'multi_female_quanweinv_uranus_bigtts', isMale: false },
-        'Hoàng Nam': { voice: 'BV075_streaming', isMale: true },
-        'Khánh Vy': { voice: 'multi_female_kiwi_uranus_bigtts', isMale: false },
-        'Thanh Thảo': { voice: 'multi_female_tianmeijieshuo_uranus_bigtts', isMale: false },
-        'Văn Phong': { voice: 'BV075_streaming', isMale: true },
+        'Phạm Tuyên': { voice: 'BV075_streaming', isMale: true },
+        'Thái Sơn': { voice: 'multi_male_felipe_uranus_bigtts', isMale: true },
+        'Xuân Vĩnh': { voice: 'BV075_streaming', isMale: true },
+        'Thanh Bình': { voice: 'BV075_streaming', isMale: true },
+        'Minh Triết': { voice: 'BV075_streaming', isMale: true },
+        'Quang Sơn': { voice: 'BV075_streaming', isMale: true },
+        'Đức Trí': { voice: 'BV075_streaming', isMale: true },
+        'Minh Quân': { voice: 'BV075_streaming', isMale: true },
+        'Anh Khôi': { voice: 'BV075_streaming', isMale: true },
+        'Adam': { voice: 'en_male_adam_clone2', isMale: true },
+        'Ngọc Huyền': { voice: 'multi_female_sisi_uranus_bigtts', isMale: false },
+        'Trúc Ly': { voice: 'BV074_streaming', isMale: false },
+        'Ngọc Linh': { voice: 'multi_female_yangguangnv_uranus_bigtts', isMale: false },
+        'Đoan Trang': { voice: 'BV074_streaming', isMale: false },
+        'Thục Đoan': { voice: 'BV074_streaming', isMale: false },
+        'Thùy Dung': { voice: 'multi_female_quanweinv_uranus_bigtts', isMale: false },
+        'Ngọc Trân': { voice: 'multi_female_kiwi_uranus_bigtts', isMale: false },
+        'Mỹ Duyên': { voice: 'BV421_vivn_streaming', isMale: false },
+        'Quỳnh Anh': { voice: 'multi_female_yangguangnv_uranus_bigtts', isMale: false },
+        'Kim Thanh': { voice: 'BV074_streaming', isMale: false },
       };
 
       const mapped = VIENEU_FALLBACK_MAP[vieneuVoiceName] || { voice: isMaleVieNeu ? 'BV075_streaming' : 'BV074_streaming', isMale: isMaleVieNeu };

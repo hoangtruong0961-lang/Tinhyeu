@@ -6,6 +6,9 @@ export interface VieNeuVoice {
   style: string;
   description: string;
   recommended?: boolean;
+  isCustom?: boolean;
+  speakerEmb?: number[];
+  codes?: number[][];
 }
 
 /**
@@ -207,3 +210,46 @@ export const VIENEU_VOICES: VieNeuVoice[] = [
     description: 'Nữ miền Nam ấm áp, nhẹ nhàng, lắng đọng',
   },
 ];
+
+const CUSTOM_VOICES_STORAGE_KEY = 'vieneu_custom_cloned_voices';
+
+export function getLocalCustomVoices(): VieNeuVoice[] {
+  if (typeof window === 'undefined') return [];
+  try {
+    const raw = localStorage.getItem(CUSTOM_VOICES_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (e) {
+    console.warn('[vieneuVoices] Failed to parse local custom voices:', e);
+    return [];
+  }
+}
+
+export function saveLocalCustomVoice(voice: VieNeuVoice): void {
+  if (typeof window === 'undefined') return;
+  try {
+    const existing = getLocalCustomVoices();
+    const updated = [voice, ...existing.filter((v) => v.id !== voice.id && v.name !== voice.name)];
+    localStorage.setItem(CUSTOM_VOICES_STORAGE_KEY, JSON.stringify(updated));
+  } catch (e) {
+    console.error('[vieneuVoices] Failed to save custom voice to localStorage:', e);
+  }
+}
+
+export function deleteLocalCustomVoice(voiceId: string): void {
+  if (typeof window === 'undefined') return;
+  try {
+    const existing = getLocalCustomVoices();
+    const updated = existing.filter((v) => v.id !== voiceId && v.name !== voiceId);
+    localStorage.setItem(CUSTOM_VOICES_STORAGE_KEY, JSON.stringify(updated));
+  } catch (e) {
+    console.error('[vieneuVoices] Failed to delete custom voice from localStorage:', e);
+  }
+}
+
+export function getAllVieNeuVoices(): VieNeuVoice[] {
+  const custom = getLocalCustomVoices();
+  return [...custom, ...VIENEU_VOICES];
+}
+

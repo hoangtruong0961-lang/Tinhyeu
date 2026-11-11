@@ -75,8 +75,11 @@ import { CustomColorPicker } from './CustomColorPicker';
 import { wrapSubtitleText, parseSRT, exportToSRT, exportToASS, exportToVTT, exportToTXT } from '../utils/srtParser';
 import { generateVoiceoverWav } from '../utils/audioExporter';
 import { cleanTranslatedSubtitleText } from '../utils/subtitleCleaner';
-import { VIENEU_VOICES } from '../data/vieneuVoices';
+import { VIENEU_VOICES, getAllVieNeuVoices, getLocalCustomVoices, saveLocalCustomVoice, deleteLocalCustomVoice, VieNeuVoice } from '../data/vieneuVoices';
 import { VieNeuModelDownloadModal } from './VieNeuModelDownloadModal';
+import { VieNeuVoiceCloneModal } from './VieNeuVoiceCloneModal';
+import { Capacitor } from '@capacitor/core';
+import { VieNeuNative } from '../plugins/vieneuPlugin';
 
 interface CapCutBottomBarProps {
   activeTab: CapCutTab | null;
@@ -876,8 +879,28 @@ export const CapCutBottomBar: React.FC<CapCutBottomBarProps> = ({
   const [autoMergeSubtitles, setAutoMergeSubtitles] = useState<boolean>(true);
   const [isTuningCollapsed, setIsTuningCollapsed] = useState<boolean>(false);
   const [isTestingTts, setIsTestingTts] = useState<boolean>(false);
-  const [isCacheCleared, setIsCacheCleared] = useState<boolean>(false);
   const [isVieNeuModalOpen, setIsVieNeuModalOpen] = useState<boolean>(false);
+  const [isCloneModalOpen, setIsCloneModalOpen] = useState<boolean>(false);
+  const [customVieNeuVoices, setCustomVieNeuVoices] = useState<VieNeuVoice[]>([]);
+  const [isCacheCleared, setIsCacheCleared] = useState<boolean>(false);
+
+  useEffect(() => {
+    const local = getLocalCustomVoices();
+    setCustomVieNeuVoices(local);
+
+    // Fetch and merge server custom voices
+    fetch('/api/vieneu/custom-voices')
+      .then((r) => r.json())
+      .then((d) => {
+        if (d && d.success && Array.isArray(d.voices)) {
+          d.voices.forEach((v: any) => {
+            saveLocalCustomVoice(v);
+          });
+          setCustomVieNeuVoices(getLocalCustomVoices());
+        }
+      })
+      .catch((e) => console.debug('[CapCutBottomBar] Custom voices fetch fallback:', e));
+  }, []);
 
   useEffect(() => {
     if (appSettings.ttsProvider) {
@@ -1950,13 +1973,25 @@ export const CapCutBottomBar: React.FC<CapCutBottomBarProps> = ({
                         Giọng thuyết minh
                       </label>
                       {selectedTtsProvider === 'vieneu_tts' && (
-                        <button
-                          type="button"
-                          onClick={() => setIsVieNeuModalOpen(true)}
-                          className="text-[10px] text-amber-400 hover:text-amber-300 underline font-semibold cursor-pointer"
-                        >
-                          Tải mô hình (~147 MB)
-                        </button>
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => setIsCloneModalOpen(true)}
+                            className="text-[10px] text-amber-400 hover:text-amber-300 font-bold flex items-center gap-0.5 cursor-pointer hover:underline"
+                            title="Tạo giọng đọc mới từ bản thu âm hoặc file audio mẫu"
+                          >
+                            <Sparkles className="w-3 h-3 text-amber-400 animate-pulse" />
+                            + Nhân bản (Clone)
+                          </button>
+                          <span className="text-[10px] text-zinc-600">|</span>
+                          <button
+                            type="button"
+                            onClick={() => setIsVieNeuModalOpen(true)}
+                            className="text-[10px] text-zinc-400 hover:text-zinc-300 underline font-medium cursor-pointer"
+                          >
+                            Tải mô hình
+                          </button>
+                        </div>
                       )}
                     </div>
 
@@ -1970,6 +2005,15 @@ export const CapCutBottomBar: React.FC<CapCutBottomBarProps> = ({
                         }}
                         className="w-full bg-transparent text-xs font-bold text-amber-300 focus:outline-none cursor-pointer appearance-none pr-7"
                       >
+                        {customVieNeuVoices.length > 0 && (
+                          <optgroup label="✨ Giọng nhân bản của bạn (Voice Clone)" className="bg-[#1e1e24] text-amber-300 font-bold">
+                            {customVieNeuVoices.map((v) => (
+                              <option key={v.id} value={v.id} className="bg-[#1e1e24] text-amber-200">
+                                ⭐ [Clone] {v.name} - {v.style}
+                              </option>
+                            ))}
+                          </optgroup>
+                        )}
                         <optgroup label="🌟 Miền Bắc (Tin tức & Đời thường)" className="bg-[#1e1e24] text-amber-400 font-bold">
                           {VIENEU_VOICES.filter((v) => v.accent === 'bac').map((v) => (
                             <option key={v.id} value={v.id} className="bg-[#1e1e24] text-white">
@@ -4542,6 +4586,34 @@ export const CapCutBottomBar: React.FC<CapCutBottomBarProps> = ({
       <VieNeuModelDownloadModal
         isOpen={isVieNeuModalOpen}
         onClose={() => setIsVieNeuModalOpen(false)}
+      />
+
+      <VieNeuVoiceCloneModal
+        isOpen={isCloneModalOpen}
+        onClose={() => setIsCloneModalOpen(false)}
+        customVoices={customVieNeuVoices}
+        onVoiceCreated={(newVoice) => {
+          saveLocalCustomVoice(newVoice);
+          setCustomVieNeuVoices(getLocalCustomVoices());
+          onSaveSettings({ ...appSettings, vieneuVoice: newVoice.name });
+        }}
+        onDeleteCustomVoice={async (id) => {
+          if (window.confirm('Bạn có chắc muốn xóa giọng nhân bản này không?')) {
+            deleteLocalCustomVoice(id);
+            setCustomVieNeuVoices(getLocalCustomVoices());
+            try {
+              await fetch(`/api/vieneu/custom-voices/${encodeURIComponent(id)}`, { method: 'DELETE' });
+            } catch {}
+            if (Capacitor.isNativePlatform()) {
+              try {
+                await VieNeuNative.deleteCustomVoice({ name: id });
+              } catch {}
+            }
+            if (appSettings.vieneuVoice === id) {
+              onSaveSettings({ ...appSettings, vieneuVoice: 'Minh Đức' });
+            }
+          }
+        }}
       />
     </>
   );

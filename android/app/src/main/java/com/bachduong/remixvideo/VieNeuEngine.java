@@ -783,6 +783,80 @@ public class VieNeuEngine {
             }
             voicesJsonObject = new JSONObject(sb.toString());
         }
+
+        // Also merge any saved custom cloned voices from custom_voices.json
+        try {
+            File customFile = new File(modelsDir, "custom_voices.json");
+            if (customFile.exists()) {
+                try (BufferedReader cbr = new BufferedReader(new InputStreamReader(new FileInputStream(customFile), StandardCharsets.UTF_8))) {
+                    StringBuilder csb = new StringBuilder();
+                    String cline;
+                    while ((cline = cbr.readLine()) != null) {
+                        csb.append(cline);
+                    }
+                    JSONObject customObj = new JSONObject(csb.toString());
+                    JSONObject presets = voicesJsonObject.optJSONObject("presets");
+                    if (presets == null) {
+                        presets = new JSONObject();
+                        voicesJsonObject.put("presets", presets);
+                    }
+                    JSONArray cnames = customObj.names();
+                    if (cnames != null) {
+                        for (int i = 0; i < cnames.length(); i++) {
+                            String k = cnames.getString(i);
+                            presets.put(k, customObj.get(k));
+                        }
+                    }
+                    Log.d(TAG, "Loaded custom cloned voices from " + customFile.getName());
+                }
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to load custom voices file: " + e.getMessage());
+        }
+    }
+
+    public void registerCustomVoice(String name, float[] speakerEmb, int[][] codes) {
+        if (voicesJsonObject == null) return;
+        try {
+            JSONObject presets = voicesJsonObject.optJSONObject("presets");
+            if (presets == null) {
+                presets = new JSONObject();
+                voicesJsonObject.put("presets", presets);
+            }
+            JSONObject voiceData = new JSONObject();
+            JSONArray spkArr = new JSONArray();
+            for (float f : speakerEmb) {
+                spkArr.put((double) f);
+            }
+            voiceData.put("speaker_emb", spkArr);
+
+            JSONArray codesArr = new JSONArray();
+            for (int[] row : codes) {
+                JSONArray rowArr = new JSONArray();
+                for (int c : row) rowArr.put(c);
+                codesArr.put(rowArr);
+            }
+            voiceData.put("codes", codesArr);
+
+            presets.put(name, voiceData);
+            Log.d(TAG, "Registered custom voice: " + name + " with " + codes.length + " ref frames");
+
+            // Persist to custom_voices.json in modelsDir
+            File customFile = new File(modelsDir, "custom_voices.json");
+            JSONObject customFileObj = new JSONObject();
+            if (customFile.exists()) {
+                try {
+                    String existing = new String(java.nio.file.Files.readAllBytes(customFile.toPath()), StandardCharsets.UTF_8);
+                    customFileObj = new JSONObject(existing);
+                } catch (Exception ignored) {}
+            }
+            customFileObj.put(name, voiceData);
+            try (FileOutputStream fos = new FileOutputStream(customFile)) {
+                fos.write(customFileObj.toString().getBytes(StandardCharsets.UTF_8));
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to register custom voice: " + name, e);
+        }
     }
 
     private void loadNpzWeights(File npzFile) throws Exception {

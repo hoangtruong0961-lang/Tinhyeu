@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   SlidersHorizontal,
   ChevronDown,
@@ -25,8 +25,11 @@ import {
   Sparkles,
 } from 'lucide-react';
 import { AppSettings, ApiConnectionMode } from '../types';
-import { VIENEU_VOICES } from '../data/vieneuVoices';
+import { VIENEU_VOICES, getLocalCustomVoices, saveLocalCustomVoice, deleteLocalCustomVoice, VieNeuVoice } from '../data/vieneuVoices';
 import { VieNeuModelDownloadModal } from './VieNeuModelDownloadModal';
+import { VieNeuVoiceCloneModal } from './VieNeuVoiceCloneModal';
+import { Capacitor } from '@capacitor/core';
+import { VieNeuNative } from '../plugins/vieneuPlugin';
 
 interface AdvancedConfigDrawerProps {
   formData: AppSettings;
@@ -96,6 +99,22 @@ export const AdvancedConfigDrawer: React.FC<AdvancedConfigDrawerProps> = ({
   const [isTestingBackend, setIsTestingBackend] = useState(false);
   const [backendTestStatus, setBackendTestStatus] = useState<{ success: boolean; msg: string } | null>(null);
   const [isVieNeuModalOpen, setIsVieNeuModalOpen] = useState(false);
+  const [isCloneModalOpen, setIsCloneModalOpen] = useState(false);
+  const [customVieNeuVoices, setCustomVieNeuVoices] = useState<VieNeuVoice[]>(() => getLocalCustomVoices());
+
+  useEffect(() => {
+    fetch('/api/vieneu/custom-voices')
+      .then((r) => r.json())
+      .then((d) => {
+        if (d && d.success && Array.isArray(d.voices)) {
+          d.voices.forEach((v: any) => {
+            saveLocalCustomVoice(v);
+          });
+          setCustomVieNeuVoices(getLocalCustomVoices());
+        }
+      })
+      .catch(() => {});
+  }, []);
 
   const handleTestBackendServer = async () => {
     const url = (formData.backendServerUrl || '').trim().replace(/\/+$/, '');
@@ -554,14 +573,26 @@ export const AdvancedConfigDrawer: React.FC<AdvancedConfigDrawerProps> = ({
                   <div className="flex items-center justify-between">
                     <label className="text-[11px] font-semibold text-slate-300 block">Giọng đọc:</label>
                     {formData.ttsProvider === 'vieneu_tts' && (
-                      <button
-                        type="button"
-                        onClick={() => setIsVieNeuModalOpen(true)}
-                        className="text-[10px] text-amber-400 hover:text-amber-300 underline font-medium flex items-center gap-1"
-                      >
-                        <Sparkles className="w-3 h-3" />
-                        <span>Tải mô hình</span>
-                      </button>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setIsCloneModalOpen(true)}
+                          className="text-[10px] text-amber-400 hover:text-amber-300 font-bold flex items-center gap-1 cursor-pointer hover:underline"
+                          title="Tạo giọng đọc mới từ bản thu âm hoặc file audio mẫu"
+                        >
+                          <Sparkles className="w-3 h-3 text-amber-400 animate-pulse" />
+                          <span>+ Nhân bản giọng</span>
+                        </button>
+                        <span className="text-[10px] text-slate-600">|</span>
+                        <button
+                          type="button"
+                          onClick={() => setIsVieNeuModalOpen(true)}
+                          className="text-[10px] text-slate-400 hover:text-slate-300 underline font-medium flex items-center gap-1 cursor-pointer"
+                        >
+                          <DownloadCloud className="w-3 h-3" />
+                          <span>Tải mô hình</span>
+                        </button>
+                      </div>
                     )}
                   </div>
                   {formData.ttsProvider === 'vieneu_tts' ? (
@@ -571,6 +602,15 @@ export const AdvancedConfigDrawer: React.FC<AdvancedConfigDrawerProps> = ({
                         onChange={(e) => handleChange('vieneuVoice', e.target.value)}
                         className="w-full bg-[#16161e] border border-amber-500/40 rounded-xl p-2 text-xs text-amber-200 focus:outline-none focus:border-amber-400"
                       >
+                        {customVieNeuVoices.length > 0 && (
+                          <optgroup label="✨ Giọng nhân bản của bạn (Voice Clone)">
+                            {customVieNeuVoices.map((v) => (
+                              <option key={v.id} value={v.id}>
+                                ⭐ [Clone] {v.name} - {v.style}
+                              </option>
+                            ))}
+                          </optgroup>
+                        )}
                         <optgroup label="🌟 Miền Bắc (Tin tức & Đời thường)">
                           {VIENEU_VOICES.filter((v) => v.accent === 'bac').map((v) => (
                             <option key={v.id} value={v.id}>
@@ -593,14 +633,25 @@ export const AdvancedConfigDrawer: React.FC<AdvancedConfigDrawerProps> = ({
                           ))}
                         </optgroup>
                       </select>
-                      <button
-                        type="button"
-                        onClick={() => setIsVieNeuModalOpen(true)}
-                        className="w-full px-3 py-1.5 rounded-lg bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/30 text-amber-300 text-[11px] font-medium flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
-                      >
-                        <DownloadCloud className="w-3.5 h-3.5" />
-                        <span>Quản lý / Tải gói mô hình VieNeu-TTS (~147 MB)</span>
-                      </button>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setIsCloneModalOpen(true)}
+                          className="flex-1 px-3 py-1.5 rounded-lg bg-gradient-to-r from-amber-500/20 to-orange-500/20 hover:from-amber-500/30 hover:to-orange-500/30 border border-amber-500/40 text-amber-300 text-[11px] font-semibold flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
+                        >
+                          <Sparkles className="w-3.5 h-3.5 text-amber-400" />
+                          <span>+ Nhân bản giọng mới</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setIsVieNeuModalOpen(true)}
+                          className="px-2.5 py-1.5 rounded-lg bg-slate-800/80 hover:bg-slate-700/80 border border-slate-700 text-slate-300 text-[11px] font-medium flex items-center justify-center gap-1 transition-colors cursor-pointer"
+                          title="Tải gói mô hình VieNeu-TTS offline (~147 MB)"
+                        >
+                          <DownloadCloud className="w-3.5 h-3.5" />
+                          <span>Gói mô hình</span>
+                        </button>
+                      </div>
                     </div>
                   ) : (formData.ttsProvider || 'capcut_tts') === 'capcut_tts' ? (
                     <select
@@ -954,6 +1005,34 @@ export const AdvancedConfigDrawer: React.FC<AdvancedConfigDrawerProps> = ({
       <VieNeuModelDownloadModal
         isOpen={isVieNeuModalOpen}
         onClose={() => setIsVieNeuModalOpen(false)}
+      />
+
+      <VieNeuVoiceCloneModal
+        isOpen={isCloneModalOpen}
+        onClose={() => setIsCloneModalOpen(false)}
+        customVoices={customVieNeuVoices}
+        onVoiceCreated={(newVoice) => {
+          saveLocalCustomVoice(newVoice);
+          setCustomVieNeuVoices(getLocalCustomVoices());
+          handleChange('vieneuVoice', newVoice.name);
+        }}
+        onDeleteCustomVoice={async (id) => {
+          if (window.confirm('Bạn có chắc muốn xóa giọng nhân bản này không?')) {
+            deleteLocalCustomVoice(id);
+            setCustomVieNeuVoices(getLocalCustomVoices());
+            try {
+              await fetch(`/api/vieneu/custom-voices/${encodeURIComponent(id)}`, { method: 'DELETE' });
+            } catch {}
+            if (Capacitor.isNativePlatform()) {
+              try {
+                await VieNeuNative.deleteCustomVoice({ name: id });
+              } catch {}
+            }
+            if (formData.vieneuVoice === id) {
+              handleChange('vieneuVoice', 'Minh Đức');
+            }
+          }
+        }}
       />
     </div>
   );

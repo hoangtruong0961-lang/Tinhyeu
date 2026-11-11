@@ -206,6 +206,129 @@ public class VieNeuPlugin extends Plugin {
     }
 
     @PluginMethod
+    public void saveCustomVoice(PluginCall call) {
+        try {
+            String name = call.getString("name");
+            JSArray spkEmbArr = call.getArray("speakerEmb");
+            if (spkEmbArr == null) {
+                spkEmbArr = call.getArray("speaker_emb");
+            }
+            JSArray codesArr = call.getArray("codes");
+
+            if (name == null || spkEmbArr == null || codesArr == null) {
+                call.reject("Missing required parameters: name, speakerEmb, codes");
+                return;
+            }
+
+            File dir = getModelsDir();
+            File customFile = new File(dir, "custom_voices.json");
+            JSONObject customObj = new JSONObject();
+            if (customFile.exists()) {
+                try (BufferedReader cbr = new BufferedReader(new InputStreamReader(new FileInputStream(customFile), StandardCharsets.UTF_8))) {
+                    StringBuilder csb = new StringBuilder();
+                    String cline;
+                    while ((cline = cbr.readLine()) != null) csb.append(cline);
+                    customObj = new JSONObject(csb.toString());
+                } catch (Exception ignored) {}
+            }
+
+            JSONObject voiceEntry = new JSONObject();
+            voiceEntry.put("speaker_emb", spkEmbArr);
+            voiceEntry.put("codes", codesArr);
+            customObj.put(name, voiceEntry);
+
+            try (FileOutputStream fos = new FileOutputStream(customFile)) {
+                fos.write(customObj.toString(2).getBytes(StandardCharsets.UTF_8));
+            }
+
+            // Reload engine presets
+            if (engineInstance != null) {
+                engineInstance.release();
+                engineInstance.initialize();
+            }
+
+            Log.d(TAG, "Saved custom voice '" + name + "' to " + customFile.getAbsolutePath());
+            JSObject res = new JSObject();
+            res.put("success", true);
+            res.put("message", "Đã lưu giọng nhân bản '" + name + "' vào bộ nhớ máy Android");
+            call.resolve(res);
+        } catch (Exception e) {
+            Log.e(TAG, "saveCustomVoice error", e);
+            call.reject("Failed to save custom voice: " + e.getMessage());
+        }
+    }
+
+    @PluginMethod
+    public void listCustomVoices(PluginCall call) {
+        try {
+            File dir = getModelsDir();
+            File customFile = new File(dir, "custom_voices.json");
+            JSArray arr = new JSArray();
+            if (customFile.exists()) {
+                try (BufferedReader cbr = new BufferedReader(new InputStreamReader(new FileInputStream(customFile), StandardCharsets.UTF_8))) {
+                    StringBuilder csb = new StringBuilder();
+                    String cline;
+                    while ((cline = cbr.readLine()) != null) csb.append(cline);
+                    JSONObject customObj = new JSONObject(csb.toString());
+                    JSONArray names = customObj.names();
+                    if (names != null) {
+                        for (int i = 0; i < names.length(); i++) {
+                            String k = names.getString(i);
+                            JSObject o = new JSObject();
+                            o.put("id", k);
+                            o.put("name", k);
+                            arr.put(o);
+                        }
+                    }
+                }
+            }
+            JSObject res = new JSObject();
+            res.put("success", true);
+            res.put("voices", arr);
+            call.resolve(res);
+        } catch (Exception e) {
+            call.reject("Failed to list custom voices: " + e.getMessage());
+        }
+    }
+
+    @PluginMethod
+    public void deleteCustomVoice(PluginCall call) {
+        try {
+            String name = call.getString("name");
+            if (name == null || name.trim().isEmpty()) {
+                call.reject("Voice name is required");
+                return;
+            }
+            File dir = getModelsDir();
+            File customFile = new File(dir, "custom_voices.json");
+            if (customFile.exists()) {
+                JSONObject customObj = new JSONObject();
+                try (BufferedReader cbr = new BufferedReader(new InputStreamReader(new FileInputStream(customFile), StandardCharsets.UTF_8))) {
+                    StringBuilder csb = new StringBuilder();
+                    String cline;
+                    while ((cline = cbr.readLine()) != null) csb.append(cline);
+                    customObj = new JSONObject(csb.toString());
+                }
+                if (customObj.has(name)) {
+                    customObj.remove(name);
+                    try (FileOutputStream fos = new FileOutputStream(customFile)) {
+                        fos.write(customObj.toString(2).getBytes(StandardCharsets.UTF_8));
+                    }
+                }
+            }
+            if (engineInstance != null) {
+                engineInstance.release();
+                engineInstance.initialize();
+            }
+            JSObject res = new JSObject();
+            res.put("success", true);
+            call.resolve(res);
+        } catch (Exception e) {
+            call.reject("Failed to delete custom voice: " + e.getMessage());
+        }
+    }
+
+    @PluginMethod
     public void synthesize(PluginCall call) {
         JSArray tokenIdsArray = call.getArray("tokenIds");
         if (tokenIdsArray == null || tokenIdsArray.length() == 0) {
@@ -304,6 +427,80 @@ public class VieNeuPlugin extends Plugin {
             call.resolve(ret);
         } catch (Exception e) {
             call.reject("Failed to release models: " + e.getMessage());
+        }
+    }
+
+    @PluginMethod
+    public void saveCustomVoice(PluginCall call) {
+        try {
+            String name = call.getString("name");
+            JSArray spkArray = call.getArray("speakerEmb");
+            JSArray codesArray = call.getArray("codes");
+
+            if (name == null || spkArray == null || codesArray == null) {
+                call.reject("Missing name, speakerEmb, or codes");
+                return;
+            }
+
+            float[] speakerEmb = new float[spkArray.length()];
+            for (int i = 0; i < spkArray.length(); i++) {
+                speakerEmb[i] = (float) spkArray.getDouble(i);
+            }
+
+            int numFrames = codesArray.length();
+            int[][] codes = new int[numFrames][16];
+            for (int f = 0; f < numFrames; f++) {
+                JSONArray row = codesArray.getJSONArray(f);
+                for (int c = 0; c < 16; c++) {
+                    codes[f][c] = row.getInt(c);
+                }
+            }
+
+            File dir = getModelsDir();
+            if (engineInstance == null && verifyModelFiles(dir)) {
+                engineInstance = new VieNeuEngine(dir);
+                engineInstance.initialize();
+            }
+            if (engineInstance != null) {
+                engineInstance.registerCustomVoice(name, speakerEmb, codes);
+            }
+
+            JSObject res = new JSObject();
+            res.put("success", true);
+            res.put("message", "Đã lưu giọng nhân bản '" + name + "' vào thiết bị.");
+            call.resolve(res);
+        } catch (Exception e) {
+            Log.e(TAG, "saveCustomVoice error", e);
+            call.reject("Failed to save custom voice: " + e.getMessage());
+        }
+    }
+
+    @PluginMethod
+    public void listCustomVoices(PluginCall call) {
+        try {
+            File dir = getModelsDir();
+            File customFile = new File(dir, "custom_voices.json");
+            JSArray arr = new JSArray();
+            if (customFile.exists()) {
+                String content = new String(java.nio.file.Files.readAllBytes(customFile.toPath()), StandardCharsets.UTF_8);
+                JSONObject obj = new JSONObject(content);
+                JSONArray names = obj.names();
+                if (names != null) {
+                    for (int i = 0; i < names.length(); i++) {
+                        String k = names.getString(i);
+                        JSObject vObj = new JSObject();
+                        vObj.put("id", k);
+                        vObj.put("name", k);
+                        arr.put(vObj);
+                    }
+                }
+            }
+            JSObject res = new JSObject();
+            res.put("success", true);
+            res.put("voices", arr);
+            call.resolve(res);
+        } catch (Exception e) {
+            call.reject("Failed to list custom voices: " + e.getMessage());
         }
     }
 

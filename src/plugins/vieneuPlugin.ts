@@ -38,6 +38,9 @@ export interface VieNeuPluginInterface {
   cancelDownload(): Promise<{ success: boolean }>;
   deleteModels(): Promise<{ success: boolean; message: string }>;
   listVoices(): Promise<{ success: boolean; voices: string[] }>;
+  saveCustomVoice(options: { name: string; speakerEmb: number[]; codes: number[][] }): Promise<{ success: boolean; message: string }>;
+  listCustomVoices(): Promise<{ success: boolean; voices: { id: string; name: string }[] }>;
+  deleteCustomVoice(options: { name: string }): Promise<{ success: boolean }>;
   synthesize(options: VieNeuSynthesizeOptions): Promise<VieNeuSynthesizeResult>;
   cancelSynthesis(): Promise<{ success: boolean }>;
   releaseModels(): Promise<{ success: boolean }>;
@@ -69,8 +72,17 @@ export const VieNeuNative = registerPlugin<VieNeuPluginInterface>('VieNeuNative'
     async listVoices() {
       return {
         success: true,
-        voices: ['Minh Đức', 'Mai Anh', 'Mạnh Dũng', 'Lan Nhi', 'Tuấn Kiệt', 'Phương Trang', 'Gia Huy', 'Thảo My', 'Quốc Bảo', 'Bích Ngọc', 'Hoàng Nam', 'Khánh Vy', 'Thanh Thảo', 'Văn Phong'],
+        voices: ['Minh Đức', 'Phạm Tuyên', 'Thái Sơn', 'Xuân Vĩnh', 'Thanh Bình', 'Mai Anh', 'Ngọc Huyền'],
       };
+    },
+    async saveCustomVoice(_options: { name: string; speakerEmb: number[]; codes: number[][] }) {
+      return { success: true, message: 'Saved on web' };
+    },
+    async listCustomVoices() {
+      return { success: true, voices: [] };
+    },
+    async deleteCustomVoice(_options: { name: string }) {
+      return { success: true };
     },
     async synthesize() {
       throw new Error('Động cơ VieNeu-TTS v3 Turbo Offline chạy trực tiếp trên Android qua ONNX Runtime. Bản Web xem trước tự động chuyển sang CapCut/Edge TTS server fallback.');
