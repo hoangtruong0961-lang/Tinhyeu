@@ -3,9 +3,9 @@ package com.bachduong.remixvideo;
 import android.util.Log;
 
 import ai.onnxruntime.OnnxTensor;
+import ai.onnxruntime.OnnxValue;
 import ai.onnxruntime.OrtEnvironment;
 import ai.onnxruntime.OrtSession;
-import ai.onnxruntime.OrtValue;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -486,7 +486,7 @@ public class VieNeuEngine {
         lensTensor.close();
 
         // MOSS output waveform array
-        OrtValue val = codecRes.get(0);
+        OnnxValue val = codecRes.get(0);
         float[] pcmAudio = extractPcmWaveform(val.getValue());
         codecRes.close();
 

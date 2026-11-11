@@ -214,10 +214,13 @@ public class VieNeuPlugin extends Plugin {
         }
 
         String voiceName = call.getString("voiceName", "Minh Đức");
-        float temperature = (float) call.getDouble("temperature", 0.8);
+        Double dTemp = call.getDouble("temperature", 0.8);
+        float temperature = (dTemp != null) ? dTemp.floatValue() : 0.8f;
         int topK = call.getInt("topK", 25);
-        float topP = (float) call.getDouble("topP", 0.95);
-        float repPenalty = (float) call.getDouble("repPenalty", 1.2);
+        Double dTopP = call.getDouble("topP", 0.95);
+        float topP = (dTopP != null) ? dTopP.floatValue() : 0.95f;
+        Double dRep = call.getDouble("repPenalty", 1.2);
+        float repPenalty = (dRep != null) ? dRep.floatValue() : 1.2f;
         int repWindow = call.getInt("repWindow", 64);
         int maxFrames = call.getInt("maxFrames", 250);
 
