@@ -17,17 +17,19 @@ service cloud.firestore {
       allow read, write: if true;
     }
 
-    // 4. Admin Accounts (`/admins/{adminId}`)
+    // 4. Cloud Licenses Collection (`/cloud_licenses/{licenseId}`)
+    match /cloud_licenses/{licenseId} {
+      allow read, write: if true;
+    }
+
+    // 5. Admin Accounts (`/admins/{adminId}`)
     match /admins/{adminId} {
       allow read, write: if true;
     }
 
-    // 5. System Configuration (`/system_config/{configId}`)
+    // 6. System Configuration (`/system_config/{configId}`)
     match /system_config/{configId} {
       allow read, write: if true;
     }
   }
 }
-
-
-

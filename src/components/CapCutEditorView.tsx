@@ -52,6 +52,8 @@ import { HelpModal } from './HelpModal';
 import { ConfigView } from './ConfigView';
 import { ExportSettingsConfig } from '../types';
 import { Capacitor } from '@capacitor/core';
+import { VieNeuNative } from '../plugins/vieneuPlugin';
+import { convertTextToTokenIds } from '../utils/vieneuTextProcessor';
 
 interface CapCutEditorViewProps {
   project: Project;
@@ -2722,6 +2724,41 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
   ): Promise<string | null> => {
     try {
       const currentSettings = appSettingsRef.current || appSettings;
+      const actualProvider = provider || currentSettings.ttsProvider || 'capcut_tts';
+
+      // Native Android VieNeu-TTS v3 Turbo Offline Synthesis
+      if (actualProvider === 'vieneu_tts' && Capacitor.isNativePlatform()) {
+        try {
+          const voiceName = (provider === 'vieneu_tts' && voiceOverride) ? voiceOverride : (currentSettings.vieneuVoice || 'Minh Đức');
+          const tokenIds = await convertTextToTokenIds(textChunk);
+          const synRes = await VieNeuNative.synthesize({
+            tokenIds,
+            voiceName,
+            temperature: 0.8,
+            topP: 0.95,
+            repPenalty: 1.2,
+          });
+
+          if (synRes && synRes.success && synRes.audioPath) {
+            const webUrl = Capacitor.convertFileSrc(synRes.audioPath);
+            const aRes = await fetch(webUrl);
+            const blob = await aRes.blob();
+            return await new Promise<string>((resolve, reject) => {
+              const reader = new FileReader();
+              reader.onloadend = () => {
+                const dataUrl = reader.result as string;
+                const b64 = dataUrl.includes(',') ? dataUrl.split(',')[1] : dataUrl;
+                resolve(b64);
+              };
+              reader.onerror = reject;
+              reader.readAsDataURL(blob);
+            });
+          }
+        } catch (nativeErr) {
+          console.warn('[VieNeu Native TTS Synthesis Exception - falling back to server preview]', nativeErr);
+        }
+      }
+
       const res = await fetch('/api/tts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },

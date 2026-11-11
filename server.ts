@@ -802,6 +802,28 @@ async function startServer() {
     return res.redirect(`https://cdn.jsdelivr.net/npm/onnxruntime-web@1.23.2/dist/${encodeURIComponent(filename)}`);
   });
 
+  // VieNeu-TTS v3 Turbo Model Files Endpoint (tokenizer.json, vieneu_vi_g2p.json, etc.)
+  app.get('/api/vieneu-models/:filename', (req, res) => {
+    const filename = req.params.filename;
+    const safeFilename = path.basename(filename);
+    const candidatePaths = [
+      path.join(process.cwd(), 'models', safeFilename),
+      path.join(process.cwd(), 'public', safeFilename),
+      path.join(process.cwd(), 'public', 'models', safeFilename),
+    ];
+    for (const p of candidatePaths) {
+      if (fs.existsSync(p)) {
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+        if (safeFilename.endsWith('.json')) {
+          res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        }
+        return res.sendFile(p);
+      }
+    }
+    res.status(404).json({ error: `VieNeu model file ${safeFilename} not found.` });
+  });
+
   // PaddleOCR Models & Dictionary Serving Endpoints
   const PADDLE_MODEL_CONFIGS: Record<string, { filename: string; remoteUrl: string; fallbackUrls: string[]; minSize: number; contentType: string }> = {
     det: {
