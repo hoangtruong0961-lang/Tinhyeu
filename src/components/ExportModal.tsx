@@ -28,6 +28,7 @@ import {
   LogoOverlay,
   TextOverlay,
   ExportSettingsConfig,
+  AudioEffectType,
 } from '../types';
 import { exportToSRT, exportToASS } from '../utils/srtParser';
 import { generateVoiceoverWav } from '../utils/audioExporter';
@@ -56,6 +57,7 @@ interface ExportModalProps {
   ttsSpeed?: number;
   ttsPitch?: number;
   videoVolume?: number;
+  videoAudioEffect?: AudioEffectType;
   blurOverlays?: BlurOverlay[];
   logoOverlays?: LogoOverlay[];
   textOverlays?: TextOverlay[];
@@ -76,6 +78,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
   ttsSpeed = 1.0,
   ttsPitch = 0,
   videoVolume = 1.0,
+  videoAudioEffect = 'none',
   blurOverlays = [],
   logoOverlays = [],
   textOverlays = [],
@@ -340,6 +343,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
               gpuEncoder: isGpuAccelerated ? 'auto' : 'cpu',
               subMode: 'hardsub',
               videoVolume,
+              videoAudioEffect: videoAudioEffect || exportSettings?.videoAudioEffect,
             },
           });
 
@@ -381,6 +385,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
             ttsSpeed,
             ttsPitch,
             videoVolume,
+            videoAudioEffect: videoAudioEffect || exportSettings?.videoAudioEffect,
             videoDuration,
             width: targetWidth,
             height: targetHeight,
@@ -431,6 +436,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
             ttsSpeed,
             ttsPitch,
             videoVolume,
+            videoAudioEffect: videoAudioEffect || exportSettings?.videoAudioEffect,
             videoDuration,
             targetWidth,
             targetHeight,

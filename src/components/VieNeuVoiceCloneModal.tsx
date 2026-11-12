@@ -12,7 +12,12 @@ import {
   Volume2,
   Trash2,
   RefreshCw,
-  Info
+  Info,
+  ChevronDown,
+  ChevronUp,
+  Copy,
+  Check,
+  AlertTriangle
 } from 'lucide-react';
 import { Capacitor } from '@capacitor/core';
 import { VieNeuNative } from '../plugins/vieneuPlugin';
@@ -36,6 +41,16 @@ interface VieNeuVoiceCloneModalProps {
   onVoiceCreated: (newVoice: CustomVoiceItem) => void;
   customVoices: CustomVoiceItem[];
   onDeleteCustomVoice: (id: string) => void;
+}
+
+export interface DetailedErrorInfo {
+  title: string;
+  statusCode?: number;
+  message: string;
+  cause?: string;
+  suggestion?: string;
+  technicalDetails?: string;
+  urlsTried?: string[];
 }
 
 export const VieNeuVoiceCloneModal: React.FC<VieNeuVoiceCloneModalProps> = ({
@@ -68,10 +83,13 @@ export const VieNeuVoiceCloneModal: React.FC<VieNeuVoiceCloneModalProps> = ({
   const [isPlayingPreview, setIsPlayingPreview] = useState<boolean>(false);
   const audioPreviewRef = useRef<HTMLAudioElement | null>(null);
 
-  // Submission state
+  // Submission & Error state
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const [processStep, setProcessStep] = useState<string>('');
   const [error, setError] = useState<string | null>(null);
+  const [detailedError, setDetailedError] = useState<DetailedErrorInfo | null>(null);
+  const [showTechDetails, setShowTechDetails] = useState<boolean>(false);
+  const [copiedTechDetails, setCopiedTechDetails] = useState<boolean>(false);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
 
   useEffect(() => {
@@ -93,6 +111,9 @@ export const VieNeuVoiceCloneModal: React.FC<VieNeuVoiceCloneModalProps> = ({
     setIsPlayingPreview(false);
     setIsProcessing(false);
     setError(null);
+    setDetailedError(null);
+    setShowTechDetails(false);
+    setCopiedTechDetails(false);
     setSuccessMsg(null);
     setProcessStep('');
   };
@@ -101,6 +122,7 @@ export const VieNeuVoiceCloneModal: React.FC<VieNeuVoiceCloneModalProps> = ({
   const startRecording = async () => {
     try {
       setError(null);
+      setDetailedError(null);
       setSuccessMsg(null);
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       audioChunksRef.current = [];
@@ -155,6 +177,7 @@ export const VieNeuVoiceCloneModal: React.FC<VieNeuVoiceCloneModalProps> = ({
     const file = e.target.files?.[0];
     if (!file) return;
     setError(null);
+    setDetailedError(null);
     setSuccessMsg(null);
     setUploadedFile(file);
     const url = URL.createObjectURL(file);
@@ -194,6 +217,7 @@ export const VieNeuVoiceCloneModal: React.FC<VieNeuVoiceCloneModalProps> = ({
     try {
       setIsProcessing(true);
       setError(null);
+      setDetailedError(null);
       setSuccessMsg(null);
       setProcessStep('1/3: Đang đọc và chuyển đổi mẫu âm thanh...');
 
@@ -203,45 +227,124 @@ export const VieNeuVoiceCloneModal: React.FC<VieNeuVoiceCloneModalProps> = ({
       formData.append('gender', gender);
       formData.append('accent', accent);
 
-      setProcessStep('2/3: Đang trích xuất đặc trưng âm sắc 192 chiều & mã hóa 16 RVQ codebooks...');
+      setProcessStep('2/3: Đang gửi mẫu tới máy chủ & trích xuất đặc trưng âm sắc AI...');
 
-      const apiUrl = resolveApiUrl('/api/vieneu/clone-voice');
-      const res = await fetch(apiUrl, {
-        method: 'POST',
-        body: formData,
-      });
+      // Build candidate endpoints to fallback dynamically
+      const candidateUrls: string[] = [];
+      const primaryUrl = resolveApiUrl('/api/vieneu/clone-voice');
+      candidateUrls.push(primaryUrl);
+      candidateUrls.push(resolveApiUrl('/api/vieneu/clone'));
+      candidateUrls.push(resolveApiUrl('/api/clone-voice'));
 
-      if (!res.ok) {
-        const errJson = await res.json().catch(() => ({}));
-        throw new Error(errJson.error || `Máy chủ báo lỗi HTTP ${res.status}`);
+      if (typeof window !== 'undefined') {
+        const origin = window.location.origin;
+        candidateUrls.push(`${origin}/api/vieneu/clone-voice`);
+        candidateUrls.push(`${origin}/api/vieneu/clone`);
+        candidateUrls.push('/api/vieneu/clone-voice');
+        candidateUrls.push('/api/vieneu/clone');
       }
 
-      const data = await res.json();
-      if (!data.success || !data.voice) {
-        throw new Error(data.error || 'Không nhận được dữ liệu giọng nhân bản');
+      const uniqueUrls = Array.from(new Set(candidateUrls));
+      let lastResponseStatus = 0;
+      let lastResponseText = '';
+      let successfulData: any = null;
+      const attemptedLogs: string[] = [];
+
+      for (const url of uniqueUrls) {
+        try {
+          console.log(`[VieNeu Voice Clone] Attempting POST ${url}...`);
+          const res = await fetch(url, {
+            method: 'POST',
+            body: formData,
+          });
+
+          lastResponseStatus = res.status;
+          const statusDesc = `HTTP ${res.status} ${res.statusText || ''}`.trim();
+          attemptedLogs.push(`${url} => ${statusDesc}`);
+
+          if (res.ok) {
+            const data = await res.json();
+            if (data.success && data.voice) {
+              successfulData = data;
+              break;
+            } else {
+              lastResponseText = data.error || data.message || JSON.stringify(data);
+            }
+          } else {
+            let errText = '';
+            try {
+              const errJson = await res.json();
+              errText = errJson.error || errJson.details || errJson.message || JSON.stringify(errJson);
+            } catch (_) {
+              errText = await res.text().catch(() => '');
+            }
+            lastResponseText = errText || `Máy chủ phản hồi ${statusDesc}`;
+          }
+        } catch (fetchErr: any) {
+          attemptedLogs.push(`${url} => Lỗi kết nối: ${fetchErr?.message || fetchErr}`);
+        }
+      }
+
+      if (!successfulData) {
+        // Detailed error diagnosis
+        let title = 'Nhân bản giọng nói thất bại';
+        let cause = 'Máy chủ phản hồi không thành công hoặc không tìm thấy đường dẫn.';
+        let suggestion = 'Vui lòng kiểm tra địa chỉ máy chủ backend hoặc thử lại sau.';
+
+        if (lastResponseStatus === 404) {
+          title = 'Lỗi HTTP 404 - Đường Dẫn Máy Chủ Không Tồn Tại';
+          cause = `Tất cả các đường dẫn API nhân bản giọng (${uniqueUrls.join(', ')}) đều báo HTTP 404 Not Found.`;
+          suggestion = '1. Đảm bảo Server Express đang chạy đúng và đã khởi động lại trên port 3000.\n2. Kiểm tra lại tham số Backend Server URL trong phần Thiết lập (Settings).\n3. Nếu sử dụng ứng dụng di động (APK), hãy đảm bảo kết nối tới máy chủ Render/Backend đang online.';
+        } else if (lastResponseStatus === 400) {
+          title = 'Lỗi Mẫu Âm Thanh (HTTP 400)';
+          cause = lastResponseText || 'Dữ liệu âm thanh không hợp lệ hoặc quá ngắn (dưới 1.5 giây).';
+          suggestion = 'Vui lòng thu âm hoặc chọn tệp âm thanh có âm thanh rõ tiếng, không bị ngắt quãng, độ dài từ 3 đến 10 giây.';
+        } else if (lastResponseStatus === 500) {
+          title = 'Lỗi Xử Lý Máy Chủ (HTTP 500)';
+          cause = lastResponseText || 'Máy chủ gặp sự cố trong quá trình trích xuất âm sắc giọng đọc.';
+          suggestion = 'Thử lại với tệp âm thanh khác (định dạng MP3/WAV chuẩn), hoặc xem nhật ký lỗi bên dưới.';
+        } else if (lastResponseStatus === 0) {
+          title = 'Lỗi Kết Nối Mạng (Network Failure)';
+          cause = 'Trình duyệt/Ứng dụng không thể gửi yêu cầu HTTP tới máy chủ backend.';
+          suggestion = 'Vui lòng kiểm tra lại đường truyền Internet và đảm bảo địa chỉ Server backend khả dụng.';
+        }
+
+        const techLog = `[Chi Tiết Kỹ Thuật]\nTrạng thái HTTP: ${lastResponseStatus || 'N/A'}\nCác endpoint đã thử:\n${attemptedLogs.join('\n')}\n\n[Phản hồi từ Server]\n${lastResponseText || '(Không có nội dung)'}`;
+
+        setDetailedError({
+          title,
+          statusCode: lastResponseStatus,
+          message: lastResponseText || `Máy chủ báo lỗi HTTP ${lastResponseStatus || '404'}`,
+          cause,
+          suggestion,
+          technicalDetails: techLog,
+          urlsTried: uniqueUrls,
+        });
+
+        throw new Error(title);
       }
 
       setProcessStep('3/3: Đang đồng bộ hóa vào bộ nhớ máy offline...');
 
       const created: CustomVoiceItem = {
-        id: data.voice.id || cleanName,
-        name: data.voice.name || cleanName,
-        gender: data.voice.gender || gender,
-        accent: data.voice.accent || accent,
+        id: successfulData.voice.id || cleanName,
+        name: successfulData.voice.name || cleanName,
+        gender: successfulData.voice.gender || gender,
+        accent: successfulData.voice.accent || accent,
         style: 'Nhân bản AI (Voice Clone)',
-        description: data.voice.description || `Giọng nhân bản tùy chỉnh (${data.voice.codes?.length || 0} khung mã)`,
-        speaker_emb: data.voice.speaker_emb,
-        codes: data.voice.codes,
-        createdAt: data.voice.createdAt,
+        description: successfulData.voice.description || `Giọng nhân bản tùy chỉnh (${successfulData.voice.codes?.length || 0} khung mã)`,
+        speaker_emb: successfulData.voice.speaker_emb,
+        codes: successfulData.voice.codes,
+        createdAt: successfulData.voice.createdAt,
       };
 
       // If running on Android Native, sync directly into native engine custom_voices.json
-      if (Capacitor.isNativePlatform() && data.voice.speaker_emb && data.voice.codes) {
+      if (Capacitor.isNativePlatform() && successfulData.voice.speaker_emb && successfulData.voice.codes) {
         try {
           await VieNeuNative.saveCustomVoice({
             name: created.name,
-            speakerEmb: data.voice.speaker_emb,
-            codes: data.voice.codes,
+            speakerEmb: successfulData.voice.speaker_emb,
+            codes: successfulData.voice.codes,
           });
           console.log('[VieNeuVoiceCloneModal] Saved custom voice to native Android engine successfully');
         } catch (nativeSaveErr) {
@@ -258,7 +361,9 @@ export const VieNeuVoiceCloneModal: React.FC<VieNeuVoiceCloneModalProps> = ({
 
     } catch (err: any) {
       console.error('Clone voice failure:', err);
-      setError(err?.message || 'Quá trình nhân bản giọng nói thất bại.');
+      if (!detailedError) {
+        setError(err?.message || 'Quá trình nhân bản giọng nói thất bại.');
+      }
     } finally {
       setIsProcessing(false);
       setProcessStep('');
@@ -522,8 +627,93 @@ export const VieNeuVoiceCloneModal: React.FC<VieNeuVoiceCloneModalProps> = ({
             </div>
           )}
 
-          {/* Feedback & Status Message */}
-          {error && (
+          {/* Detailed Error Diagnosis Card */}
+          {detailedError && (
+            <div className="p-4 rounded-xl bg-gradient-to-br from-rose-950/50 via-rose-900/30 to-black border border-rose-500/40 text-xs text-rose-200 space-y-3 shadow-2xl animate-in fade-in duration-200">
+              <div className="flex items-start justify-between gap-2">
+                <div className="flex items-center gap-2.5">
+                  <div className="w-8 h-8 rounded-lg bg-rose-500/20 border border-rose-500/30 flex items-center justify-center text-rose-400 flex-shrink-0 shadow-inner">
+                    <AlertTriangle className="w-4 h-4 animate-pulse" />
+                  </div>
+                  <div>
+                    <h4 className="font-bold text-rose-100 text-xs flex items-center gap-2">
+                      {detailedError.title}
+                      {detailedError.statusCode ? (
+                        <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-rose-500/30 text-rose-300 font-bold border border-rose-500/40">
+                          HTTP {detailedError.statusCode}
+                        </span>
+                      ) : null}
+                    </h4>
+                    <p className="text-[11px] text-rose-300/80 mt-0.5">{detailedError.message}</p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setDetailedError(null)}
+                  className="text-rose-400 hover:text-white p-1 rounded-md hover:bg-rose-500/20 transition-colors cursor-pointer"
+                  title="Đóng thông báo"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              {detailedError.cause && (
+                <div className="p-2.5 rounded-lg bg-black/50 border border-rose-500/20 space-y-1">
+                  <span className="font-semibold text-rose-300 block text-[11px] flex items-center gap-1">
+                    <span className="w-1.5 h-1.5 rounded-full bg-rose-400 inline-block"></span>
+                    Nguyên nhân phát sinh:
+                  </span>
+                  <p className="text-zinc-300 leading-relaxed text-[11px] whitespace-pre-wrap pl-2.5">{detailedError.cause}</p>
+                </div>
+              )}
+
+              {detailedError.suggestion && (
+                <div className="p-2.5 rounded-lg bg-amber-500/10 border border-amber-500/25 space-y-1 text-amber-200">
+                  <span className="font-semibold text-amber-300 block text-[11px] flex items-center gap-1">
+                    <span className="w-1.5 h-1.5 rounded-full bg-amber-400 inline-block"></span>
+                    Gợi ý hướng xử lý:
+                  </span>
+                  <p className="text-amber-100/90 leading-relaxed text-[11px] whitespace-pre-wrap pl-2.5">{detailedError.suggestion}</p>
+                </div>
+              )}
+
+              {detailedError.technicalDetails && (
+                <div>
+                  <button
+                    type="button"
+                    onClick={() => setShowTechDetails(!showTechDetails)}
+                    className="flex items-center gap-1.5 text-[11px] text-zinc-400 hover:text-zinc-200 font-mono py-1 cursor-pointer select-none"
+                  >
+                    {showTechDetails ? <ChevronUp className="w-3.5 h-3.5 text-rose-400" /> : <ChevronDown className="w-3.5 h-3.5 text-rose-400" />}
+                    {showTechDetails ? 'Ẩn nhật ký kỹ thuật (Diagnostic Logs)' : 'Xem chi tiết kỹ thuật & Nhật ký Endpoint máy chủ'}
+                  </button>
+
+                  {showTechDetails && (
+                    <div className="relative mt-2 p-3 rounded-xl bg-black/90 border border-zinc-800 font-mono text-[10px] text-zinc-300 overflow-x-auto max-h-48 leading-relaxed shadow-inner">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (detailedError.technicalDetails) {
+                            navigator.clipboard.writeText(detailedError.technicalDetails);
+                            setCopiedTechDetails(true);
+                            setTimeout(() => setCopiedTechDetails(false), 2000);
+                          }
+                        }}
+                        className="absolute top-2.5 right-2.5 px-2 py-1 rounded-md bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-[9px] flex items-center gap-1 border border-zinc-700 transition-colors cursor-pointer"
+                      >
+                        {copiedTechDetails ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3 text-zinc-400" />}
+                        {copiedTechDetails ? 'Đã sao chép' : 'Sao chép Log'}
+                      </button>
+                      <pre className="whitespace-pre-wrap break-all pr-16 text-zinc-400">{detailedError.technicalDetails}</pre>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Feedback & Simple Status Message */}
+          {error && !detailedError && (
             <div className="p-3 rounded-xl bg-rose-500/10 border border-rose-500/20 flex items-center gap-2 text-xs text-rose-300">
               <AlertCircle className="w-4 h-4 text-rose-400 flex-shrink-0" />
               <span>{error}</span>

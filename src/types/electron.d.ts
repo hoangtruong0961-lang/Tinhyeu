@@ -39,6 +39,8 @@ export interface ElectronFfmpegRenderOptions {
   crf?: number;
   videoVolume?: number;
   ttsVolume?: number;
+  videoAudioEffect?: string;
+  audioFilter?: string;
 }
 
 export interface ElectronFfmpegRenderPayload {

@@ -239,6 +239,7 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
     setTextOverlays(project.textOverlays || []);
     setVideoVolume(project.videoVolume ?? 1.0);
     setVideoSpeed(project.videoSpeed ?? 1.0);
+    setVideoAudioEffect(project.videoAudioEffect || 'none');
     setCustomContext(project.customContext || '');
     setHistory([project.subtitles || []]);
     setHistoryIndex(0);
@@ -255,6 +256,7 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
       textOverlays: project.textOverlays || [],
       videoVolume: project.videoVolume ?? 1.0,
       videoSpeed: project.videoSpeed ?? 1.0,
+      videoAudioEffect: project.videoAudioEffect || 'none',
       customContext: project.customContext || '',
       globalContext: project.globalContext || null,
       clips: project.clips || [],
@@ -379,6 +381,7 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
   const [bgMusicTitle, setBgMusicTitle] = useState<string | null>(null);
   const [videoVolume, setVideoVolume] = useState<number>(project.videoVolume ?? 1.0);
   const [videoSpeed, setVideoSpeed] = useState<number>(project.videoSpeed ?? 1.0);
+  const [videoAudioEffect, setVideoAudioEffect] = useState<AudioEffectType>(project.videoAudioEffect || 'none');
   const [customContext, setCustomContext] = useState<string>(project.customContext || '');
   const [globalContext, setGlobalContext] = useState<GlobalMovieContext | null>(normalizeGlobalContext(project.globalContext) || null);
 
@@ -767,6 +770,7 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
       textOverlays,
       videoVolume,
       videoSpeed,
+      videoAudioEffect,
       customContext,
       globalContext: globalContext || null,
       clips,
@@ -797,6 +801,7 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
           textOverlays,
           videoVolume,
           videoSpeed,
+          videoAudioEffect,
           customContext,
           globalContext: globalContext || undefined,
           clips,
@@ -823,6 +828,7 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
     textOverlays,
     videoVolume,
     videoSpeed,
+    videoAudioEffect,
     customContext,
     globalContext,
     clips,
@@ -845,6 +851,7 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
       textOverlays,
       videoVolume,
       videoSpeed,
+      videoAudioEffect,
       customContext,
       globalContext: globalContext || null,
       clips,
@@ -865,6 +872,7 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
         textOverlays,
         videoVolume,
         videoSpeed,
+        videoAudioEffect,
         customContext,
         globalContext: globalContext || undefined,
         clips,
@@ -3921,6 +3929,8 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
           onChangeVideoVolume={setVideoVolume}
           videoSpeed={videoSpeed}
           onChangeVideoSpeed={setVideoSpeed}
+          videoAudioEffect={videoAudioEffect}
+          onChangeVideoAudioEffect={setVideoAudioEffect}
           onUpdateSubtitle={(updated) =>
             setSubtitles((prev) => {
               const updatedList = prev.map((s) => (s.id === updated.id ? updated : s));
@@ -4055,6 +4065,7 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
               ttsSpeed={appSettings?.ttsSpeed || 1.0}
               ttsPitch={appSettings?.ttsPitch || 0}
               videoVolume={videoVolume}
+              videoAudioEffect={videoAudioEffect}
               blurOverlays={blurOverlays}
               logoOverlays={logoOverlays}
               textOverlays={textOverlays}

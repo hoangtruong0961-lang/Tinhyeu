@@ -98,6 +98,7 @@
     "react-dom": "^19.0.1",
     "sherpa-onnx": "^1.13.4",
     "sherpa-onnx-node": "^1.13.6",
+    "tone": "^15.1.22",
     "vite": "^8.2.2"
   },
   "devDependencies": {

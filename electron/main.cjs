@@ -705,6 +705,20 @@ ipcMain.handle('ffmpeg:renderSubtitledVideo', async (event, payload) => {
     const videoVolume = options.videoVolume ?? (voiceoverAudioPath ? 0.35 : 1.0);
     const ttsVolume = options.ttsVolume ?? 1.0;
 
+    const AUDIO_EFFECT_FFMPEG_MAP = {
+      chipmunk: 'asetrate=48000*1.42,aresample=48000,atempo=1/1.42,equalizer=f=3200:t=q:w=1:g=3',
+      deep: 'asetrate=48000*0.76,aresample=48000,atempo=1/0.76,bass=g=6:f=120,equalizer=f=250:t=q:w=1.2:g=4',
+      robot: 'flanger=delay=2.5:depth=2:speed=5:width=80,tremolo=f=45:d=0.75,volume=1.2',
+      walkie_talkie: 'highpass=f=450,lowpass=f=3100,volume=2.2,overdrive=12:12,equalizer=f=1200:t=q:w=2:g=4',
+      radio: 'highpass=f=450,lowpass=f=3100,volume=2.2,overdrive=12:12,equalizer=f=1200:t=q:w=2:g=4',
+      echo: 'aecho=0.8:0.85:350|700:0.4|0.25,volume=1.1',
+      cave: 'aecho=0.8:0.88:80|160|320|640:0.5|0.35|0.25|0.15,lowpass=f=4000,volume=1.15',
+      cave_echo: 'aecho=0.8:0.88:80|160|320|640:0.5|0.35|0.25|0.15,lowpass=f=4000,volume=1.15',
+    };
+    const effKey = (options.videoAudioEffect || options.audioEffect || '').trim().toLowerCase();
+    const effectFilter = options.audioFilter || AUDIO_EFFECT_FFMPEG_MAP[effKey] || '';
+    const videoAudioChain = effectFilter ? `${effectFilter},volume=${videoVolume}` : `volume=${videoVolume}`;
+
     // Helper to construct FFmpeg argument list with strict input-first ordering
     const buildFfmpegArgs = (encoderType) => {
       const args = ['-y'];
@@ -735,7 +749,7 @@ ipcMain.handle('ffmpeg:renderSubtitledVideo', async (event, payload) => {
           if (hasVideoAudio) {
             args.push(
               '-filter_complex',
-              `[0:v]subtitles='${escapedSubPath}'[vout];[0:a]volume=${videoVolume}[a0];[${voiceoverInputIndex}:a]volume=${ttsVolume}[a1];[a0][a1]amix=inputs=2:duration=first:dropout_transition=2[aout]`,
+              `[0:v]subtitles='${escapedSubPath}'[vout];[0:a]${videoAudioChain}[a0];[${voiceoverInputIndex}:a]volume=${ttsVolume}[a1];[a0][a1]amix=inputs=2:duration=first:dropout_transition=2[aout]`,
               '-map', '[vout]',
               '-map', '[aout]'
             );
@@ -748,12 +762,21 @@ ipcMain.handle('ffmpeg:renderSubtitledVideo', async (event, payload) => {
             );
           }
         } else {
-          args.push(
-            '-filter_complex',
-            `[0:v]subtitles='${escapedSubPath}'[vout]`,
-            '-map', '[vout]',
-            '-map', '0:a?'
-          );
+          if (hasVideoAudio && (videoVolume !== 1.0 || effectFilter)) {
+            args.push(
+              '-filter_complex',
+              `[0:v]subtitles='${escapedSubPath}'[vout];[0:a]${videoAudioChain}[aout]`,
+              '-map', '[vout]',
+              '-map', '[aout]'
+            );
+          } else {
+            args.push(
+              '-filter_complex',
+              `[0:v]subtitles='${escapedSubPath}'[vout]`,
+              '-map', '[vout]',
+              '-map', '0:a?'
+            );
+          }
         }
       } else {
         // Softsub or None
@@ -763,7 +786,7 @@ ipcMain.handle('ffmpeg:renderSubtitledVideo', async (event, payload) => {
           if (hasVideoAudio) {
             args.push(
               '-filter_complex',
-              `[0:a]volume=${videoVolume}[a0];[${voiceoverInputIndex}:a]volume=${ttsVolume}[a1];[a0][a1]amix=inputs=2:duration=first:dropout_transition=2[aout]`,
+              `[0:a]${videoAudioChain}[a0];[${voiceoverInputIndex}:a]volume=${ttsVolume}[a1];[a0][a1]amix=inputs=2:duration=first:dropout_transition=2[aout]`,
               '-map', '[aout]'
             );
           } else {
@@ -774,7 +797,15 @@ ipcMain.handle('ffmpeg:renderSubtitledVideo', async (event, payload) => {
             );
           }
         } else {
-          args.push('-map', '0:a?');
+          if (hasVideoAudio && (videoVolume !== 1.0 || effectFilter)) {
+            args.push(
+              '-filter_complex',
+              `[0:a]${videoAudioChain}[aout]`,
+              '-map', '[aout]'
+            );
+          } else {
+            args.push('-map', '0:a?');
+          }
         }
 
         // Map Softsub stream cleanly

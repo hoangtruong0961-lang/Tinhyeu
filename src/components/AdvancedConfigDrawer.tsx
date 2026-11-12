@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { resolveApiUrl } from '../utils/apiUrl';
 import {
   SlidersHorizontal,
   ChevronDown,
@@ -103,7 +104,7 @@ export const AdvancedConfigDrawer: React.FC<AdvancedConfigDrawerProps> = ({
   const [customVieNeuVoices, setCustomVieNeuVoices] = useState<VieNeuVoice[]>(() => getLocalCustomVoices());
 
   useEffect(() => {
-    fetch('/api/vieneu/custom-voices')
+    fetch(resolveApiUrl('/api/vieneu/custom-voices'))
       .then((r) => r.json())
       .then((d) => {
         if (d && d.success && Array.isArray(d.voices)) {
@@ -1021,7 +1022,7 @@ export const AdvancedConfigDrawer: React.FC<AdvancedConfigDrawerProps> = ({
             deleteLocalCustomVoice(id);
             setCustomVieNeuVoices(getLocalCustomVoices());
             try {
-              await fetch(`/api/vieneu/custom-voices/${encodeURIComponent(id)}`, { method: 'DELETE' });
+              await fetch(resolveApiUrl(`/api/vieneu/custom-voices/${encodeURIComponent(id)}`), { method: 'DELETE' });
             } catch {}
             if (Capacitor.isNativePlatform()) {
               try {

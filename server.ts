@@ -830,13 +830,13 @@ async function startServer() {
     res.status(404).json({ error: `VieNeu model file ${safeFilename} not found.` });
   });
 
-  // VieNeu-TTS Voice Cloning Endpoint
+  // VieNeu-TTS Voice Cloning Endpoint (Supports multiple alias routes)
   const cloneAudioUpload = multer({
     storage: multer.memoryStorage(),
     limits: { fileSize: 50 * 1024 * 1024 },
   });
 
-  app.post('/api/vieneu/clone-voice', cloneAudioUpload.single('audio'), async (req, res) => {
+  const handleCloneVoice = async (req: express.Request, res: express.Response) => {
     try {
       let audioBuffer: Buffer | null = null;
       let voiceName = (req.body.voiceName || '').trim();
@@ -848,10 +848,17 @@ async function startServer() {
       } else if (req.body.audioBase64) {
         const cleanB64 = req.body.audioBase64.replace(/^data:audio\/\w+;base64,/, '');
         audioBuffer = Buffer.from(cleanB64, 'base64');
+      } else if (req.body.audio && typeof req.body.audio === 'string') {
+        const cleanB64 = req.body.audio.replace(/^data:audio\/\w+;base64,/, '');
+        audioBuffer = Buffer.from(cleanB64, 'base64');
       }
 
       if (!audioBuffer || audioBuffer.length < 500) {
-        res.status(400).json({ error: 'Vui lòng cung cấp tệp âm thanh mẫu hoặc bản ghi âm (tối thiểu 1.5 - 3 giây).' });
+        res.status(400).json({
+          error: 'Vui lòng cung cấp tệp âm thanh mẫu hoặc bản ghi âm (tối thiểu 1.5 - 3 giây).',
+          code: 'AUDIO_TOO_SHORT_OR_MISSING',
+          details: 'Dữ liệu âm thanh nhận được bị trống hoặc quá nhỏ (dưới 500 bytes).'
+        });
         return;
       }
 
@@ -873,11 +880,21 @@ async function startServer() {
       });
     } catch (err: any) {
       console.error('[VieNeu Voice Cloning Error]', err);
-      res.status(500).json({ error: err?.message || 'Lỗi xử lý nhân bản giọng nói' });
+      res.status(500).json({
+        error: err?.message || 'Lỗi xử lý nhân bản giọng nói trên máy chủ Express',
+        code: 'CLONE_PROCESSING_ERROR',
+        details: err?.stack || String(err)
+      });
     }
-  });
+  };
 
-  app.get('/api/vieneu/custom-voices', (_req, res) => {
+  app.post(
+    ['/api/vieneu/clone-voice', '/api/vieneu/clone', '/api/clone-voice', '/api/vieneu/voice-clone'],
+    cloneAudioUpload.single('audio'),
+    handleCloneVoice
+  );
+
+  app.get(['/api/vieneu/custom-voices', '/api/custom-voices'], (_req, res) => {
     try {
       const voices = loadCustomVoices();
       const unique = Object.values(voices).filter((v, idx, arr) => arr.findIndex((x) => x.id === v.id) === idx);
@@ -887,7 +904,7 @@ async function startServer() {
     }
   });
 
-  app.delete('/api/vieneu/custom-voices/:id', (req, res) => {
+  app.delete(['/api/vieneu/custom-voices/:id', '/api/custom-voices/:id'], (req, res) => {
     try {
       const id = req.params.id;
       const ok = deleteCustomVoiceFromDisk(id);

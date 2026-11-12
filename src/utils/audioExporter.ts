@@ -98,7 +98,7 @@ export async function generateVoiceoverAudioBuffer(
   const tempCtx = new AudioCtx();
 
   // Decode each subtitle audio URL into AudioBuffer
-  const decodedBuffers: { startTime: number; buffer: AudioBuffer; speed: number; finalDuration: number }[] = [];
+  const decodedBuffers: { startTime: number; buffer: AudioBuffer; speed: number; finalDuration: number; volume?: number; audioEffect?: string }[] = [];
 
   // Helper to decode any audio URL / Base64 format safely
   async function decodeAudioUrlSafely(ctx: AudioContext, rawUrl: string): Promise<AudioBuffer> {
@@ -209,7 +209,7 @@ export async function generateVoiceoverAudioBuffer(
     const { outputNode, detuneOffsetCents } = applyAudioEffectChain(
       offlineCtx,
       source,
-      item.audioEffect,
+      item.audioEffect as any,
       item.volume
     );
 

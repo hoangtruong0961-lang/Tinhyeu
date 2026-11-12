@@ -106,6 +106,8 @@ export type AudioEffectType =
   | 'deep'
   | 'robot'
   | 'walkie_talkie'
+  | 'echo'
+  | 'cave'
   | 'telephone'
   | 'cave_echo'
   | 'underwater'
@@ -410,6 +412,7 @@ export interface ExportSettingsConfig {
   frameRate: ExportFrameRate;
   bitrate: ExportBitrate;
   gpuAcceleration?: boolean;
+  videoAudioEffect?: AudioEffectType;
 }
 
 export interface Project {
@@ -429,6 +432,7 @@ export interface Project {
   textOverlays?: TextOverlay[];
   videoVolume?: number;
   videoSpeed?: number;
+  videoAudioEffect?: AudioEffectType;
   clips?: VideoClip[];
   customContext?: string;
   globalContext?: GlobalMovieContext;

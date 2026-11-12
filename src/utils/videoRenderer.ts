@@ -1,6 +1,7 @@
-import { SubtitleItem, SubtitleStyleConfig, BlurOverlay, LogoOverlay, TextOverlay } from '../types';
+import { SubtitleItem, SubtitleStyleConfig, BlurOverlay, LogoOverlay, TextOverlay, AudioEffectType } from '../types';
 import { wrapSubtitleText } from './srtParser';
 import { generateVoiceoverAudioBuffer } from './audioExporter';
+import { applyAudioEffectChain } from './audioEffects';
 import { createFile as createMp4BoxFile, DataStream } from 'mp4box';
 import fixWebmDuration from 'fix-webm-duration';
 import { loadAllSavedCustomFonts, getSavedCustomFonts } from './fontStorage';
@@ -166,11 +167,12 @@ export async function fixMp4Duration(blob: Blob, durationInSeconds: number): Pro
 async function adjustAudioBufferVolume(
   original: AudioBuffer | null,
   volume: number = 1.0,
-  targetDuration: number
+  targetDuration: number,
+  effect: AudioEffectType = 'none'
 ): Promise<AudioBuffer | null> {
   if (!original) return null;
   if (volume === 0) return null; // Muted
-  if (volume === 1.0) return original; // No change needed
+  if (volume === 1.0 && (!effect || effect === 'none')) return original; // No change needed
 
   const sampleRate = original.sampleRate;
   const numChannels = original.numberOfChannels;
@@ -185,11 +187,16 @@ async function adjustAudioBufferVolume(
   const originalSource = offlineCtx.createBufferSource();
   originalSource.buffer = original;
 
-  const gainNode = offlineCtx.createGain();
-  gainNode.gain.value = volume;
-
-  originalSource.connect(gainNode);
-  gainNode.connect(offlineCtx.destination);
+  const { outputNode, detuneOffsetCents } = applyAudioEffectChain(
+    offlineCtx,
+    originalSource,
+    effect,
+    volume
+  );
+  if (detuneOffsetCents !== 0) {
+    originalSource.detune.value = detuneOffsetCents;
+  }
+  outputNode.connect(offlineCtx.destination);
   originalSource.start(0);
 
   return await offlineCtx.startRendering();
@@ -202,11 +209,12 @@ async function mixAudioBuffers(
   original: AudioBuffer | null,
   tts: AudioBuffer | null,
   targetDuration: number,
-  videoVolume: number = 1.0
+  videoVolume: number = 1.0,
+  videoEffect: AudioEffectType = 'none'
 ): Promise<AudioBuffer | null> {
   if (!original && !tts) return null;
   if (original && !tts) {
-    return await adjustAudioBufferVolume(original, videoVolume, targetDuration);
+    return await adjustAudioBufferVolume(original, videoVolume, targetDuration, videoEffect);
   }
   if (!original && tts) return tts;
 
@@ -225,18 +233,20 @@ async function mixAudioBuffers(
     sampleRate
   );
 
-  // 1. Play original audio with videoVolume applied
+  // 1. Play original audio with videoVolume & audio effect applied
   const originalSource = offlineCtx.createBufferSource();
   originalSource.buffer = original!;
 
-  if (videoVolume !== 1.0) {
-    const gainNode = offlineCtx.createGain();
-    gainNode.gain.value = videoVolume;
-    originalSource.connect(gainNode);
-    gainNode.connect(offlineCtx.destination);
-  } else {
-    originalSource.connect(offlineCtx.destination);
+  const { outputNode, detuneOffsetCents } = applyAudioEffectChain(
+    offlineCtx,
+    originalSource,
+    videoEffect,
+    videoVolume
+  );
+  if (detuneOffsetCents !== 0) {
+    originalSource.detune.value = detuneOffsetCents;
   }
+  outputNode.connect(offlineCtx.destination);
   originalSource.start(0);
 
   // 2. Play TTS audio (mono will be automatically upmixed to stereo/numChannels)
@@ -345,6 +355,7 @@ export async function renderWithMp4Muxer(
     ttsSpeed?: number;
     ttsPitch?: number;
     videoVolume?: number;
+    videoAudioEffect?: AudioEffectType;
     targetWidth?: number;
     targetHeight?: number;
     fps?: number;
@@ -448,6 +459,7 @@ export async function renderWithMp4Muxer(
 
   // 5. Generate or Mix Audio
   const videoVolume = options.videoVolume ?? 1.0;
+  const videoAudioEffect = options.videoAudioEffect || 'none';
   let audioBuffer: AudioBuffer | null = null;
   if (options.includeVoiceover) {
     onProgress({
@@ -464,13 +476,13 @@ export async function renderWithMp4Muxer(
         options.ttsPitch || 0
       );
       const ttsAudioBuffer = result.buffer;
-      audioBuffer = await mixAudioBuffers(originalAudioBuffer, ttsAudioBuffer, duration, videoVolume);
+      audioBuffer = await mixAudioBuffers(originalAudioBuffer, ttsAudioBuffer, duration, videoVolume, videoAudioEffect);
     } catch (e: any) {
       console.warn('Không thể dựng audio thuyết minh, sẽ dùng audio gốc làm fallback:', e);
-      audioBuffer = await adjustAudioBufferVolume(originalAudioBuffer, videoVolume, duration);
+      audioBuffer = await adjustAudioBufferVolume(originalAudioBuffer, videoVolume, duration, videoAudioEffect);
     }
   } else {
-    audioBuffer = await adjustAudioBufferVolume(originalAudioBuffer, videoVolume, duration);
+    audioBuffer = await adjustAudioBufferVolume(originalAudioBuffer, videoVolume, duration, videoAudioEffect);
   }
 
   onProgress({
@@ -935,6 +947,7 @@ export async function renderVideoWithSubtitles(
     ttsSpeed?: number;
     ttsPitch?: number;
     videoVolume?: number;
+    videoAudioEffect?: AudioEffectType;
     targetWidth?: number;
     targetHeight?: number;
     fps?: number;

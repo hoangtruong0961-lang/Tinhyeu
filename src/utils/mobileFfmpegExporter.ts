@@ -1,7 +1,7 @@
 import { CapacitorFFmpeg } from '@capgo/capacitor-ffmpeg';
 import { Capacitor } from '@capacitor/core';
 import NativeFFmpegKit, { FFmpegKitInfo, FFmpegExecuteResult, FFmpegStatistics } from '../plugins/ffmpegKit';
-import { SubtitleItem, SubtitleStyleConfig, BlurOverlay, LogoOverlay, TextOverlay } from '../types';
+import { SubtitleItem, SubtitleStyleConfig, BlurOverlay, LogoOverlay, TextOverlay, AudioEffectType } from '../types';
 import { renderVideoWithSubtitles, RenderProgress } from './videoRenderer';
 
 export interface MobileFfmpegOptions {
@@ -13,6 +13,7 @@ export interface MobileFfmpegOptions {
   ttsSpeed?: number;
   ttsPitch?: number;
   videoVolume?: number;
+  videoAudioEffect?: AudioEffectType;
   blurOverlays?: BlurOverlay[];
   logoOverlays?: LogoOverlay[];
   textOverlays?: TextOverlay[];
@@ -170,6 +171,7 @@ export async function exportWithCapacitorFFmpeg(
       ttsSpeed: options.ttsSpeed,
       ttsPitch: options.ttsPitch,
       videoVolume: options.videoVolume,
+      videoAudioEffect: options.videoAudioEffect,
       videoDuration: options.videoDuration,
       targetWidth: options.width,
       targetHeight: options.height,
