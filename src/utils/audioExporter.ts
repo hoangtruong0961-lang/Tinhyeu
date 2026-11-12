@@ -1,4 +1,5 @@
 import { SubtitleItem } from '../types';
+import { applyAudioEffectChain } from './audioEffects';
 
 /**
  * Encodes an AudioBuffer into a WAV format Blob (16-bit PCM)
@@ -156,6 +157,8 @@ export async function generateVoiceoverAudioBuffer(
         buffer: decoded,
         speed: appliedSpeed,
         finalDuration,
+        volume: sub.audioVolume ?? 1.0,
+        audioEffect: sub.audioEffect || 'none',
       });
     } catch (err) {
       console.warn(`[Audio Exporter] Unable to decode TTS audio for sub ${sub.id}:`, err);
@@ -185,7 +188,7 @@ export async function generateVoiceoverAudioBuffer(
     sampleRate
   );
 
-  // Schedule each audio buffer at its specified startTime with its calculated playbackRate and pitch shift
+  // Schedule each audio buffer at its specified startTime with its calculated playbackRate, pitch shift and voice effects
   for (const item of decodedBuffers) {
     const source = offlineCtx.createBufferSource();
     source.buffer = item.buffer;
@@ -196,21 +199,27 @@ export async function generateVoiceoverAudioBuffer(
     }
 
     // Apply manual ttsPitch detuning + optional pitch compensation for playback speedup (1 semitone = 100 cents)
-    // If speed > 1.0, we slightly compensate pitch downwards (-cents) to neutralize the "chipmunk" shift if desired,
-    // or apply exact user-configured ttsPitch detune.
     let totalDetuneCents = ttsPitch * 100;
     if (item.speed > 1.0) {
-      // Natural pitch compensation: counter playbackRate pitch shift (cents = 1200 * log2(1/speed))
       const pitchCompensationCents = -1200 * Math.log2(item.speed);
       totalDetuneCents += pitchCompensationCents;
     }
 
-    const clampedDetune = Math.max(-1200, Math.min(1200, totalDetuneCents));
+    // Route through audio effect graph (Pitch shift, Equalizer, Distortion, Echo, Master Volume)
+    const { outputNode, detuneOffsetCents } = applyAudioEffectChain(
+      offlineCtx,
+      source,
+      item.audioEffect,
+      item.volume
+    );
+
+    totalDetuneCents += detuneOffsetCents;
+    const clampedDetune = Math.max(-2400, Math.min(2400, totalDetuneCents));
     if (clampedDetune !== 0) {
       source.detune.value = clampedDetune;
     }
     
-    source.connect(offlineCtx.destination);
+    outputNode.connect(offlineCtx.destination);
     source.start(item.startTime);
   }
 

@@ -11,15 +11,19 @@ import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
 
 import org.json.JSONArray;
+import org.json.JSONObject;
 
 import java.io.BufferedInputStream;
+import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -427,80 +431,6 @@ public class VieNeuPlugin extends Plugin {
             call.resolve(ret);
         } catch (Exception e) {
             call.reject("Failed to release models: " + e.getMessage());
-        }
-    }
-
-    @PluginMethod
-    public void saveCustomVoice(PluginCall call) {
-        try {
-            String name = call.getString("name");
-            JSArray spkArray = call.getArray("speakerEmb");
-            JSArray codesArray = call.getArray("codes");
-
-            if (name == null || spkArray == null || codesArray == null) {
-                call.reject("Missing name, speakerEmb, or codes");
-                return;
-            }
-
-            float[] speakerEmb = new float[spkArray.length()];
-            for (int i = 0; i < spkArray.length(); i++) {
-                speakerEmb[i] = (float) spkArray.getDouble(i);
-            }
-
-            int numFrames = codesArray.length();
-            int[][] codes = new int[numFrames][16];
-            for (int f = 0; f < numFrames; f++) {
-                JSONArray row = codesArray.getJSONArray(f);
-                for (int c = 0; c < 16; c++) {
-                    codes[f][c] = row.getInt(c);
-                }
-            }
-
-            File dir = getModelsDir();
-            if (engineInstance == null && verifyModelFiles(dir)) {
-                engineInstance = new VieNeuEngine(dir);
-                engineInstance.initialize();
-            }
-            if (engineInstance != null) {
-                engineInstance.registerCustomVoice(name, speakerEmb, codes);
-            }
-
-            JSObject res = new JSObject();
-            res.put("success", true);
-            res.put("message", "Đã lưu giọng nhân bản '" + name + "' vào thiết bị.");
-            call.resolve(res);
-        } catch (Exception e) {
-            Log.e(TAG, "saveCustomVoice error", e);
-            call.reject("Failed to save custom voice: " + e.getMessage());
-        }
-    }
-
-    @PluginMethod
-    public void listCustomVoices(PluginCall call) {
-        try {
-            File dir = getModelsDir();
-            File customFile = new File(dir, "custom_voices.json");
-            JSArray arr = new JSArray();
-            if (customFile.exists()) {
-                String content = new String(java.nio.file.Files.readAllBytes(customFile.toPath()), StandardCharsets.UTF_8);
-                JSONObject obj = new JSONObject(content);
-                JSONArray names = obj.names();
-                if (names != null) {
-                    for (int i = 0; i < names.length(); i++) {
-                        String k = names.getString(i);
-                        JSObject vObj = new JSObject();
-                        vObj.put("id", k);
-                        vObj.put("name", k);
-                        arr.put(vObj);
-                    }
-                }
-            }
-            JSObject res = new JSObject();
-            res.put("success", true);
-            res.put("voices", arr);
-            call.resolve(res);
-        } catch (Exception e) {
-            call.reject("Failed to list custom voices: " + e.getMessage());
         }
     }
 

@@ -100,6 +100,19 @@ export interface WordTimestamp {
   end: number;   // in seconds relative to subtitle start
 }
 
+export type AudioEffectType =
+  | 'none'
+  | 'chipmunk'
+  | 'deep'
+  | 'robot'
+  | 'walkie_talkie'
+  | 'telephone'
+  | 'cave_echo'
+  | 'underwater'
+  | 'chorus'
+  | 'megaphone'
+  | 'radio';
+
 export interface SubtitleItem {
   id: string;
   startTime: number; // in seconds, e.g. 1.25
@@ -116,6 +129,7 @@ export interface SubtitleItem {
   timestamps?: WordTimestamp[]; // Word-level timestamps for exact audio sync
   audioVolume?: number;        // Individual audio volume (0.0 - 2.0, default 1.0)
   audioDeleted?: boolean;       // Marked as deleted from audio track
+  audioEffect?: AudioEffectType; // Voice effect preset e.g. 'chipmunk', 'deep', 'robot'
 }
 
 export interface RegionROI {
@@ -265,6 +279,7 @@ export interface AppSettings {
   geminiVoice?: string;                // Gemini Voice e.g. Kore or Puck
   ttsSpeed?: number;                   // Speed multiplier 0.5 - 2.0 (default 1.0)
   ttsPitch?: number;                   // Pitch offset -5 to +5 (default 0)
+  defaultAudioEffect?: AudioEffectType; // Default audio effect e.g. 'none', 'chipmunk', 'deep'
   bgFilterStrength?: number;           // Background text filter strength 0 - 100% (default 40)
   bgFilterMode?: 'none' | 'contrast' | 'binarize' | 'adaptive'; // Background text filter mode (default 'contrast')
   adaptiveSampling?: boolean;          // Auto-increase frame density in fast dialogue zones (default true)

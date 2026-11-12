@@ -23,7 +23,9 @@ import {
   VideoClip,
   GlobalMovieContext,
   GlossaryEntity,
+  AudioEffectType,
 } from '../types';
+import { applyAudioEffectChain } from '../utils/audioEffects';
 import {
   ensureGoogleFontsLoaded,
   loadAllSavedCustomFonts,
@@ -2564,7 +2566,8 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
     speed: number = appSettings.ttsSpeed || 1.0,
     pitch: number = appSettings.ttsPitch || 0,
     subId?: string,
-    volume: number = 1.0
+    volume: number = 1.0,
+    effect: AudioEffectType = 'none'
   ) => {
     try {
       if (activeAudioSourceRef.current) {
@@ -2605,14 +2608,20 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
       const source = audioCtx.createBufferSource();
       source.buffer = audioBuffer;
       source.playbackRate.value = Math.max(0.95, Math.min(1.25, speed));
-      source.detune.value = Math.max(-1200, Math.min(1200, pitch * 100)); // cents pitch shift
 
-      // GainNode for audio volume control
-      const gainNode = audioCtx.createGain();
-      gainNode.gain.value = Math.max(0, Math.min(3.0, volume));
+      // Apply pitch shift and audio effect routing
+      let totalDetuneCents = pitch * 100;
+      const { outputNode, detuneOffsetCents } = applyAudioEffectChain(
+        audioCtx,
+        source,
+        effect,
+        volume
+      );
 
-      source.connect(gainNode);
-      gainNode.connect(audioCtx.destination);
+      totalDetuneCents += detuneOffsetCents;
+      source.detune.value = Math.max(-2400, Math.min(2400, totalDetuneCents));
+
+      outputNode.connect(audioCtx.destination);
       source.start(0);
       activeAudioSourceRef.current = source;
       return source;
