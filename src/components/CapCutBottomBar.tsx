@@ -178,6 +178,8 @@ interface CapCutBottomBarProps {
   onSelectTextOverlay?: (overlay: TextOverlay | null) => void;
   triggerTextOverlayAction?: { id: string; action: 'edit' | 'config' } | null;
   projectTitle?: string;
+  videoAudioEffect?: string;
+  onChangeVideoAudioEffect?: (effect: any) => void;
   extractSubTab?: 'image' | 'audio';
   onExtractSubTabChange?: (tab: 'image' | 'audio') => void;
   onActiveSheetChange?: (sheet: string | null) => void;
