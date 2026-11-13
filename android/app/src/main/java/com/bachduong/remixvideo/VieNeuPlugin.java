@@ -122,7 +122,7 @@ public class VieNeuPlugin extends Plugin {
             ret.put("totalSizeMB", Math.round((totalBytes / (1024.0 * 1024.0)) * 10.0) / 10.0);
             ret.put("platform", "android");
             call.resolve(ret);
-        } catch (Exception e) {
+        } catch (Throwable e) {
             Log.e(TAG, "checkStatus failed", e);
             call.reject("Failed to check VieNeu status: " + e.getMessage());
         }
@@ -201,7 +201,7 @@ public class VieNeuPlugin extends Plugin {
                 res.put("isCloningReady", cloningReady);
                 call.resolve(res);
 
-            } catch (Exception e) {
+            } catch (Throwable e) {
                 Log.e(TAG, "Download error", e);
                 isDownloading.set(false);
                 emitProgress("error", 0, "Lỗi tải mô hình: " + e.getMessage());
@@ -260,7 +260,7 @@ public class VieNeuPlugin extends Plugin {
                 res.put("isCloningReady", true);
                 res.put("isReady", verifyModelFiles(modelsDir));
                 call.resolve(res);
-            } catch (Exception e) {
+            } catch (Throwable e) {
                 Log.e(TAG, "downloadCloningModels error", e);
                 isDownloading.set(false);
                 emitProgress("error", 0, "Lỗi tải gói Clone: " + e.getMessage());
@@ -290,6 +290,7 @@ public class VieNeuPlugin extends Plugin {
 
         executor.execute(() -> {
             File tempInput = null;
+            String stage = "prepare_audio";
             try {
                 File dir = getModelsDir();
                 if (!verifyCloningFiles(dir)) {
@@ -306,6 +307,7 @@ public class VieNeuPlugin extends Plugin {
                     cleanB64 = cleanB64.substring(commaIdx + 1);
                 }
                 byte[] audioBytes = Base64.decode(cleanB64, Base64.DEFAULT);
+                cleanB64 = null;
                 if (audioBytes == null || audioBytes.length < 512) {
                     throw new Exception("Tệp âm thanh mẫu quá ngắn hoặc bị lỗi.");
                 }
@@ -316,17 +318,20 @@ public class VieNeuPlugin extends Plugin {
                     fos.write(audioBytes);
                     fos.flush();
                 }
+                audioBytes = null;
 
                 if (engineInstance == null) {
                     engineInstance = new VieNeuEngine(dir);
                 }
 
+                stage = "native_onnx_clone";
                 JSONObject cloneData = engineInstance.cloneVoiceFromAudio(
                     voiceName,
                     tempInput,
                     getContext().getCacheDir()
                 );
 
+                stage = "serialize_result";
                 SimpleDateFormat isoFmt = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US);
                 isoFmt.setTimeZone(TimeZone.getTimeZone("UTC"));
 
@@ -349,9 +354,13 @@ public class VieNeuPlugin extends Plugin {
                 res.put("success", true);
                 res.put("voice", voiceObj);
                 call.resolve(res);
-            } catch (Exception e) {
-                Log.e(TAG, "cloneVoice failed", e);
-                call.reject(e.getMessage() != null ? e.getMessage() : "Lỗi trích xuất giọng nói ONNX", "CLONE_FAILED", e);
+            } catch (Throwable t) {
+                Log.e(TAG, "cloneVoice failed at stage=" + stage, t);
+                String msg = (t.getMessage() != null && !t.getMessage().trim().isEmpty())
+                        ? t.getMessage()
+                        : t.getClass().getSimpleName();
+                Exception ex = (t instanceof Exception) ? (Exception) t : new Exception(msg, t);
+                call.reject("[" + stage + "] " + msg, "CLONE_FAILED", ex);
             } finally {
                 if (tempInput != null && tempInput.exists()) {
                     tempInput.delete();
@@ -604,9 +613,9 @@ public class VieNeuPlugin extends Plugin {
                 res.put("duration", Math.round(duration * 100.0) / 100.0);
                 call.resolve(res);
 
-            } catch (Exception e) {
+            } catch (Throwable e) {
                 Log.e(TAG, "Synthesis failed", e);
-                call.reject("Synthesis failed: " + e.getMessage());
+                call.reject("Synthesis failed: " + (e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName()));
             }
         });
     }

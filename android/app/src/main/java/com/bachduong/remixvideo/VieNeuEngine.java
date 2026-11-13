@@ -10,9 +10,10 @@ import ai.onnxruntime.OrtEnvironment;
 import ai.onnxruntime.OrtSession;
 import ai.onnxruntime.TensorInfo;
 
-import com.arthenica.ffmpegkit.FFmpegKit;
-import com.arthenica.ffmpegkit.FFmpegSession;
-import com.arthenica.ffmpegkit.ReturnCode;
+import android.media.AudioFormat;
+import android.media.MediaCodec;
+import android.media.MediaExtractor;
+import android.media.MediaFormat;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -926,11 +927,11 @@ public class VieNeuEngine {
     private static final int CLONE_MOSS_SR = 48000;
     private static float[][] cachedMelFilterbank = null;
 
-    private static final class DecodedWav {
+    private static final class DecodedAudio {
         final float[] samples; // interleaved if stereo
         final int channels;
         final int sampleRate;
-        DecodedWav(float[] samples, int channels, int sampleRate) {
+        DecodedAudio(float[] samples, int channels, int sampleRate) {
             this.samples = samples;
             this.channels = channels;
             this.sampleRate = sampleRate;
@@ -939,7 +940,8 @@ public class VieNeuEngine {
 
     /**
      * Extracts real speaker_emb (192-dim) and RVQ audio codes ([T][16]) on-device
-     * using FFmpeg decoding + silence trimming + speaker_encoder.onnx + moss_audio_tokenizer_encode.onnx.
+     * using pure-Java WAV / Android MediaCodec decoding + VAD trimming + speaker_encoder.onnx + moss_audio_tokenizer_encode.onnx.
+     * Note: Zero FFmpegKit calls to avoid any libc++_shared / native ABI conflict with ONNX Runtime.
      */
     public synchronized JSONObject cloneVoiceFromAudio(
             String voiceName,
@@ -947,40 +949,46 @@ public class VieNeuEngine {
             File workDir
     ) throws Exception {
         long startMs = System.currentTimeMillis();
-        if (env == null) {
-            env = OrtEnvironment.getEnvironment();
-        }
-
-        File spkModelFile = new File(modelsDir, "speaker_encoder.onnx");
-        File mossEncodeFile = new File(modelsDir, "moss_audio_tokenizer_encode.onnx");
-        File mossEncodeDataFile = new File(modelsDir, "moss_audio_tokenizer_encode.data");
-
-        if (!spkModelFile.exists() || spkModelFile.length() == 0
-                || !mossEncodeFile.exists() || mossEncodeFile.length() == 0
-                || !mossEncodeDataFile.exists() || mossEncodeDataFile.length() == 0) {
-            throw new Exception("Thiếu tệp mô hình AI Clone Giọng (speaker_encoder.onnx hoặc moss_audio_tokenizer_encode). Vui lòng tải gói Clone giọng (~64 MB).");
-        }
-
-        String ts = String.valueOf(System.currentTimeMillis());
-        File wav16kFile = new File(workDir, "clone_16k_" + ts + ".wav");
-        File wav48kFile = new File(workDir, "clone_48k_" + ts + ".wav");
-
+        String stage = "init";
         try {
-            // Step 1: Decode audio to clean 16kHz mono & 48kHz stereo WAV via FFmpegKit
-            convertToCloneWav(inputAudioFile, wav16kFile, 1, CLONE_SPK_SR);
-            convertToCloneWav(inputAudioFile, wav48kFile, 2, CLONE_MOSS_SR);
+            if (env == null) {
+                env = OrtEnvironment.getEnvironment();
+            }
 
-            DecodedWav wav16 = parseWavFile(wav16kFile);
-            DecodedWav wav48 = parseWavFile(wav48kFile);
+            stage = "verify_cloning_models";
+            File spkModelFile = new File(modelsDir, "speaker_encoder.onnx");
+            File mossEncodeFile = new File(modelsDir, "moss_audio_tokenizer_encode.onnx");
+            File mossEncodeDataFile = new File(modelsDir, "moss_audio_tokenizer_encode.data");
 
-            float[] pcm16Raw = toMono(wav16.samples, wav16.channels);
+            if (!spkModelFile.exists() || spkModelFile.length() == 0
+                    || !mossEncodeFile.exists() || mossEncodeFile.length() == 0
+                    || !mossEncodeDataFile.exists() || mossEncodeDataFile.length() == 0) {
+                throw new Exception("Thiếu tệp mô hình AI Clone Giọng (speaker_encoder.onnx hoặc moss_audio_tokenizer_encode). Vui lòng tải gói Clone giọng (~64 MB).");
+            }
+
+            // Step 1: Decode audio to clean float[] PCM via pure-Java WAV parser or Android MediaExtractor/MediaCodec
+            stage = "decode_audio";
+            DecodedAudio decoded = decodeInputAudioSafely(inputAudioFile);
+            if (decoded == null || decoded.samples == null || decoded.samples.length == 0) {
+                throw new Exception("Không giải mã được dữ liệu sóng âm từ tệp âm thanh đầu vào.");
+            }
+
+            // Apply lightweight 75Hz high-pass filter per channel to remove rumble/DC offset
+            stage = "highpass_resample";
+            applyHighPass75HzInPlace(decoded.samples, decoded.channels, decoded.sampleRate);
+
+            float[] monoOrig = toMono(decoded.samples, decoded.channels);
+            float[] pcm16Raw = (decoded.sampleRate == CLONE_SPK_SR)
+                    ? monoOrig
+                    : resampleMono(monoOrig, decoded.sampleRate, CLONE_SPK_SR);
+
             if (pcm16Raw.length < CLONE_SPK_SR / 2) {
                 throw new Exception("Âm thanh quá ngắn (dưới 0.5 giây). Vui lòng cung cấp đoạn nói rõ ràng từ 3 đến 10 giây.");
             }
 
             // Step 2: Active-speech VAD silence trimming & loudness normalization
-            // Frame size = 320 samples (20ms @ 16kHz)
-            int frameLen = 320;
+            stage = "vad_trimming";
+            int frameLen = 320; // 20ms @ 16kHz
             int totalFrames = pcm16Raw.length / frameLen;
             float[] frameRms = new float[totalFrames];
             float peakRms = 0f;
@@ -1000,11 +1008,11 @@ public class VieNeuEngine {
                 if (rms > peakRms) peakRms = rms;
             }
 
-            if (overallPeakAmp < 0.004f || peakRms < 0.002f) {
+            if (overallPeakAmp < 0.003f || peakRms < 0.0015f) {
                 throw new Exception("Âm thanh chỉ toàn im lặng hoặc âm lượng quá nhỏ. Vui lòng ghi âm lại gần micro hơn.");
             }
 
-            float speechThresh = Math.max(0.005f, peakRms * 0.12f);
+            float speechThresh = Math.max(0.004f, peakRms * 0.12f);
             int firstActive = -1;
             int lastActive = -1;
             for (int f = 0; f < totalFrames; f++) {
@@ -1018,8 +1026,8 @@ public class VieNeuEngine {
                 lastActive = totalFrames - 1;
             }
 
-            int startFrame = Math.max(0, firstActive - 2); // 40ms pre-roll
-            int endFrame = Math.min(totalFrames, lastActive + 4); // 60ms tail
+            int startFrame = Math.max(0, firstActive - 2);
+            int endFrame = Math.min(totalFrames, lastActive + 4);
             int startSample16 = startFrame * frameLen;
             int endSample16 = Math.min(pcm16Raw.length, endFrame * frameLen);
             int activeSamples16 = endSample16 - startSample16;
@@ -1027,16 +1035,15 @@ public class VieNeuEngine {
             double activeDurationSec = (double) activeSamples16 / (double) CLONE_SPK_SR;
             if (activeDurationSec < 0.8) {
                 throw new Exception(String.format(
+                        java.util.Locale.US,
                         "Giọng nói thực tế quá ngắn (chỉ có %.1fs sau khi bỏ khoảng lặng). Vui lòng nói rõ câu dài từ 3 đến 8 giây.",
                         activeDurationSec
                 ));
             }
 
-            // Use up to 10s of active speech for speaker_encoder.onnx
             int spkSliceLen = Math.min(activeSamples16, CLONE_SPK_SR * 10);
             float[] pcm16Trimmed = Arrays.copyOfRange(pcm16Raw, startSample16, startSample16 + spkSliceLen);
 
-            // Compute active speech RMS and gain so soft mic recordings match reference levels cleanly
             double sumSqActive = 0.0;
             float peakActive = 0f;
             for (float s : pcm16Trimmed) {
@@ -1054,47 +1061,47 @@ public class VieNeuEngine {
                 pcm16Trimmed[i] = Math.max(-0.98f, Math.min(0.98f, pcm16Trimmed[i] * targetGain));
             }
 
-            // Slice corresponding 48kHz stereo window: max 4.8s active speech (~60 MOSS RVQ frames @ 12.5 Hz)
+            // Prepare 48kHz planar stereo buffer (~4.2s max = ~52 MOSS frames) to keep RAM usage lean on Android
+            stage = "prepare_moss_48k";
             double startSec = (double) startSample16 / (double) CLONE_SPK_SR;
-            int total48Frames = wav48.samples.length / Math.max(1, wav48.channels);
-            int start48 = Math.max(0, Math.min(total48Frames - 1, (int) Math.round(startSec * CLONE_MOSS_SR)));
-            int end48 = Math.min(total48Frames, (int) Math.round(((double) endSample16 / CLONE_SPK_SR) * CLONE_MOSS_SR));
-            int avail48 = end48 - start48;
-            if (avail48 < CLONE_MOSS_SR / 2) {
-                start48 = 0;
-                avail48 = total48Frames;
+            double endSec = (double) endSample16 / (double) CLONE_SPK_SR;
+            float[] planar48 = buildPlanarStereo48k(decoded, startSec, endSec, targetGain, 4.2);
+            int mossFramesLen = planar48.length / 2;
+            if (mossFramesLen < 4800) {
+                throw new Exception("Đoạn âm thanh 48kHz sau cắt khoảng lặng quá ngắn (< 0.1s). Vui lòng cung cấp đoạn nói từ 3 đến 8 giây.");
             }
-            int mossFramesLen = Math.min(avail48, (int) (CLONE_MOSS_SR * 4.8));
 
-            float[] planar48 = new float[2 * mossFramesLen];
-            if (wav48.channels >= 2) {
-                int chStride = wav48.channels;
-                for (int i = 0; i < mossFramesLen; i++) {
-                    int srcIdx = (start48 + i) * chStride;
-                    float l = Math.max(-0.98f, Math.min(0.98f, wav48.samples[srcIdx] * targetGain));
-                    float r = Math.max(-0.98f, Math.min(0.98f, wav48.samples[srcIdx + 1] * targetGain));
-                    planar48[i] = l;
-                    planar48[mossFramesLen + i] = r;
-                }
+            // Free large intermediate decoded arrays before loading ONNX cloning models
+            decoded = null;
+            monoOrig = null;
+            pcm16Raw = null;
+
+            // Free any already-loaded TTS synthesis models (~180MB+ RAM) so cloning ONNX sessions have generous headroom
+            if (isInitialized) {
+                stage = "release_tts_sessions";
+                release();
             } else {
-                for (int i = 0; i < mossFramesLen; i++) {
-                    float m = Math.max(-0.98f, Math.min(0.98f, wav48.samples[start48 + i] * targetGain));
-                    planar48[i] = m;
-                    planar48[mossFramesLen + i] = m;
-                }
+                System.gc();
             }
 
             // Step 3: Extract 192-dim Speaker Embedding using speaker_encoder.onnx
+            stage = "run_speaker_encoder";
             float[] speakerEmb = runSpeakerEncoder(spkModelFile, pcm16Trimmed);
+            pcm16Trimmed = null;
+            System.gc();
 
             // Step 4: Extract 16-channel RVQ audio codes using moss_audio_tokenizer_encode.onnx
+            stage = "run_moss_tokenizer_encode";
             int[][] refCodes = runMossTokenizerEncode(mossEncodeFile, planar48, mossFramesLen);
+            planar48 = null;
 
             // Step 5: Persist to custom_voices.json & update in-memory presets immediately
+            stage = "save_custom_voice";
             registerCustomVoice(voiceName, speakerEmb, refCodes);
 
             long elapsedMs = System.currentTimeMillis() - startMs;
             Log.d(TAG, String.format(
+                    java.util.Locale.US,
                     "REAL CLONE SUCCESS '%s': active=%.2fs, gain=%.2fx, refFrames=%d, elapsed=%dms",
                     voiceName, activeDurationSec, targetGain, refCodes.length, elapsedMs
             ));
@@ -1114,38 +1121,263 @@ public class VieNeuEngine {
             result.put("activeDurationSec", Math.round(activeDurationSec * 100.0) / 100.0);
             result.put("elapsedMs", elapsedMs);
             return result;
-        } finally {
-            try { if (wav16kFile.exists()) wav16kFile.delete(); } catch (Exception ignored) {}
-            try { if (wav48kFile.exists()) wav48kFile.delete(); } catch (Exception ignored) {}
+        } catch (Throwable t) {
+            String msg = (t.getMessage() != null && !t.getMessage().trim().isEmpty())
+                    ? t.getMessage()
+                    : t.getClass().getSimpleName();
+            if (msg.startsWith("[")) {
+                throw (t instanceof Exception) ? (Exception) t : new Exception(msg, t);
+            }
+            throw new Exception("[" + stage + "] " + msg, t);
         }
     }
 
-    private void convertToCloneWav(File inputFile, File outputWav, int channels, int sampleRate) throws Exception {
-        String cmd = String.format(
-                java.util.Locale.US,
-                "-y -i \"%s\" -af \"highpass=f=75\" -ac %d -ar %d -t 15 -c:a pcm_s16le \"%s\"",
-                inputFile.getAbsolutePath(), channels, sampleRate, outputWav.getAbsolutePath()
-        );
-        FFmpegSession session = FFmpegKit.execute(cmd);
-        if (!ReturnCode.isSuccess(session.getReturnCode()) || !outputWav.exists() || outputWav.length() < 44) {
-            // Retry without highpass audio filter just in case
-            String fallbackCmd = String.format(
-                    java.util.Locale.US,
-                    "-y -i \"%s\" -ac %d -ar %d -t 15 -c:a pcm_s16le \"%s\"",
-                    inputFile.getAbsolutePath(), channels, sampleRate, outputWav.getAbsolutePath()
-            );
-            session = FFmpegKit.execute(fallbackCmd);
-            if (!ReturnCode.isSuccess(session.getReturnCode()) || !outputWav.exists() || outputWav.length() < 44) {
-                String errOut = session.getFailStackTrace();
-                if (errOut == null || errOut.trim().isEmpty()) {
-                    errOut = session.getOutput();
-                }
-                if (errOut != null && errOut.length() > 300) {
-                    errOut = errOut.substring(errOut.length() - 300);
-                }
-                throw new Exception("Không thể giải mã tệp âm thanh (" + sampleRate + "Hz). Chi tiết FFmpeg: " + errOut);
+    private DecodedAudio decodeInputAudioSafely(File inputFile) throws Exception {
+        byte[] header = new byte[12];
+        try (FileInputStream fis = new FileInputStream(inputFile)) {
+            int n = fis.read(header);
+            if (n >= 12
+                    && header[0] == 'R' && header[1] == 'I' && header[2] == 'F' && header[3] == 'F'
+                    && header[8] == 'W' && header[9] == 'A' && header[10] == 'V' && header[11] == 'E') {
+                return parseWavFile(inputFile);
             }
         }
+        return decodeWithMediaCodec(inputFile);
+    }
+
+    private DecodedAudio decodeWithMediaCodec(File inputFile) throws Exception {
+        MediaExtractor extractor = new MediaExtractor();
+        MediaCodec codec = null;
+        try {
+            extractor.setDataSource(inputFile.getAbsolutePath());
+            int trackIndex = -1;
+            MediaFormat audioFormat = null;
+            String mime = null;
+            for (int i = 0; i < extractor.getTrackCount(); i++) {
+                MediaFormat fmt = extractor.getTrackFormat(i);
+                String m = fmt.getString(MediaFormat.KEY_MIME);
+                if (m != null && m.startsWith("audio/")) {
+                    trackIndex = i;
+                    audioFormat = fmt;
+                    mime = m;
+                    break;
+                }
+            }
+            if (trackIndex < 0 || audioFormat == null || mime == null) {
+                throw new Exception("Không tìm thấy luồng âm thanh (audio track) trong tệp đã chọn.");
+            }
+
+            extractor.selectTrack(trackIndex);
+            int sampleRate = audioFormat.containsKey(MediaFormat.KEY_SAMPLE_RATE)
+                    ? audioFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE) : 48000;
+            int channels = audioFormat.containsKey(MediaFormat.KEY_CHANNEL_COUNT)
+                    ? audioFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT) : 1;
+            int pcmEncoding = AudioFormat.ENCODING_PCM_16BIT;
+            if (audioFormat.containsKey(MediaFormat.KEY_PCM_ENCODING)) {
+                pcmEncoding = audioFormat.getInteger(MediaFormat.KEY_PCM_ENCODING);
+            }
+
+            codec = MediaCodec.createDecoderByType(mime);
+            codec.configure(audioFormat, null, null, 0);
+            codec.start();
+
+            ByteArrayOutputStream pcmBytes = new ByteArrayOutputStream();
+            MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+            boolean inputDone = false;
+            boolean outputDone = false;
+            int maxBytesCap = Math.max(1, sampleRate) * Math.max(1, channels) * 4 * 16; // max 16s even for float32
+
+            long timeoutUs = 10000L;
+            while (!outputDone) {
+                if (!inputDone) {
+                    int inIdx = codec.dequeueInputBuffer(timeoutUs);
+                    if (inIdx >= 0) {
+                        ByteBuffer inBuf = codec.getInputBuffer(inIdx);
+                        if (inBuf != null) {
+                            int sampleSize = extractor.readSampleData(inBuf, 0);
+                            if (sampleSize < 0 || pcmBytes.size() >= maxBytesCap) {
+                                codec.queueInputBuffer(inIdx, 0, 0, 0L, MediaCodec.BUFFER_FLAG_END_OF_STREAM);
+                                inputDone = true;
+                            } else {
+                                long pts = extractor.getSampleTime();
+                                codec.queueInputBuffer(inIdx, 0, sampleSize, Math.max(0L, pts), 0);
+                                extractor.advance();
+                            }
+                        }
+                    }
+                }
+
+                int outIdx = codec.dequeueOutputBuffer(info, timeoutUs);
+                if (outIdx >= 0) {
+                    ByteBuffer outBuf = codec.getOutputBuffer(outIdx);
+                    if (outBuf != null && info.size > 0) {
+                        outBuf.position(info.offset);
+                        outBuf.limit(info.offset + info.size);
+                        byte[] chunk = new byte[info.size];
+                        outBuf.get(chunk);
+                        if (pcmBytes.size() < maxBytesCap) {
+                            pcmBytes.write(chunk);
+                        }
+                    }
+                    codec.releaseOutputBuffer(outIdx, false);
+                    if ((info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0 || pcmBytes.size() >= maxBytesCap) {
+                        outputDone = true;
+                    }
+                } else if (outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                    MediaFormat outFmt = codec.getOutputFormat();
+                    if (outFmt.containsKey(MediaFormat.KEY_SAMPLE_RATE)) {
+                        sampleRate = outFmt.getInteger(MediaFormat.KEY_SAMPLE_RATE);
+                    }
+                    if (outFmt.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) {
+                        channels = outFmt.getInteger(MediaFormat.KEY_CHANNEL_COUNT);
+                    }
+                    if (outFmt.containsKey(MediaFormat.KEY_PCM_ENCODING)) {
+                        pcmEncoding = outFmt.getInteger(MediaFormat.KEY_PCM_ENCODING);
+                    }
+                }
+            }
+
+            byte[] raw = pcmBytes.toByteArray();
+            if (raw.length < 64) {
+                throw new Exception("Bộ giải mã âm thanh Android trả về dữ liệu trống (" + mime + ").");
+            }
+
+            ByteBuffer bb = ByteBuffer.wrap(raw).order(ByteOrder.LITTLE_ENDIAN);
+            float[] samples;
+            if (pcmEncoding == AudioFormat.ENCODING_PCM_FLOAT) {
+                int n = raw.length / 4;
+                samples = new float[n];
+                for (int i = 0; i < n; i++) samples[i] = bb.getFloat(i * 4);
+            } else if (pcmEncoding == AudioFormat.ENCODING_PCM_8BIT) {
+                samples = new float[raw.length];
+                for (int i = 0; i < raw.length; i++) samples[i] = ((raw[i] & 0xFF) - 128) / 128.0f;
+            } else {
+                int n = raw.length / 2;
+                samples = new float[n];
+                for (int i = 0; i < n; i++) samples[i] = bb.getShort(i * 2) / 32768.0f;
+            }
+            return new DecodedAudio(samples, Math.max(1, channels), Math.max(8000, sampleRate));
+        } finally {
+            if (codec != null) {
+                try { codec.stop(); } catch (Exception ignored) {}
+                try { codec.release(); } catch (Exception ignored) {}
+            }
+            try { extractor.release(); } catch (Exception ignored) {}
+        }
+    }
+
+    private void applyHighPass75HzInPlace(float[] interleaved, int channels, int sampleRate) {
+        if (interleaved == null || interleaved.length == 0 || sampleRate <= 0) return;
+        double rc = 1.0 / (2.0 * Math.PI * 75.0);
+        double dt = 1.0 / sampleRate;
+        float alpha = (float) (rc / (rc + dt));
+        int chCount = Math.max(1, channels);
+        int frames = interleaved.length / chCount;
+        for (int c = 0; c < chCount; c++) {
+            float prevIn = interleaved[c];
+            float prevOut = 0f;
+            for (int f = 0; f < frames; f++) {
+                int idx = f * chCount + c;
+                float curIn = interleaved[idx];
+                float curOut = alpha * (prevOut + curIn - prevIn);
+                interleaved[idx] = curOut;
+                prevIn = curIn;
+                prevOut = curOut;
+            }
+        }
+    }
+
+    private float[] resampleMono(float[] src, int srcSr, int dstSr) {
+        if (srcSr == dstSr || src.length == 0) return src;
+        int outLen = Math.max(1, (int) Math.floor((double) src.length * dstSr / srcSr));
+        float[] out = new float[outLen];
+        double ratio = (double) srcSr / dstSr;
+        if (ratio >= 1.5) {
+            // Simple box anti-aliasing average for clean downsampling (e.g. 48kHz -> 16kHz)
+            int halfWin = Math.max(1, (int) Math.floor(ratio * 0.5));
+            for (int i = 0; i < outLen; i++) {
+                int center = (int) Math.round(i * ratio);
+                int lo = Math.max(0, center - halfWin);
+                int hi = Math.min(src.length - 1, center + halfWin);
+                float sum = 0f;
+                int cnt = 0;
+                for (int j = lo; j <= hi; j++) {
+                    sum += src[j];
+                    cnt++;
+                }
+                out[i] = (cnt > 0) ? (sum / cnt) : 0f;
+            }
+        } else {
+            for (int i = 0; i < outLen; i++) {
+                double pos = i * ratio;
+                int idx0 = Math.min(src.length - 1, (int) Math.floor(pos));
+                int idx1 = Math.min(src.length - 1, idx0 + 1);
+                float frac = (float) (pos - idx0);
+                out[i] = src[idx0] * (1f - frac) + src[idx1] * frac;
+            }
+        }
+        return out;
+    }
+
+    private float[] buildPlanarStereo48k(DecodedAudio src, double startSec, double endSec, float gain, double maxDurationSec) {
+        int chCount = Math.max(1, src.channels);
+        int totalSrcFrames = src.samples.length / chCount;
+        int startSrc = Math.max(0, Math.min(totalSrcFrames - 1, (int) Math.round(startSec * src.sampleRate)));
+        int endSrc = Math.min(totalSrcFrames, (int) Math.round(endSec * src.sampleRate));
+        int availSrc = endSrc - startSrc;
+        if (availSrc < src.sampleRate / 2) {
+            startSrc = 0;
+            availSrc = totalSrcFrames;
+        }
+        int maxSrcFrames = (int) Math.round(maxDurationSec * src.sampleRate);
+        availSrc = Math.min(availSrc, maxSrcFrames);
+
+        if (src.sampleRate == CLONE_MOSS_SR) {
+            int outFrames = Math.max(1, availSrc);
+            float[] planar = new float[2 * outFrames];
+            if (chCount >= 2) {
+                for (int i = 0; i < outFrames; i++) {
+                    int base = (startSrc + i) * chCount;
+                    planar[i] = Math.max(-0.98f, Math.min(0.98f, src.samples[base] * gain));
+                    planar[outFrames + i] = Math.max(-0.98f, Math.min(0.98f, src.samples[base + 1] * gain));
+                }
+            } else {
+                for (int i = 0; i < outFrames; i++) {
+                    float m = Math.max(-0.98f, Math.min(0.98f, src.samples[startSrc + i] * gain));
+                    planar[i] = m;
+                    planar[outFrames + i] = m;
+                }
+            }
+            return planar;
+        }
+
+        int outFrames = Math.max(1, (int) Math.floor((double) availSrc * CLONE_MOSS_SR / src.sampleRate));
+        int maxOutFrames = (int) (CLONE_MOSS_SR * maxDurationSec);
+        outFrames = Math.min(outFrames, maxOutFrames);
+        float[] planar = new float[2 * outFrames];
+        double ratio = (double) src.sampleRate / CLONE_MOSS_SR;
+
+        for (int i = 0; i < outFrames; i++) {
+            double pos = startSrc + i * ratio;
+            int idx0 = Math.max(0, Math.min(totalSrcFrames - 1, (int) Math.floor(pos)));
+            int idx1 = Math.min(totalSrcFrames - 1, idx0 + 1);
+            float frac = (float) (pos - idx0);
+            if (chCount >= 2) {
+                float l0 = src.samples[idx0 * chCount];
+                float l1 = src.samples[idx1 * chCount];
+                float r0 = src.samples[idx0 * chCount + 1];
+                float r1 = src.samples[idx1 * chCount + 1];
+                planar[i] = Math.max(-0.98f, Math.min(0.98f, (l0 * (1f - frac) + l1 * frac) * gain));
+                planar[outFrames + i] = Math.max(-0.98f, Math.min(0.98f, (r0 * (1f - frac) + r1 * frac) * gain));
+            } else {
+                float m0 = src.samples[idx0];
+                float m1 = src.samples[idx1];
+                float m = Math.max(-0.98f, Math.min(0.98f, (m0 * (1f - frac) + m1 * frac) * gain));
+                planar[i] = m;
+                planar[outFrames + i] = m;
+            }
+        }
+        return planar;
     }
 
     private float[] runSpeakerEncoder(File modelFile, float[] pcm16k) throws Exception {
@@ -1154,13 +1386,13 @@ public class VieNeuEngine {
         if (fbank.length != numFrames * CLONE_NUM_MELS) {
             numFrames = fbank.length / CLONE_NUM_MELS;
         }
-        if (numFrames < 5) {
-            throw new Exception("Độ dài phổ âm thanh không đủ khung hình cho Speaker Encoder.");
+        if (numFrames < 8) {
+            throw new Exception("Độ dài phổ âm thanh không đủ khung hình cho Speaker Encoder (" + numFrames + ").");
         }
 
         OrtSession.SessionOptions opts = new OrtSession.SessionOptions();
         opts.setInterOpNumThreads(1);
-        opts.setIntraOpNumThreads(Math.min(Math.max(Runtime.getRuntime().availableProcessors() / 2, 1), 4));
+        opts.setIntraOpNumThreads(Math.min(Math.max(Runtime.getRuntime().availableProcessors() / 2, 1), 2));
         opts.addConfigEntry("session.intra_op.allow_spinning", "0");
 
         try (OrtSession spkSession = env.createSession(modelFile.getAbsolutePath(), opts);
@@ -1172,6 +1404,8 @@ public class VieNeuEngine {
                 float[] emb;
                 if (raw instanceof float[][]) {
                     emb = ((float[][]) raw)[0];
+                } else if (raw instanceof float[][][]) {
+                    emb = ((float[][][]) raw)[0][0];
                 } else if (raw instanceof float[]) {
                     emb = (float[]) raw;
                 } else {
@@ -1188,13 +1422,18 @@ public class VieNeuEngine {
                 }
                 return out;
             }
+        } finally {
+            try { opts.close(); } catch (Exception ignored) {}
         }
     }
 
     private int[][] runMossTokenizerEncode(File modelFile, float[] planarStereoWave, int numSamplesPerCh) throws Exception {
+        if (numSamplesPerCh < 4800) {
+            throw new Exception("Độ dài sóng âm 48kHz quá ngắn (" + numSamplesPerCh + " mẫu).");
+        }
         OrtSession.SessionOptions opts = new OrtSession.SessionOptions();
         opts.setInterOpNumThreads(1);
-        opts.setIntraOpNumThreads(Math.min(Math.max(Runtime.getRuntime().availableProcessors() / 2, 1), 4));
+        opts.setIntraOpNumThreads(Math.min(Math.max(Runtime.getRuntime().availableProcessors() / 2, 1), 2));
         opts.addConfigEntry("session.intra_op.allow_spinning", "0");
 
         try (OrtSession mossSession = env.createSession(modelFile.getAbsolutePath(), opts);
@@ -1210,9 +1449,9 @@ public class VieNeuEngine {
                 int reportedLen = Integer.MAX_VALUE;
                 if (res.get("audio_code_lengths").isPresent()) {
                     Object lenRaw = res.get("audio_code_lengths").get().getValue();
-                    if (lenRaw instanceof int[]) {
+                    if (lenRaw instanceof int[] && ((int[]) lenRaw).length > 0) {
                         reportedLen = ((int[]) lenRaw)[0];
-                    } else if (lenRaw instanceof long[]) {
+                    } else if (lenRaw instanceof long[] && ((long[]) lenRaw).length > 0) {
                         reportedLen = (int) ((long[]) lenRaw)[0];
                     }
                 }
@@ -1220,14 +1459,18 @@ public class VieNeuEngine {
                 int[][] extracted;
                 if (codesRaw instanceof int[][][]) {
                     int[][][] arr = (int[][][]) codesRaw;
+                    if (arr.length == 0 || arr[0].length == 0) {
+                        throw new Exception("MOSS Tokenizer trả về mảng rỗng.");
+                    }
                     int rawFrames = arr[0].length;
-                    int validFrames = Math.min(rawFrames, Math.min(reportedLen, 70));
+                    int validFrames = Math.min(rawFrames, Math.min(reportedLen, 60));
                     if (validFrames < 5) {
                         throw new Exception("MOSS Tokenizer chỉ trích xuất được " + validFrames + " khung âm thanh.");
                     }
                     extracted = new int[validFrames][N_VQ];
                     for (int f = 0; f < validFrames; f++) {
-                        for (int c = 0; c < N_VQ; c++) {
+                        int chCount = Math.min(N_VQ, arr[0][f].length);
+                        for (int c = 0; c < chCount; c++) {
                             int code = arr[0][f][c];
                             if (code < 0) code = 0;
                             if (code >= 1024) code = 1023;
@@ -1236,14 +1479,18 @@ public class VieNeuEngine {
                     }
                 } else if (codesRaw instanceof long[][][]) {
                     long[][][] arr = (long[][][]) codesRaw;
+                    if (arr.length == 0 || arr[0].length == 0) {
+                        throw new Exception("MOSS Tokenizer trả về mảng rỗng.");
+                    }
                     int rawFrames = arr[0].length;
-                    int validFrames = Math.min(rawFrames, Math.min(reportedLen, 70));
+                    int validFrames = Math.min(rawFrames, Math.min(reportedLen, 60));
                     if (validFrames < 5) {
                         throw new Exception("MOSS Tokenizer chỉ trích xuất được " + validFrames + " khung âm thanh.");
                     }
                     extracted = new int[validFrames][N_VQ];
                     for (int f = 0; f < validFrames; f++) {
-                        for (int c = 0; c < N_VQ; c++) {
+                        int chCount = Math.min(N_VQ, arr[0][f].length);
+                        for (int c = 0; c < chCount; c++) {
                             int code = (int) arr[0][f][c];
                             if (code < 0) code = 0;
                             if (code >= 1024) code = 1023;
@@ -1255,6 +1502,8 @@ public class VieNeuEngine {
                 }
                 return extracted;
             }
+        } finally {
+            try { opts.close(); } catch (Exception ignored) {}
         }
     }
 
@@ -1380,12 +1629,13 @@ public class VieNeuEngine {
         }
     }
 
-    private DecodedWav parseWavFile(File wavFile) throws Exception {
+    private DecodedAudio parseWavFile(File wavFile) throws Exception {
         byte[] bytes = java.nio.file.Files.readAllBytes(wavFile.toPath());
         if (bytes.length < 44) {
-            throw new Exception("Tệp WAV giải mã không hợp lệ (< 44 bytes).");
+            throw new Exception("Tệp WAV không hợp lệ (< 44 bytes).");
         }
         ByteBuffer bb = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN);
+        int audioFormat = 1;
         int channels = 1;
         int sampleRate = 16000;
         int bitsPerSample = 16;
@@ -1396,7 +1646,9 @@ public class VieNeuEngine {
         while (offset + 8 <= bytes.length) {
             String chunkId = new String(bytes, offset, 4, StandardCharsets.US_ASCII);
             int chunkSize = bb.getInt(offset + 4);
+            if (chunkSize < 0) break;
             if ("fmt ".equals(chunkId) && offset + 24 <= bytes.length) {
+                audioFormat = bb.getShort(offset + 8) & 0xFFFF;
                 channels = bb.getShort(offset + 10) & 0xFFFF;
                 sampleRate = bb.getInt(offset + 12);
                 bitsPerSample = bb.getShort(offset + 22) & 0xFFFF;
@@ -1405,23 +1657,35 @@ public class VieNeuEngine {
                 dataSize = Math.min(chunkSize, bytes.length - dataOffset);
                 break;
             }
-            if (chunkSize < 0) break;
             offset += 8 + chunkSize + (chunkSize % 2);
         }
 
+        channels = Math.max(1, channels);
+        sampleRate = Math.max(8000, sampleRate);
         int bytesPerSample = Math.max(1, bitsPerSample / 8);
-        int numSamples = Math.max(0, dataSize / bytesPerSample);
+        int maxBytes = sampleRate * channels * bytesPerSample * 16; // cap 16s in memory
+        int safeDataSize = Math.min(Math.max(0, dataSize), maxBytes);
+        int numSamples = safeDataSize / bytesPerSample;
         float[] samples = new float[numSamples];
         for (int i = 0; i < numSamples; i++) {
             int pos = dataOffset + i * bytesPerSample;
             if (pos + bytesPerSample > bytes.length) break;
-            if (bitsPerSample == 16) {
+            if (bitsPerSample == 8) {
+                samples[i] = ((bytes[pos] & 0xFF) - 128) / 128.0f;
+            } else if (bitsPerSample == 16) {
                 samples[i] = bb.getShort(pos) / 32768.0f;
+            } else if (bitsPerSample == 24) {
+                int v = (bytes[pos] & 0xFF) | ((bytes[pos + 1] & 0xFF) << 8) | (bytes[pos + 2] << 16);
+                samples[i] = v / 8388608.0f;
             } else if (bitsPerSample == 32) {
-                samples[i] = bb.getFloat(pos);
+                if (audioFormat == 3) {
+                    samples[i] = bb.getFloat(pos);
+                } else {
+                    samples[i] = bb.getInt(pos) / 2147483648.0f;
+                }
             }
         }
-        return new DecodedWav(samples, channels, sampleRate);
+        return new DecodedAudio(samples, channels, sampleRate);
     }
 
     private float[] toMono(float[] interleaved, int channels) {

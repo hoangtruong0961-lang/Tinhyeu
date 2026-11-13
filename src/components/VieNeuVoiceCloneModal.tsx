@@ -280,6 +280,91 @@ export const VieNeuVoiceCloneModal: React.FC<VieNeuVoiceCloneModalProps> = ({
     }
   };
 
+  const encodeMonoWav48k = (samples: Float32Array, sampleRate: number): Blob => {
+    const buffer = new ArrayBuffer(44 + samples.length * 2);
+    const view = new DataView(buffer);
+    const writeStr = (offset: number, str: string) => {
+      for (let i = 0; i < str.length; i++) {
+        view.setUint8(offset + i, str.charCodeAt(i));
+      }
+    };
+    writeStr(0, 'RIFF');
+    view.setUint32(4, 36 + samples.length * 2, true);
+    writeStr(8, 'WAVE');
+    writeStr(12, 'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    writeStr(36, 'data');
+    view.setUint32(40, samples.length * 2, true);
+    let offset = 44;
+    for (let i = 0; i < samples.length; i++) {
+      const s = Math.max(-1, Math.min(1, samples[i]));
+      view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+      offset += 2;
+    }
+    return new Blob([buffer], { type: 'audio/wav' });
+  };
+
+  const prepareSampleForNativeClone = async (
+    blob: Blob
+  ): Promise<{ blob: Blob; fileName: string; mimeType: string }> => {
+    const fallbackName = blob instanceof File ? blob.name : 'recorded_sample.webm';
+    const fallbackMime = blob.type || 'audio/webm';
+    const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+    if (!AudioCtx) {
+      if (blob.size > 20 * 1024 * 1024) {
+        throw new Error('Tệp âm thanh vượt quá 20 MB. Vui lòng chọn đoạn ngắn từ 3 đến 12 giây.');
+      }
+      return { blob, fileName: fallbackName, mimeType: fallbackMime };
+    }
+
+    let ctx: AudioContext | null = null;
+    try {
+      const rawBuf = await blob.arrayBuffer();
+      ctx = new AudioCtx();
+      const decoded = await ctx.decodeAudioData(rawBuf.slice(0));
+      const targetSr = 48000;
+      const maxDurationSec = Math.min(12.0, Math.max(0.5, decoded.duration));
+      const targetLen = Math.max(1, Math.floor(maxDurationSec * targetSr));
+
+      const offline = new OfflineAudioContext(1, targetLen, targetSr);
+      const src = offline.createBufferSource();
+      src.buffer = decoded;
+
+      const hp = offline.createBiquadFilter();
+      hp.type = 'highpass';
+      hp.frequency.value = 75;
+
+      src.connect(hp);
+      hp.connect(offline.destination);
+      src.start(0, 0, maxDurationSec);
+
+      const rendered = await offline.startRendering();
+      const channelData = rendered.getChannelData(0);
+      const wavBlob = encodeMonoWav48k(channelData, targetSr);
+      return {
+        blob: wavBlob,
+        fileName: 'clone_sample_48k.wav',
+        mimeType: 'audio/wav',
+      };
+    } catch (decodeErr) {
+      console.warn('[VieNeuVoiceCloneModal] WebAudio WAV conversion fallback to native MediaCodec:', decodeErr);
+      if (blob.size > 20 * 1024 * 1024) {
+        throw new Error('Tệp âm thanh quá lớn (> 20 MB) hoặc định dạng không hợp lệ. Vui lòng cắt đoạn 3–12 giây.');
+      }
+      return { blob, fileName: fallbackName, mimeType: fallbackMime };
+    } finally {
+      if (ctx) {
+        ctx.close().catch(() => {});
+      }
+    }
+  };
+
   const blobToBase64 = (blob: Blob): Promise<string> => {
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
@@ -332,18 +417,17 @@ export const VieNeuVoiceCloneModal: React.FC<VieNeuVoiceCloneModalProps> = ({
         );
       }
 
-      setProcessStep('2/3: Đang giải mã, lọc khoảng lặng & chạy mô hình ONNX (Speaker Encoder + MOSS)...');
-      const audioBase64 = await blobToBase64(activeBlob);
-      const fileName = activeBlob instanceof File ? activeBlob.name : 'recorded_sample.webm';
-      const mimeType = activeBlob.type || 'audio/webm';
+      setProcessStep('2/3: Đang chuẩn hóa sóng âm 48kHz & chạy ONNX (Speaker Encoder + MOSS)...');
+      const prepared = await prepareSampleForNativeClone(activeBlob);
+      const audioBase64 = await blobToBase64(prepared.blob);
 
       const cloneRes = await VieNeuNative.cloneVoice({
         audioBase64,
         voiceName: cleanName,
         gender,
         accent,
-        fileName,
-        mimeType,
+        fileName: prepared.fileName,
+        mimeType: prepared.mimeType,
       });
 
       if (!cloneRes?.success || !cloneRes.voice) {
@@ -374,16 +458,16 @@ export const VieNeuVoiceCloneModal: React.FC<VieNeuVoiceCloneModalProps> = ({
     } catch (err: any) {
       console.error('Native ONNX clone voice failure:', err);
       const rawMsg = err?.message || String(err);
-      const isMissingModel = rawMsg.includes('64 MB') || rawMsg.includes('CLONING_MODELS_MISSING') || rawMsg.includes('speaker_encoder');
+      const isMissingModel = rawMsg.includes('CLONING_MODELS_MISSING') || rawMsg.includes('Thiếu tệp mô hình') || rawMsg.includes('Chưa cài đặt gói AI Clone');
       setDetailedError({
         title: isMissingModel ? 'Thiếu Gói Mô Hình AI Clone Giọng (~64 MB)' : 'Lỗi Nhân Bản Giọng AI (ONNX)',
         message: rawMsg,
         cause: isMissingModel
           ? 'Thiết bị chưa có 2 mô hình ONNX thật để trích xuất đặc trưng giọng (speaker_encoder.onnx và moss_audio_tokenizer_encode.onnx).'
-          : 'Mẫu âm thanh quá ngắn, toàn tiếng im lặng, quá nhỏ hoặc định dạng tệp bị hỏng.',
+          : rawMsg,
         suggestion: isMissingModel
           ? 'Bấm nút "Tải gói AI Clone Giọng (~64 MB)" ở banner màu vàng ngay phía trên để tải về máy.'
-          : '1. Ghi âm hoặc chọn đoạn nói rõ ràng dài từ 3 đến 8 giây, không lẫn nhạc nền.\n2. Đặt micro cách miệng 15–20cm để giọng rõ ràng, không bị rè.',
+          : '1. Ghi âm hoặc chọn đoạn nói rõ ràng dài từ 3 đến 8 giây, không lẫn nhạc nền.\n2. Đặt micro cách miệng 15–20cm để giọng rõ ràng, không bị rè.\n3. Nếu gặp lỗi bộ nhớ (OOM), hãy thử chọn đoạn ngắn 4–6 giây hoặc khởi động lại ứng dụng.',
         technicalDetails: `Platform: Android Native ONNX\nDetails: ${err?.stack || rawMsg}`,
       });
     } finally {
