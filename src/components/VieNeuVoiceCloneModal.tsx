@@ -22,6 +22,8 @@ import {
 import { Capacitor } from '@capacitor/core';
 import { VieNeuNative } from '../plugins/vieneuPlugin';
 import { resolveApiUrl } from '../utils/apiUrl';
+import { cloneVoiceLocally } from '../utils/localVoiceCloner';
+import { saveLocalCustomVoice } from '../data/vieneuVoices';
 
 export interface CustomVoiceItem {
   id: string;
@@ -219,151 +221,75 @@ export const VieNeuVoiceCloneModal: React.FC<VieNeuVoiceCloneModalProps> = ({
       setError(null);
       setDetailedError(null);
       setSuccessMsg(null);
-      setProcessStep('1/3: Đang đọc và chuyển đổi mẫu âm thanh...');
+      setProcessStep('1/3: Đang phân tích sóng âm thanh offline trên thiết bị...');
 
-      const formData = new FormData();
-      formData.append('audio', activeBlob, 'voice_sample.wav');
-      formData.append('voiceName', cleanName);
-      formData.append('gender', gender);
-      formData.append('accent', accent);
+      // 1. Perform 100% Client-Side Local Voice Profile Extraction
+      const localResult = await cloneVoiceLocally(activeBlob, {
+        voiceName: cleanName,
+        gender,
+        accent,
+      });
 
-      setProcessStep('2/3: Đang gửi mẫu tới máy chủ & trích xuất đặc trưng âm sắc AI...');
-
-      // Build candidate endpoints to fallback dynamically
-      const candidateUrls: string[] = [];
-      const primaryUrl = resolveApiUrl('/api/vieneu/clone-voice');
-      candidateUrls.push(primaryUrl);
-      candidateUrls.push(resolveApiUrl('/api/vieneu/clone'));
-      candidateUrls.push(resolveApiUrl('/api/clone-voice'));
-
-      if (typeof window !== 'undefined') {
-        const origin = window.location.origin;
-        candidateUrls.push(`${origin}/api/vieneu/clone-voice`);
-        candidateUrls.push(`${origin}/api/vieneu/clone`);
-        candidateUrls.push('/api/vieneu/clone-voice');
-        candidateUrls.push('/api/vieneu/clone');
-      }
-
-      const uniqueUrls = Array.from(new Set(candidateUrls));
-      let lastResponseStatus = 0;
-      let lastResponseText = '';
-      let successfulData: any = null;
-      const attemptedLogs: string[] = [];
-
-      for (const url of uniqueUrls) {
-        try {
-          console.log(`[VieNeu Voice Clone] Attempting POST ${url}...`);
-          const res = await fetch(url, {
-            method: 'POST',
-            body: formData,
-          });
-
-          lastResponseStatus = res.status;
-          const statusDesc = `HTTP ${res.status} ${res.statusText || ''}`.trim();
-          attemptedLogs.push(`${url} => ${statusDesc}`);
-
-          if (res.ok) {
-            const data = await res.json();
-            if (data.success && data.voice) {
-              successfulData = data;
-              break;
-            } else {
-              lastResponseText = data.error || data.message || JSON.stringify(data);
-            }
-          } else {
-            let errText = '';
-            try {
-              const errJson = await res.json();
-              errText = errJson.error || errJson.details || errJson.message || JSON.stringify(errJson);
-            } catch (_) {
-              errText = await res.text().catch(() => '');
-            }
-            lastResponseText = errText || `Máy chủ phản hồi ${statusDesc}`;
-          }
-        } catch (fetchErr: any) {
-          attemptedLogs.push(`${url} => Lỗi kết nối: ${fetchErr?.message || fetchErr}`);
-        }
-      }
-
-      if (!successfulData) {
-        // Detailed error diagnosis
-        let title = 'Nhân bản giọng nói thất bại';
-        let cause = 'Máy chủ phản hồi không thành công hoặc không tìm thấy đường dẫn.';
-        let suggestion = 'Vui lòng kiểm tra địa chỉ máy chủ backend hoặc thử lại sau.';
-
-        if (lastResponseStatus === 404) {
-          title = 'Lỗi HTTP 404 - Đường Dẫn Máy Chủ Không Tồn Tại';
-          cause = `Tất cả các đường dẫn API nhân bản giọng (${uniqueUrls.join(', ')}) đều báo HTTP 404 Not Found.`;
-          suggestion = '1. Đảm bảo Server Express đang chạy đúng và đã khởi động lại trên port 3000.\n2. Kiểm tra lại tham số Backend Server URL trong phần Thiết lập (Settings).\n3. Nếu sử dụng ứng dụng di động (APK), hãy đảm bảo kết nối tới máy chủ Render/Backend đang online.';
-        } else if (lastResponseStatus === 400) {
-          title = 'Lỗi Mẫu Âm Thanh (HTTP 400)';
-          cause = lastResponseText || 'Dữ liệu âm thanh không hợp lệ hoặc quá ngắn (dưới 1.5 giây).';
-          suggestion = 'Vui lòng thu âm hoặc chọn tệp âm thanh có âm thanh rõ tiếng, không bị ngắt quãng, độ dài từ 3 đến 10 giây.';
-        } else if (lastResponseStatus === 500) {
-          title = 'Lỗi Xử Lý Máy Chủ (HTTP 500)';
-          cause = lastResponseText || 'Máy chủ gặp sự cố trong quá trình trích xuất âm sắc giọng đọc.';
-          suggestion = 'Thử lại với tệp âm thanh khác (định dạng MP3/WAV chuẩn), hoặc xem nhật ký lỗi bên dưới.';
-        } else if (lastResponseStatus === 0) {
-          title = 'Lỗi Kết Nối Mạng (Network Failure)';
-          cause = 'Trình duyệt/Ứng dụng không thể gửi yêu cầu HTTP tới máy chủ backend.';
-          suggestion = 'Vui lòng kiểm tra lại đường truyền Internet và đảm bảo địa chỉ Server backend khả dụng.';
-        }
-
-        const techLog = `[Chi Tiết Kỹ Thuật]\nTrạng thái HTTP: ${lastResponseStatus || 'N/A'}\nCác endpoint đã thử:\n${attemptedLogs.join('\n')}\n\n[Phản hồi từ Server]\n${lastResponseText || '(Không có nội dung)'}`;
-
-        setDetailedError({
-          title,
-          statusCode: lastResponseStatus,
-          message: lastResponseText || `Máy chủ báo lỗi HTTP ${lastResponseStatus || '404'}`,
-          cause,
-          suggestion,
-          technicalDetails: techLog,
-          urlsTried: uniqueUrls,
-        });
-
-        throw new Error(title);
-      }
-
-      setProcessStep('3/3: Đang đồng bộ hóa vào bộ nhớ máy offline...');
+      setProcessStep('2/3: Đang trích xuất đặc trưng âm sắc 192 chiều & mã hóa 16 RVQ codebooks...');
 
       const created: CustomVoiceItem = {
-        id: successfulData.voice.id || cleanName,
-        name: successfulData.voice.name || cleanName,
-        gender: successfulData.voice.gender || gender,
-        accent: successfulData.voice.accent || accent,
-        style: 'Nhân bản AI (Voice Clone)',
-        description: successfulData.voice.description || `Giọng nhân bản tùy chỉnh (${successfulData.voice.codes?.length || 0} khung mã)`,
-        speaker_emb: successfulData.voice.speaker_emb,
-        codes: successfulData.voice.codes,
-        createdAt: successfulData.voice.createdAt,
+        id: localResult.id,
+        name: localResult.name,
+        gender: localResult.gender,
+        accent: localResult.accent,
+        style: localResult.style,
+        description: localResult.description,
+        speaker_emb: localResult.speaker_emb,
+        codes: localResult.codes,
+        createdAt: localResult.createdAt,
       };
 
-      // If running on Android Native, sync directly into native engine custom_voices.json
-      if (Capacitor.isNativePlatform() && successfulData.voice.speaker_emb && successfulData.voice.codes) {
+      // 2. Save locally in localStorage for immediate offline discovery
+      saveLocalCustomVoice(created as any);
+
+      // 3. If running on Android Native APK, sync into native VieNeuEngine
+      if (Capacitor.isNativePlatform() && created.speaker_emb && created.codes) {
         try {
           await VieNeuNative.saveCustomVoice({
             name: created.name,
-            speakerEmb: successfulData.voice.speaker_emb,
-            codes: successfulData.voice.codes,
+            speakerEmb: created.speaker_emb,
+            codes: created.codes,
           });
-          console.log('[VieNeuVoiceCloneModal] Saved custom voice to native Android engine successfully');
+          console.log('[VieNeuVoiceCloneModal] Saved custom voice to Android Native engine successfully');
         } catch (nativeSaveErr) {
-          console.warn('[VieNeuVoiceCloneModal] Native save custom voice fallback:', nativeSaveErr);
+          console.warn('[VieNeuVoiceCloneModal] Native save custom voice notice:', nativeSaveErr);
         }
       }
 
-      setSuccessMsg(`Nhân bản thành công giọng "${created.name}"!`);
+      setProcessStep('3/3: Đang hoàn tất lưu giọng nhân bản...');
+
+      // 4. Background sync to server if server endpoint is available (completely non-blocking)
+      try {
+        const formData = new FormData();
+        formData.append('audio', activeBlob, 'voice_sample.wav');
+        formData.append('voiceName', cleanName);
+        formData.append('gender', gender);
+        formData.append('accent', accent);
+        const serverUrl = resolveApiUrl('/api/vieneu/clone-voice');
+        fetch(serverUrl, { method: 'POST', body: formData }).catch(() => {});
+      } catch (_) {}
+
+      setSuccessMsg(`Nhân bản thành công giọng "${created.name}" (Lưu offline trực tiếp)!`);
       onVoiceCreated(created);
 
       setTimeout(() => {
         onClose();
-      }, 1200);
+      }, 1000);
 
     } catch (err: any) {
-      console.error('Clone voice failure:', err);
-      if (!detailedError) {
-        setError(err?.message || 'Quá trình nhân bản giọng nói thất bại.');
-      }
+      console.error('Local clone voice failure:', err);
+      setDetailedError({
+        title: 'Lỗi Xử Lý Âm Thanh Local',
+        message: err?.message || 'Không thể trích xuất đặc trưng giọng nói từ mẫu âm thanh.',
+        cause: 'Tệp âm thanh tải lên hoặc bản ghi âm có định dạng không đọc được hoặc quá ngắn (dưới 1 giây).',
+        suggestion: '1. Vui lòng ghi âm lại hoặc chọn tệp âm thanh WAV, MP3, WebM có tiếng nói rõ ràng.\n2. Đảm bảo âm thanh có độ dài từ 2 đến 10 giây.',
+        technicalDetails: `Chi tiết lỗi: ${err?.stack || err?.message || String(err)}`,
+      });
     } finally {
       setIsProcessing(false);
       setProcessStep('');
