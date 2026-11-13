@@ -137,7 +137,7 @@ export const TopExportSettingsDropdown: React.FC<TopExportSettingsDropdownProps>
       <button
         type="button"
         onClick={toggleOpen}
-        className={`relative z-[100] h-[30px] px-2.5 rounded-lg border text-xs font-medium transition-all active:scale-95 cursor-pointer flex items-center space-x-1.5 select-none ${
+        className={`relative z-[100] h-[30px] px-2 sm:px-2.5 rounded-lg border text-xs font-medium transition-all active:scale-95 cursor-pointer flex items-center space-x-1 sm:space-x-1.5 select-none shrink-0 ${
           isPanelOpen
             ? 'bg-[#2e2e36] border-white/20 text-white'
             : 'bg-[#222226] hover:bg-[#2c2c31] text-zinc-300 hover:text-white border-white/10'
@@ -189,7 +189,7 @@ export const TopExportSettingsDropdown: React.FC<TopExportSettingsDropdownProps>
               </button>
             </div>
 
-            <div className="space-y-3.5 max-h-[min(520px,calc(100vh-120px))] overflow-y-auto pr-1 [scrollbar-width:thin]">
+            <div className="space-y-3.5 max-h-[min(520px,calc(100dvh-130px-var(--app-safe-top)-var(--app-safe-bottom)))] overflow-y-auto pr-1 [scrollbar-width:thin]">
               {/* 1. ENGINE XUẤT */}
               <div>
                 <div className="flex items-center justify-between mb-1.5">

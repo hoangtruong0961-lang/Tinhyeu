@@ -86,7 +86,7 @@ export const VieNeuModelDownloadModal: React.FC<VieNeuModelDownloadModalProps> =
       setDownloadProgress(2);
       setProgressMessage('Đang kết nối kho mô hình Hugging Face...');
 
-      const res = await VieNeuNative.downloadModels({ includeCloning: false });
+      const res = await VieNeuNative.downloadModels({ includeCloning: true });
       if (res.isReady) {
         setDownloadProgress(100);
         setProgressMessage('Tải và cài đặt thành công!');
@@ -94,6 +94,25 @@ export const VieNeuModelDownloadModal: React.FC<VieNeuModelDownloadModalProps> =
       }
     } catch (e: any) {
       setError(e?.message || 'Lỗi trong quá trình tải mô hình');
+      setIsDownloading(false);
+    }
+  };
+
+  const handleDownloadCloningOnly = async () => {
+    try {
+      setIsDownloading(true);
+      setError(null);
+      setDownloadProgress(2);
+      setProgressMessage('Đang tải gói AI Clone Giọng thật (~64 MB)...');
+
+      const res = await VieNeuNative.downloadCloningModels();
+      if (res.isCloningReady) {
+        setDownloadProgress(100);
+        setProgressMessage('Đã cài đặt gói AI Clone Giọng thật!');
+        await fetchStatus();
+      }
+    } catch (e: any) {
+      setError(e?.message || 'Lỗi khi tải gói AI Clone Giọng');
       setIsDownloading(false);
     }
   };
@@ -161,16 +180,42 @@ export const VieNeuModelDownloadModal: React.FC<VieNeuModelDownloadModalProps> =
               <span>Đang kiểm tra dữ liệu máy...</span>
             </div>
           ) : status?.isReady ? (
-            <div className="p-4 rounded-xl bg-emerald-500/10 border border-emerald-500/30 flex items-start gap-3">
-              <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0 mt-0.5" />
-              <div className="space-y-1">
-                <p className="text-sm font-semibold text-emerald-300">
-                  Mô hình đã sẵn sàng trên thiết bị!
-                </p>
-                <p className="text-xs text-zinc-400">
-                  Dung lượng đã lưu: <span className="text-white font-mono">{status.totalSizeMB || 147.4} MB</span>. Bạn có thể thuyết minh không giới hạn mà không cần internet.
-                </p>
+            <div className="space-y-3">
+              <div className="p-4 rounded-xl bg-emerald-500/10 border border-emerald-500/30 flex items-start gap-3">
+                <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0 mt-0.5" />
+                <div className="space-y-1">
+                  <p className="text-sm font-semibold text-emerald-300">
+                    Mô hình đã sẵn sàng trên thiết bị!
+                  </p>
+                  <p className="text-xs text-zinc-400">
+                    Dung lượng đã lưu: <span className="text-white font-mono">{status.totalSizeMB || 147.4} MB</span>.{' '}
+                    {status.isCloningReady
+                      ? 'Đã bao gồm gói AI Clone giọng thật (ONNX).'
+                      : 'Mô hình đọc cơ bản đã sẵn sàng.'}
+                  </p>
+                </div>
               </div>
+
+              {!status.isCloningReady && (
+                <div className="p-4 rounded-xl bg-amber-500/10 border border-amber-500/30 flex items-center justify-between gap-3">
+                  <div className="space-y-0.5">
+                    <p className="text-xs font-semibold text-amber-300">
+                      Thiếu gói AI Clone Giọng thật (~64 MB)
+                    </p>
+                    <p className="text-[11px] text-zinc-300">
+                      Cần tải thêm Speaker Encoder &amp; MOSS Audio Tokenizer để nhân bản giọng chuẩn xác.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleDownloadCloningOnly}
+                    disabled={isDownloading}
+                    className="shrink-0 px-3 py-2 rounded-lg text-xs font-semibold bg-amber-500 hover:bg-amber-400 text-black transition-all disabled:opacity-50"
+                  >
+                    Tải gói Clone
+                  </button>
+                </div>
+              )}
             </div>
           ) : (
             <div className="p-4 rounded-xl bg-amber-500/10 border border-amber-500/20 space-y-2">
@@ -179,7 +224,7 @@ export const VieNeuModelDownloadModal: React.FC<VieNeuModelDownloadModalProps> =
                 <span>Chưa có gói dữ liệu mô hình</span>
               </div>
               <p className="text-xs text-zinc-300 leading-relaxed">
-                Để giữ dung lượng ứng dụng siêu nhẹ khi cài đặt, mô hình AI VieNeu-TTS (~147 MB) được tải trực tiếp theo nhu cầu vào bộ nhớ máy của bạn.
+                Để giữ dung lượng ứng dụng gọn nhẹ khi cài đặt, bộ mô hình AI VieNeu-TTS + Clone giọng thật (~211 MB) sẽ được tải trực tiếp vào bộ nhớ máy Android.
               </p>
             </div>
           )}
@@ -279,7 +324,7 @@ export const VieNeuModelDownloadModal: React.FC<VieNeuModelDownloadModalProps> =
                 ) : (
                   <>
                     <Download className="w-4 h-4" />
-                    <span>Tải mô hình ngay (~147 MB)</span>
+                    <span>Tải mô hình + Clone giọng (~211 MB)</span>
                   </>
                 )}
               </button>

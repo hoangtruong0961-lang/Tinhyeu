@@ -10,6 +10,10 @@ import ai.onnxruntime.OrtEnvironment;
 import ai.onnxruntime.OrtSession;
 import ai.onnxruntime.TensorInfo;
 
+import com.arthenica.ffmpegkit.FFmpegKit;
+import com.arthenica.ffmpegkit.FFmpegSession;
+import com.arthenica.ffmpegkit.ReturnCode;
+
 import org.json.JSONArray;
 import org.json.JSONObject;
 
@@ -218,13 +222,21 @@ public class VieNeuEngine {
         float[] anchor = computeSpeakerAnchor(speakerEmb);
 
         // Step 2: Build prompt 2D matrix (Text Rows + Ref Audio Rows)
-        // Text tokens: [style_id, tps] + inputTokenIds + [tpe]
-        int tPromptText = 2 + inputTokenIds.length + 1;
-        int[] textTokenIds = new int[tPromptText];
-        textTokenIds[0] = DEFAULT_STYLE_TOKEN_ID;
-        textTokenIds[1] = TEXT_PROMPT_START_TOKEN_ID;
-        System.arraycopy(inputTokenIds, 0, textTokenIds, 2, inputTokenIds.length);
-        textTokenIds[tPromptText - 1] = TEXT_PROMPT_END_TOKEN_ID;
+        // Frontend convertTextToTokenIds() already wraps as [style_id, 3, ...phoneIds, 4].
+        // Only wrap if raw phone IDs were passed without TPS/TPE framing.
+        int[] textTokenIds;
+        if (inputTokenIds.length >= 3
+                && inputTokenIds[1] == TEXT_PROMPT_START_TOKEN_ID
+                && inputTokenIds[inputTokenIds.length - 1] == TEXT_PROMPT_END_TOKEN_ID) {
+            textTokenIds = inputTokenIds;
+        } else {
+            textTokenIds = new int[2 + inputTokenIds.length + 1];
+            textTokenIds[0] = DEFAULT_STYLE_TOKEN_ID;
+            textTokenIds[1] = TEXT_PROMPT_START_TOKEN_ID;
+            System.arraycopy(inputTokenIds, 0, textTokenIds, 2, inputTokenIds.length);
+            textTokenIds[textTokenIds.length - 1] = TEXT_PROMPT_END_TOKEN_ID;
+        }
+        int tPromptText = textTokenIds.length;
 
         int totalPromptLength = tPromptText + numRefFrames;
         int[][] promptRows = new int[totalPromptLength][N_VQ + 1];
@@ -465,7 +477,7 @@ public class VieNeuEngine {
             throw new Exception("Synthesis produced 0 audio frames");
         }
 
-        Log.d(TAG, String.format("Generated %d frames (~%.2fs). Running MOSS Codec decoder...", totalFrames, totalFrames / 25.0));
+        Log.d(TAG, String.format("Generated %d frames (~%.2fs). Running MOSS Codec decoder...", totalFrames, totalFrames / 12.5));
 
         // Step 5: Decode audio frames with MOSS Codec
         // Prepare audio_codes (int32 or int64): shape [1, totalFrames, 16]
@@ -543,11 +555,20 @@ public class VieNeuEngine {
 
         JSONArray names = presets.names();
         if (names != null) {
+            // Pass 1: exact case-insensitive match first (never lose to a shorter substring preset)
+            for (int i = 0; i < names.length(); i++) {
+                String candidate = names.optString(i, "");
+                if (candidate.equalsIgnoreCase(cleanReq)) {
+                    Log.d(TAG, "Resolved requested voice '" + requested + "' -> exact preset '" + candidate + "'");
+                    return candidate;
+                }
+            }
+            // Pass 2: substring fallback
             String reqLower = cleanReq.toLowerCase();
             for (int i = 0; i < names.length(); i++) {
                 String candidate = names.optString(i, "");
-                if (candidate.equalsIgnoreCase(cleanReq) || candidate.toLowerCase().contains(reqLower) || reqLower.contains(candidate.toLowerCase())) {
-                    Log.d(TAG, "Resolved requested voice '" + requested + "' -> preset '" + candidate + "'");
+                if (!candidate.isEmpty() && (candidate.toLowerCase().contains(reqLower) || reqLower.contains(candidate.toLowerCase()))) {
+                    Log.d(TAG, "Resolved requested voice '" + requested + "' -> substring preset '" + candidate + "'");
                     return candidate;
                 }
             }
@@ -721,6 +742,16 @@ public class VieNeuEngine {
             return val[0][0][0];
         } else if (rawValue instanceof float[][][]) {
             float[][][] val = (float[][][]) rawValue;
+            if (val[0].length >= 2) {
+                float[] ch0 = val[0][0];
+                float[] ch1 = val[0][1];
+                int len = Math.min(ch0.length, ch1.length);
+                float[] mono = new float[len];
+                for (int i = 0; i < len; i++) {
+                    mono[i] = (ch0[i] + ch1[i]) * 0.5f;
+                }
+                return mono;
+            }
             return val[0][0];
         } else if (rawValue instanceof float[][]) {
             float[][] val = (float[][]) rawValue;
@@ -815,14 +846,36 @@ public class VieNeuEngine {
         }
     }
 
-    public void registerCustomVoice(String name, float[] speakerEmb, int[][] codes) {
-        if (voicesJsonObject == null) return;
+    public synchronized void updateCustomVoiceInMemory(String name, JSONObject voiceData) {
+        if (voicesJsonObject == null || name == null || voiceData == null) return;
         try {
             JSONObject presets = voicesJsonObject.optJSONObject("presets");
             if (presets == null) {
                 presets = new JSONObject();
                 voicesJsonObject.put("presets", presets);
             }
+            presets.put(name, voiceData);
+            Log.d(TAG, "Updated in-memory custom voice preset: " + name);
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to update in-memory custom voice: " + name, e);
+        }
+    }
+
+    public synchronized void removeCustomVoiceInMemory(String name) {
+        if (voicesJsonObject == null || name == null) return;
+        try {
+            JSONObject presets = voicesJsonObject.optJSONObject("presets");
+            if (presets != null && presets.has(name)) {
+                presets.remove(name);
+                Log.d(TAG, "Removed in-memory custom voice preset: " + name);
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to remove in-memory custom voice: " + name, e);
+        }
+    }
+
+    public void registerCustomVoice(String name, float[] speakerEmb, int[][] codes) {
+        try {
             JSONObject voiceData = new JSONObject();
             JSONArray spkArr = new JSONArray();
             for (float f : speakerEmb) {
@@ -838,16 +891,18 @@ public class VieNeuEngine {
             }
             voiceData.put("codes", codesArr);
 
-            presets.put(name, voiceData);
+            updateCustomVoiceInMemory(name, voiceData);
             Log.d(TAG, "Registered custom voice: " + name + " with " + codes.length + " ref frames");
 
             // Persist to custom_voices.json in modelsDir
             File customFile = new File(modelsDir, "custom_voices.json");
             JSONObject customFileObj = new JSONObject();
             if (customFile.exists()) {
-                try {
-                    String existing = new String(java.nio.file.Files.readAllBytes(customFile.toPath()), StandardCharsets.UTF_8);
-                    customFileObj = new JSONObject(existing);
+                try (BufferedReader cbr = new BufferedReader(new InputStreamReader(new FileInputStream(customFile), StandardCharsets.UTF_8))) {
+                    StringBuilder csb = new StringBuilder();
+                    String cline;
+                    while ((cline = cbr.readLine()) != null) csb.append(cline);
+                    customFileObj = new JSONObject(csb.toString());
                 } catch (Exception ignored) {}
             }
             customFileObj.put(name, voiceData);
@@ -857,6 +912,531 @@ public class VieNeuEngine {
         } catch (Exception e) {
             Log.e(TAG, "Failed to register custom voice: " + name, e);
         }
+    }
+
+    // =========================================================================
+    // REAL ONNX VOICE CLONING (speaker_encoder.onnx + moss_audio_tokenizer_encode.onnx)
+    // =========================================================================
+
+    private static final int CLONE_NUM_MELS = 80;
+    private static final int CLONE_N_FFT = 512;
+    private static final int CLONE_WIN_LEN = 400; // 25ms @ 16kHz
+    private static final int CLONE_HOP_LEN = 160; // 10ms @ 16kHz
+    private static final int CLONE_SPK_SR = 16000;
+    private static final int CLONE_MOSS_SR = 48000;
+    private static float[][] cachedMelFilterbank = null;
+
+    private static final class DecodedWav {
+        final float[] samples; // interleaved if stereo
+        final int channels;
+        final int sampleRate;
+        DecodedWav(float[] samples, int channels, int sampleRate) {
+            this.samples = samples;
+            this.channels = channels;
+            this.sampleRate = sampleRate;
+        }
+    }
+
+    /**
+     * Extracts real speaker_emb (192-dim) and RVQ audio codes ([T][16]) on-device
+     * using FFmpeg decoding + silence trimming + speaker_encoder.onnx + moss_audio_tokenizer_encode.onnx.
+     */
+    public synchronized JSONObject cloneVoiceFromAudio(
+            String voiceName,
+            File inputAudioFile,
+            File workDir
+    ) throws Exception {
+        long startMs = System.currentTimeMillis();
+        if (env == null) {
+            env = OrtEnvironment.getEnvironment();
+        }
+
+        File spkModelFile = new File(modelsDir, "speaker_encoder.onnx");
+        File mossEncodeFile = new File(modelsDir, "moss_audio_tokenizer_encode.onnx");
+        File mossEncodeDataFile = new File(modelsDir, "moss_audio_tokenizer_encode.data");
+
+        if (!spkModelFile.exists() || spkModelFile.length() == 0
+                || !mossEncodeFile.exists() || mossEncodeFile.length() == 0
+                || !mossEncodeDataFile.exists() || mossEncodeDataFile.length() == 0) {
+            throw new Exception("Thiếu tệp mô hình AI Clone Giọng (speaker_encoder.onnx hoặc moss_audio_tokenizer_encode). Vui lòng tải gói Clone giọng (~64 MB).");
+        }
+
+        String ts = String.valueOf(System.currentTimeMillis());
+        File wav16kFile = new File(workDir, "clone_16k_" + ts + ".wav");
+        File wav48kFile = new File(workDir, "clone_48k_" + ts + ".wav");
+
+        try {
+            // Step 1: Decode audio to clean 16kHz mono & 48kHz stereo WAV via FFmpegKit
+            convertToCloneWav(inputAudioFile, wav16kFile, 1, CLONE_SPK_SR);
+            convertToCloneWav(inputAudioFile, wav48kFile, 2, CLONE_MOSS_SR);
+
+            DecodedWav wav16 = parseWavFile(wav16kFile);
+            DecodedWav wav48 = parseWavFile(wav48kFile);
+
+            float[] pcm16Raw = toMono(wav16.samples, wav16.channels);
+            if (pcm16Raw.length < CLONE_SPK_SR / 2) {
+                throw new Exception("Âm thanh quá ngắn (dưới 0.5 giây). Vui lòng cung cấp đoạn nói rõ ràng từ 3 đến 10 giây.");
+            }
+
+            // Step 2: Active-speech VAD silence trimming & loudness normalization
+            // Frame size = 320 samples (20ms @ 16kHz)
+            int frameLen = 320;
+            int totalFrames = pcm16Raw.length / frameLen;
+            float[] frameRms = new float[totalFrames];
+            float peakRms = 0f;
+            float overallPeakAmp = 0f;
+
+            for (int f = 0; f < totalFrames; f++) {
+                int off = f * frameLen;
+                double sq = 0.0;
+                for (int i = 0; i < frameLen; i++) {
+                    float s = pcm16Raw[off + i];
+                    sq += s * s;
+                    float abs = Math.abs(s);
+                    if (abs > overallPeakAmp) overallPeakAmp = abs;
+                }
+                float rms = (float) Math.sqrt(sq / frameLen);
+                frameRms[f] = rms;
+                if (rms > peakRms) peakRms = rms;
+            }
+
+            if (overallPeakAmp < 0.004f || peakRms < 0.002f) {
+                throw new Exception("Âm thanh chỉ toàn im lặng hoặc âm lượng quá nhỏ. Vui lòng ghi âm lại gần micro hơn.");
+            }
+
+            float speechThresh = Math.max(0.005f, peakRms * 0.12f);
+            int firstActive = -1;
+            int lastActive = -1;
+            for (int f = 0; f < totalFrames; f++) {
+                if (frameRms[f] >= speechThresh) {
+                    if (firstActive == -1) firstActive = f;
+                    lastActive = f;
+                }
+            }
+            if (firstActive == -1) {
+                firstActive = 0;
+                lastActive = totalFrames - 1;
+            }
+
+            int startFrame = Math.max(0, firstActive - 2); // 40ms pre-roll
+            int endFrame = Math.min(totalFrames, lastActive + 4); // 60ms tail
+            int startSample16 = startFrame * frameLen;
+            int endSample16 = Math.min(pcm16Raw.length, endFrame * frameLen);
+            int activeSamples16 = endSample16 - startSample16;
+
+            double activeDurationSec = (double) activeSamples16 / (double) CLONE_SPK_SR;
+            if (activeDurationSec < 0.8) {
+                throw new Exception(String.format(
+                        "Giọng nói thực tế quá ngắn (chỉ có %.1fs sau khi bỏ khoảng lặng). Vui lòng nói rõ câu dài từ 3 đến 8 giây.",
+                        activeDurationSec
+                ));
+            }
+
+            // Use up to 10s of active speech for speaker_encoder.onnx
+            int spkSliceLen = Math.min(activeSamples16, CLONE_SPK_SR * 10);
+            float[] pcm16Trimmed = Arrays.copyOfRange(pcm16Raw, startSample16, startSample16 + spkSliceLen);
+
+            // Compute active speech RMS and gain so soft mic recordings match reference levels cleanly
+            double sumSqActive = 0.0;
+            float peakActive = 0f;
+            for (float s : pcm16Trimmed) {
+                sumSqActive += s * s;
+                float a = Math.abs(s);
+                if (a > peakActive) peakActive = a;
+            }
+            float activeRms = (float) Math.sqrt(sumSqActive / Math.max(1, pcm16Trimmed.length));
+            float targetGain = Math.min(0.09f / Math.max(activeRms, 1e-5f), 0.90f / Math.max(peakActive, 1e-5f));
+            targetGain = Math.max(0.4f, Math.min(8.0f, targetGain));
+            if (targetGain * peakActive > 0.92f) {
+                targetGain = 0.92f / Math.max(peakActive, 1e-5f);
+            }
+            for (int i = 0; i < pcm16Trimmed.length; i++) {
+                pcm16Trimmed[i] = Math.max(-0.98f, Math.min(0.98f, pcm16Trimmed[i] * targetGain));
+            }
+
+            // Slice corresponding 48kHz stereo window: max 4.8s active speech (~60 MOSS RVQ frames @ 12.5 Hz)
+            double startSec = (double) startSample16 / (double) CLONE_SPK_SR;
+            int total48Frames = wav48.samples.length / Math.max(1, wav48.channels);
+            int start48 = Math.max(0, Math.min(total48Frames - 1, (int) Math.round(startSec * CLONE_MOSS_SR)));
+            int end48 = Math.min(total48Frames, (int) Math.round(((double) endSample16 / CLONE_SPK_SR) * CLONE_MOSS_SR));
+            int avail48 = end48 - start48;
+            if (avail48 < CLONE_MOSS_SR / 2) {
+                start48 = 0;
+                avail48 = total48Frames;
+            }
+            int mossFramesLen = Math.min(avail48, (int) (CLONE_MOSS_SR * 4.8));
+
+            float[] planar48 = new float[2 * mossFramesLen];
+            if (wav48.channels >= 2) {
+                int chStride = wav48.channels;
+                for (int i = 0; i < mossFramesLen; i++) {
+                    int srcIdx = (start48 + i) * chStride;
+                    float l = Math.max(-0.98f, Math.min(0.98f, wav48.samples[srcIdx] * targetGain));
+                    float r = Math.max(-0.98f, Math.min(0.98f, wav48.samples[srcIdx + 1] * targetGain));
+                    planar48[i] = l;
+                    planar48[mossFramesLen + i] = r;
+                }
+            } else {
+                for (int i = 0; i < mossFramesLen; i++) {
+                    float m = Math.max(-0.98f, Math.min(0.98f, wav48.samples[start48 + i] * targetGain));
+                    planar48[i] = m;
+                    planar48[mossFramesLen + i] = m;
+                }
+            }
+
+            // Step 3: Extract 192-dim Speaker Embedding using speaker_encoder.onnx
+            float[] speakerEmb = runSpeakerEncoder(spkModelFile, pcm16Trimmed);
+
+            // Step 4: Extract 16-channel RVQ audio codes using moss_audio_tokenizer_encode.onnx
+            int[][] refCodes = runMossTokenizerEncode(mossEncodeFile, planar48, mossFramesLen);
+
+            // Step 5: Persist to custom_voices.json & update in-memory presets immediately
+            registerCustomVoice(voiceName, speakerEmb, refCodes);
+
+            long elapsedMs = System.currentTimeMillis() - startMs;
+            Log.d(TAG, String.format(
+                    "REAL CLONE SUCCESS '%s': active=%.2fs, gain=%.2fx, refFrames=%d, elapsed=%dms",
+                    voiceName, activeDurationSec, targetGain, refCodes.length, elapsedMs
+            ));
+
+            JSONObject result = new JSONObject();
+            JSONArray spkArr = new JSONArray();
+            for (float v : speakerEmb) spkArr.put((double) v);
+            JSONArray codesArr = new JSONArray();
+            for (int[] row : refCodes) {
+                JSONArray rowArr = new JSONArray();
+                for (int c : row) rowArr.put(c);
+                codesArr.put(rowArr);
+            }
+            result.put("speaker_emb", spkArr);
+            result.put("codes", codesArr);
+            result.put("numFrames", refCodes.length);
+            result.put("activeDurationSec", Math.round(activeDurationSec * 100.0) / 100.0);
+            result.put("elapsedMs", elapsedMs);
+            return result;
+        } finally {
+            try { if (wav16kFile.exists()) wav16kFile.delete(); } catch (Exception ignored) {}
+            try { if (wav48kFile.exists()) wav48kFile.delete(); } catch (Exception ignored) {}
+        }
+    }
+
+    private void convertToCloneWav(File inputFile, File outputWav, int channels, int sampleRate) throws Exception {
+        String cmd = String.format(
+                java.util.Locale.US,
+                "-y -i \"%s\" -af \"highpass=f=75\" -ac %d -ar %d -t 15 -c:a pcm_s16le \"%s\"",
+                inputFile.getAbsolutePath(), channels, sampleRate, outputWav.getAbsolutePath()
+        );
+        FFmpegSession session = FFmpegKit.execute(cmd);
+        if (!ReturnCode.isSuccess(session.getReturnCode()) || !outputWav.exists() || outputWav.length() < 44) {
+            // Retry without highpass audio filter just in case
+            String fallbackCmd = String.format(
+                    java.util.Locale.US,
+                    "-y -i \"%s\" -ac %d -ar %d -t 15 -c:a pcm_s16le \"%s\"",
+                    inputFile.getAbsolutePath(), channels, sampleRate, outputWav.getAbsolutePath()
+            );
+            session = FFmpegKit.execute(fallbackCmd);
+            if (!ReturnCode.isSuccess(session.getReturnCode()) || !outputWav.exists() || outputWav.length() < 44) {
+                String errOut = session.getFailStackTrace();
+                if (errOut == null || errOut.trim().isEmpty()) {
+                    errOut = session.getOutput();
+                }
+                if (errOut != null && errOut.length() > 300) {
+                    errOut = errOut.substring(errOut.length() - 300);
+                }
+                throw new Exception("Không thể giải mã tệp âm thanh (" + sampleRate + "Hz). Chi tiết FFmpeg: " + errOut);
+            }
+        }
+    }
+
+    private float[] runSpeakerEncoder(File modelFile, float[] pcm16k) throws Exception {
+        int numFrames = Math.max(1, (pcm16k.length - CLONE_WIN_LEN) / CLONE_HOP_LEN + 1);
+        float[] fbank = computeFbank80(pcm16k);
+        if (fbank.length != numFrames * CLONE_NUM_MELS) {
+            numFrames = fbank.length / CLONE_NUM_MELS;
+        }
+        if (numFrames < 5) {
+            throw new Exception("Độ dài phổ âm thanh không đủ khung hình cho Speaker Encoder.");
+        }
+
+        OrtSession.SessionOptions opts = new OrtSession.SessionOptions();
+        opts.setInterOpNumThreads(1);
+        opts.setIntraOpNumThreads(Math.min(Math.max(Runtime.getRuntime().availableProcessors() / 2, 1), 4));
+        opts.addConfigEntry("session.intra_op.allow_spinning", "0");
+
+        try (OrtSession spkSession = env.createSession(modelFile.getAbsolutePath(), opts);
+             OnnxTensor inputTensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(fbank), new long[]{1, numFrames, CLONE_NUM_MELS})) {
+
+            Map<String, OnnxTensor> feed = Collections.singletonMap("input", inputTensor);
+            try (OrtSession.Result res = spkSession.run(feed)) {
+                Object raw = res.get("output").get().getValue();
+                float[] emb;
+                if (raw instanceof float[][]) {
+                    emb = ((float[][]) raw)[0];
+                } else if (raw instanceof float[]) {
+                    emb = (float[]) raw;
+                } else {
+                    throw new Exception("Đầu ra speaker_encoder không hợp lệ: " + raw.getClass());
+                }
+                if (emb.length < 192) {
+                    throw new Exception("Speaker embedding chỉ có " + emb.length + " chiều (yêu cầu 192).");
+                }
+                float[] out = Arrays.copyOf(emb, 192);
+                for (float v : out) {
+                    if (Float.isNaN(v) || Float.isInfinite(v)) {
+                        throw new Exception("Speaker Encoder trả về giá trị NaN/Inf.");
+                    }
+                }
+                return out;
+            }
+        }
+    }
+
+    private int[][] runMossTokenizerEncode(File modelFile, float[] planarStereoWave, int numSamplesPerCh) throws Exception {
+        OrtSession.SessionOptions opts = new OrtSession.SessionOptions();
+        opts.setInterOpNumThreads(1);
+        opts.setIntraOpNumThreads(Math.min(Math.max(Runtime.getRuntime().availableProcessors() / 2, 1), 4));
+        opts.addConfigEntry("session.intra_op.allow_spinning", "0");
+
+        try (OrtSession mossSession = env.createSession(modelFile.getAbsolutePath(), opts);
+             OnnxTensor waveTensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(planarStereoWave), new long[]{1, 2, numSamplesPerCh});
+             OnnxTensor lenTensor = createIntTensorForSession(env, mossSession, "input_lengths", new long[]{(long) numSamplesPerCh}, new long[]{1})) {
+
+            Map<String, OnnxTensor> feed = new HashMap<>();
+            feed.put("waveform", waveTensor);
+            feed.put("input_lengths", lenTensor);
+
+            try (OrtSession.Result res = mossSession.run(feed)) {
+                Object codesRaw = res.get("audio_codes").get().getValue();
+                int reportedLen = Integer.MAX_VALUE;
+                if (res.get("audio_code_lengths").isPresent()) {
+                    Object lenRaw = res.get("audio_code_lengths").get().getValue();
+                    if (lenRaw instanceof int[]) {
+                        reportedLen = ((int[]) lenRaw)[0];
+                    } else if (lenRaw instanceof long[]) {
+                        reportedLen = (int) ((long[]) lenRaw)[0];
+                    }
+                }
+
+                int[][] extracted;
+                if (codesRaw instanceof int[][][]) {
+                    int[][][] arr = (int[][][]) codesRaw;
+                    int rawFrames = arr[0].length;
+                    int validFrames = Math.min(rawFrames, Math.min(reportedLen, 70));
+                    if (validFrames < 5) {
+                        throw new Exception("MOSS Tokenizer chỉ trích xuất được " + validFrames + " khung âm thanh.");
+                    }
+                    extracted = new int[validFrames][N_VQ];
+                    for (int f = 0; f < validFrames; f++) {
+                        for (int c = 0; c < N_VQ; c++) {
+                            int code = arr[0][f][c];
+                            if (code < 0) code = 0;
+                            if (code >= 1024) code = 1023;
+                            extracted[f][c] = code;
+                        }
+                    }
+                } else if (codesRaw instanceof long[][][]) {
+                    long[][][] arr = (long[][][]) codesRaw;
+                    int rawFrames = arr[0].length;
+                    int validFrames = Math.min(rawFrames, Math.min(reportedLen, 70));
+                    if (validFrames < 5) {
+                        throw new Exception("MOSS Tokenizer chỉ trích xuất được " + validFrames + " khung âm thanh.");
+                    }
+                    extracted = new int[validFrames][N_VQ];
+                    for (int f = 0; f < validFrames; f++) {
+                        for (int c = 0; c < N_VQ; c++) {
+                            int code = (int) arr[0][f][c];
+                            if (code < 0) code = 0;
+                            if (code >= 1024) code = 1023;
+                            extracted[f][c] = code;
+                        }
+                    }
+                } else {
+                    throw new Exception("Đầu ra audio_codes không hợp lệ: " + codesRaw.getClass());
+                }
+                return extracted;
+            }
+        }
+    }
+
+    private float[] computeFbank80(float[] samples16k) {
+        if (cachedMelFilterbank == null) {
+            cachedMelFilterbank = createMelFilterbank(CLONE_NUM_MELS, CLONE_N_FFT, CLONE_SPK_SR, 20.0, 8000.0);
+        }
+        float[] window = new float[CLONE_WIN_LEN];
+        for (int i = 0; i < CLONE_WIN_LEN; i++) {
+            window[i] = (float) (0.54 - 0.46 * Math.cos((2.0 * Math.PI * i) / (CLONE_WIN_LEN - 1)));
+        }
+
+        int numFrames = (samples16k.length - CLONE_WIN_LEN) / CLONE_HOP_LEN + 1;
+        if (numFrames <= 0) {
+            return new float[CLONE_NUM_MELS];
+        }
+
+        float[] fbank = new float[numFrames * CLONE_NUM_MELS];
+        float[] real = new float[CLONE_N_FFT];
+        float[] imag = new float[CLONE_N_FFT];
+        int numBins = CLONE_N_FFT / 2 + 1; // 257
+        float[] power = new float[numBins];
+
+        for (int f = 0; f < numFrames; f++) {
+            Arrays.fill(real, 0f);
+            Arrays.fill(imag, 0f);
+            int start = f * CLONE_HOP_LEN;
+            for (int i = 0; i < CLONE_WIN_LEN; i++) {
+                real[i] = samples16k[start + i] * window[i];
+            }
+            fft512(real, imag);
+            for (int k = 0; k < numBins; k++) {
+                power[k] = real[k] * real[k] + imag[k] * imag[k];
+            }
+            for (int m = 0; m < CLONE_NUM_MELS; m++) {
+                float energy = 0f;
+                float[] melRow = cachedMelFilterbank[m];
+                for (int k = 0; k < numBins; k++) {
+                    energy += melRow[k] * power[k];
+                }
+                fbank[f * CLONE_NUM_MELS + m] = (float) Math.log(Math.max(energy, 1e-5f));
+            }
+        }
+
+        // Cepstral Mean Normalization (CMN) per Mel bin across time
+        for (int m = 0; m < CLONE_NUM_MELS; m++) {
+            double mean = 0.0;
+            for (int f = 0; f < numFrames; f++) {
+                mean += fbank[f * CLONE_NUM_MELS + m];
+            }
+            float fMean = (float) (mean / numFrames);
+            for (int f = 0; f < numFrames; f++) {
+                fbank[f * CLONE_NUM_MELS + m] -= fMean;
+            }
+        }
+        return fbank;
+    }
+
+    private static float[][] createMelFilterbank(int numBands, int nFft, int sampleRate, double fMin, double fMax) {
+        int numBins = nFft / 2 + 1;
+        double minMel = 2595.0 * Math.log10(1.0 + fMin / 700.0);
+        double maxMel = 2595.0 * Math.log10(1.0 + fMax / 700.0);
+        int[] binPoints = new int[numBands + 2];
+        for (int i = 0; i <= numBands + 1; i++) {
+            double mel = minMel + ((double) i / (numBands + 1)) * (maxMel - minMel);
+            double hz = 700.0 * (Math.pow(10.0, mel / 2595.0) - 1.0);
+            binPoints[i] = (int) Math.floor(((nFft + 1) * hz) / sampleRate);
+        }
+
+        float[][] fb = new float[numBands][numBins];
+        for (int m = 0; m < numBands; m++) {
+            int start = Math.max(0, Math.min(numBins - 1, binPoints[m]));
+            int center = Math.max(0, Math.min(numBins - 1, binPoints[m + 1]));
+            int end = Math.max(0, Math.min(numBins, binPoints[m + 2]));
+            for (int k = start; k < center; k++) {
+                fb[m][k] = (float) (k - start) / Math.max(1, center - start);
+            }
+            for (int k = center; k < end; k++) {
+                fb[m][k] = (float) (end - k) / Math.max(1, end - center);
+            }
+        }
+        return fb;
+    }
+
+    private static void fft512(float[] real, float[] imag) {
+        final int N = 512;
+        int j = 0;
+        for (int i = 0; i < N - 1; i++) {
+            if (i < j) {
+                float tr = real[i]; real[i] = real[j]; real[j] = tr;
+                float ti = imag[i]; imag[i] = imag[j]; imag[j] = ti;
+            }
+            int k = N >> 1;
+            while (k <= j) {
+                j -= k;
+                k >>= 1;
+            }
+            j += k;
+        }
+        for (int len = 2; len <= N; len <<= 1) {
+            int half = len >> 1;
+            double angle = (-2.0 * Math.PI) / len;
+            float wStepR = (float) Math.cos(angle);
+            float wStepI = (float) Math.sin(angle);
+            for (int i = 0; i < N; i += len) {
+                float wR = 1f;
+                float wI = 0f;
+                for (int k = 0; k < half; k++) {
+                    float uR = real[i + k];
+                    float uI = imag[i + k];
+                    float vR = real[i + k + half] * wR - imag[i + k + half] * wI;
+                    float vI = real[i + k + half] * wI + imag[i + k + half] * wR;
+                    real[i + k] = uR + vR;
+                    imag[i + k] = uI + vI;
+                    real[i + k + half] = uR - vR;
+                    imag[i + k + half] = uI - vI;
+                    float nextWR = wR * wStepR - wI * wStepI;
+                    float nextWI = wR * wStepI + wI * wStepR;
+                    wR = nextWR;
+                    wI = nextWI;
+                }
+            }
+        }
+    }
+
+    private DecodedWav parseWavFile(File wavFile) throws Exception {
+        byte[] bytes = java.nio.file.Files.readAllBytes(wavFile.toPath());
+        if (bytes.length < 44) {
+            throw new Exception("Tệp WAV giải mã không hợp lệ (< 44 bytes).");
+        }
+        ByteBuffer bb = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN);
+        int channels = 1;
+        int sampleRate = 16000;
+        int bitsPerSample = 16;
+        int dataOffset = 44;
+        int dataSize = bytes.length - 44;
+
+        int offset = 12;
+        while (offset + 8 <= bytes.length) {
+            String chunkId = new String(bytes, offset, 4, StandardCharsets.US_ASCII);
+            int chunkSize = bb.getInt(offset + 4);
+            if ("fmt ".equals(chunkId) && offset + 24 <= bytes.length) {
+                channels = bb.getShort(offset + 10) & 0xFFFF;
+                sampleRate = bb.getInt(offset + 12);
+                bitsPerSample = bb.getShort(offset + 22) & 0xFFFF;
+            } else if ("data".equals(chunkId)) {
+                dataOffset = offset + 8;
+                dataSize = Math.min(chunkSize, bytes.length - dataOffset);
+                break;
+            }
+            if (chunkSize < 0) break;
+            offset += 8 + chunkSize + (chunkSize % 2);
+        }
+
+        int bytesPerSample = Math.max(1, bitsPerSample / 8);
+        int numSamples = Math.max(0, dataSize / bytesPerSample);
+        float[] samples = new float[numSamples];
+        for (int i = 0; i < numSamples; i++) {
+            int pos = dataOffset + i * bytesPerSample;
+            if (pos + bytesPerSample > bytes.length) break;
+            if (bitsPerSample == 16) {
+                samples[i] = bb.getShort(pos) / 32768.0f;
+            } else if (bitsPerSample == 32) {
+                samples[i] = bb.getFloat(pos);
+            }
+        }
+        return new DecodedWav(samples, channels, sampleRate);
+    }
+
+    private float[] toMono(float[] interleaved, int channels) {
+        if (channels <= 1) return interleaved;
+        int frames = interleaved.length / channels;
+        float[] mono = new float[frames];
+        for (int i = 0; i < frames; i++) {
+            float sum = 0f;
+            int base = i * channels;
+            for (int c = 0; c < channels; c++) {
+                sum += interleaved[base + c];
+            }
+            mono[i] = sum / channels;
+        }
+        return mono;
     }
 
     private void loadNpzWeights(File npzFile) throws Exception {

@@ -369,15 +369,18 @@ export const CapCutHomeView: React.FC<CapCutHomeViewProps> = ({
   };
 
   return (
-    <div className="min-h-screen bg-[#0b0b0d] text-slate-100 flex justify-center font-sans antialiased">
+    <div className="min-h-[100dvh] bg-[#0b0b0d] text-slate-100 flex justify-center font-sans antialiased">
       {/* Smartphone / PC Responsive Container Viewport */}
-      <div className="w-full max-w-md md:max-w-2xl lg:max-w-3xl bg-[#121215] min-h-screen flex flex-col relative shadow-2xl border-x border-slate-900/80 transition-all duration-300">
+      <div className="w-full max-w-md md:max-w-2xl lg:max-w-3xl bg-[#121215] min-h-[100dvh] flex flex-col relative shadow-2xl border-x border-slate-900/80 transition-all duration-300">
         
         {/* Top Header - BachTranslate Logo + License Badge */}
-        <header className="px-4 py-3 bg-metallic-panel flex items-center justify-between sticky top-0 z-30 border-b border-slate-700/60 shadow-md">
+        <header
+          className="px-4 py-3 bg-metallic-panel flex items-center justify-between gap-2 sticky top-0 z-30 border-b border-slate-700/60 shadow-md"
+          style={{ paddingTop: 'calc(0.75rem + var(--app-safe-top))' }}
+        >
           {/* Logo Left */}
-          <div className="flex items-center cursor-pointer" onClick={() => setActiveTab('home')}>
-            <h1 className="text-xl font-black tracking-wider text-metallic-silver font-sans">
+          <div className="flex items-center cursor-pointer min-w-0" onClick={() => setActiveTab('home')}>
+            <h1 className="text-lg sm:text-xl font-black tracking-wider text-metallic-silver font-sans truncate">
               BachTranlastor
             </h1>
           </div>
@@ -386,17 +389,17 @@ export const CapCutHomeView: React.FC<CapCutHomeViewProps> = ({
           {onOpenLicense && isWhitelistedAdminMember(licenseState) && (
             <button
               onClick={onOpenLicense}
-              className="flex items-center space-x-1.5 px-3 py-1.5 rounded-xl text-xs font-black transition-all shadow-md active:scale-95 cursor-pointer bg-gradient-to-r from-amber-400 via-yellow-300 to-amber-500 text-slate-950 shadow-amber-500/20 hover:brightness-110"
+              className="flex items-center space-x-1.5 px-2.5 sm:px-3 py-1.5 rounded-xl text-[11px] sm:text-xs font-black transition-all shadow-md active:scale-95 cursor-pointer bg-gradient-to-r from-amber-400 via-yellow-300 to-amber-500 text-slate-950 shadow-amber-500/20 hover:brightness-110 shrink-0 whitespace-nowrap"
               title="Trung Tâm Quản Trị Super Admin & Buff VIP"
             >
-              <Crown className="w-3.5 h-3.5 fill-slate-950" />
+              <Crown className="w-3.5 h-3.5 fill-slate-950 shrink-0" />
               <span>👑 ADMIN BUFF VIP</span>
             </button>
           )}
         </header>
 
         {/* Main Content Area */}
-        <main className="flex-1 px-4 py-4 flex flex-col gap-4 overflow-y-auto pb-24">
+        <main className="flex-1 px-4 py-4 flex flex-col gap-4 overflow-y-auto pb-[calc(6.25rem+var(--app-safe-bottom))]">
           
           {/* VIEW SWITCHER: CONFIG VIEW */}
           {activeTab === 'config' ? (
@@ -625,7 +628,10 @@ export const CapCutHomeView: React.FC<CapCutHomeViewProps> = ({
         </main>
 
         {/* Smartphone / PC Fixed Bottom Dock Navigation */}
-        <nav className="fixed bottom-0 left-1/2 -translate-x-1/2 w-full max-w-md md:max-w-2xl lg:max-w-3xl bg-metallic-panel/95 backdrop-blur-md border-t border-slate-700/80 px-6 py-2 flex items-center justify-between z-40 shadow-2xl transition-all duration-300">
+        <nav
+          className="fixed bottom-0 left-1/2 -translate-x-1/2 w-full max-w-md md:max-w-2xl lg:max-w-3xl bg-metallic-panel/95 backdrop-blur-md border-t border-slate-700/80 px-6 py-2 flex items-center justify-between z-40 shadow-2xl transition-all duration-300"
+          style={{ paddingBottom: 'calc(0.5rem + var(--app-safe-bottom))' }}
+        >
           {/* Home Tab */}
           <button
             onClick={() => setActiveTab('home')}
@@ -665,7 +671,7 @@ export const CapCutHomeView: React.FC<CapCutHomeViewProps> = ({
         {/* Import Video Modal */}
         {showImportModal && (
           <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4 animate-fade-in">
-            <div className="bg-metallic-panel border-t sm:border border-slate-700/80 rounded-t-3xl sm:rounded-2xl w-full max-w-md p-5 flex flex-col gap-4 shadow-2xl">
+            <div className="bg-metallic-panel border-t sm:border border-slate-700/80 rounded-t-3xl sm:rounded-2xl w-full max-w-md p-5 pb-[calc(1.25rem+var(--app-safe-bottom))] sm:pb-5 flex flex-col gap-4 shadow-2xl">
               
               {/* Modal Title & Close */}
               <div className="flex items-center justify-between border-b border-slate-700/60 pb-2.5">
@@ -1043,7 +1049,7 @@ export const CapCutHomeView: React.FC<CapCutHomeViewProps> = ({
         {/* TEXT TO SPEECH STUDIO MODAL */}
         {showTtsModal && (
           <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4 animate-fade-in">
-            <div className="bg-[#18181d] border-t sm:border border-zinc-800 rounded-t-3xl sm:rounded-3xl w-full max-w-lg p-5 flex flex-col gap-4 shadow-2xl max-h-[90vh] overflow-y-auto">
+            <div className="bg-[#18181d] border-t sm:border border-zinc-800 rounded-t-3xl sm:rounded-3xl w-full max-w-lg p-5 pb-[calc(1.25rem+var(--app-safe-bottom))] sm:pb-5 flex flex-col gap-4 shadow-2xl max-h-[90dvh] overflow-y-auto">
               
               {/* Header */}
               <div className="flex items-center justify-between border-b border-zinc-800 pb-3">
@@ -1303,7 +1309,7 @@ export const CapCutHomeView: React.FC<CapCutHomeViewProps> = ({
         {/* COMMUNITY / FACEBOOK GROUP MODAL */}
         {showCommunityModal && (
           <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4 animate-fade-in">
-            <div className="bg-[#18181d] border-t sm:border border-zinc-800 rounded-t-3xl sm:rounded-3xl w-full max-w-md p-5 flex flex-col gap-4 shadow-2xl">
+            <div className="bg-[#18181d] border-t sm:border border-zinc-800 rounded-t-3xl sm:rounded-3xl w-full max-w-md p-5 pb-[calc(1.25rem+var(--app-safe-bottom))] sm:pb-5 flex flex-col gap-4 shadow-2xl">
               
               {/* Header */}
               <div className="flex items-center justify-between border-b border-zinc-800 pb-3">

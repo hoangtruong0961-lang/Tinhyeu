@@ -2,6 +2,7 @@ import { registerPlugin } from '@capacitor/core';
 
 export interface VieNeuStatus {
   isReady: boolean;
+  isCloningReady?: boolean;
   isDownloading: boolean;
   modelsPath?: string;
   totalSizeMB?: number;
@@ -32,9 +33,45 @@ export interface VieNeuSynthesizeResult {
   duration: number;
 }
 
+export interface VieNeuCloneVoiceOptions {
+  audioBase64: string;
+  voiceName: string;
+  gender?: 'male' | 'female';
+  accent?: 'bac' | 'trung' | 'nam';
+  fileName?: string;
+  mimeType?: string;
+}
+
+export interface VieNeuCloneVoiceResult {
+  success: boolean;
+  voice: {
+    id: string;
+    name: string;
+    gender: 'male' | 'female';
+    accent: 'bac' | 'trung' | 'nam';
+    style: string;
+    description: string;
+    speaker_emb: number[];
+    codes: number[][];
+    numFrames?: number;
+    createdAt?: string;
+  };
+}
+
 export interface VieNeuPluginInterface {
   checkStatus(): Promise<VieNeuStatus>;
-  downloadModels(options?: { includeCloning?: boolean }): Promise<{ success: boolean; modelsPath: string; isReady: boolean }>;
+  downloadModels(options?: { includeCloning?: boolean }): Promise<{
+    success: boolean;
+    modelsPath: string;
+    isReady: boolean;
+    isCloningReady?: boolean;
+  }>;
+  downloadCloningModels(): Promise<{
+    success: boolean;
+    isCloningReady: boolean;
+    isReady: boolean;
+  }>;
+  cloneVoice(options: VieNeuCloneVoiceOptions): Promise<VieNeuCloneVoiceResult>;
   cancelDownload(): Promise<{ success: boolean }>;
   deleteModels(): Promise<{ success: boolean; message: string }>;
   listVoices(): Promise<{ success: boolean; voices: string[] }>;
@@ -55,6 +92,7 @@ export const VieNeuNative = registerPlugin<VieNeuPluginInterface>('VieNeuNative'
     async checkStatus() {
       return {
         isReady: false,
+        isCloningReady: false,
         isDownloading: false,
         platform: 'web',
         totalSizeMB: 0,
@@ -62,6 +100,12 @@ export const VieNeuNative = registerPlugin<VieNeuPluginInterface>('VieNeuNative'
     },
     async downloadModels() {
       throw new Error('Mô hình VieNeu-TTS v3 Turbo offline chỉ hỗ trợ trên ứng dụng Android (Native ONNX Runtime).');
+    },
+    async downloadCloningModels() {
+      throw new Error('Gói AI Clone Giọng chỉ hỗ trợ trên ứng dụng Android (Native ONNX Runtime).');
+    },
+    async cloneVoice() {
+      throw new Error('Tính năng nhân bản giọng thật ONNX chỉ hoạt động trên ứng dụng Android APK.');
     },
     async cancelDownload() {
       return { success: true };
@@ -85,7 +129,7 @@ export const VieNeuNative = registerPlugin<VieNeuPluginInterface>('VieNeuNative'
       return { success: true };
     },
     async synthesize() {
-      throw new Error('Động cơ VieNeu-TTS v3 Turbo Offline chạy trực tiếp trên Android qua ONNX Runtime. Bản Web xem trước tự động chuyển sang CapCut/Edge TTS server fallback.');
+      throw new Error('Động cơ VieNeu-TTS v3 Turbo Offline chạy trực tiếp trên Android qua ONNX Runtime.');
     },
     async cancelSynthesis() {
       return { success: true };

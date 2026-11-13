@@ -94,8 +94,10 @@ export const LockScreenGate: React.FC<LockScreenGateProps> = ({
   return (
     <div
       id="lock-screen-gate"
-      className="fixed inset-0 z-[9999] flex flex-col items-center justify-between bg-[#0e0e11] text-white select-none overflow-y-auto px-4 py-8 min-h-screen"
+      className="fixed inset-0 z-[9999] flex flex-col items-center justify-between bg-[#0e0e11] text-white select-none overflow-y-auto px-4 min-h-[100dvh]"
       style={{
+        paddingTop: 'calc(2rem + var(--app-safe-top))',
+        paddingBottom: 'calc(2rem + var(--app-safe-bottom))',
         backgroundImage: 'radial-gradient(circle at 50% 28%, rgba(245, 158, 11, 0.18) 0%, rgba(245, 158, 11, 0.04) 35%, rgba(14, 14, 17, 1) 65%)'
       }}
     >

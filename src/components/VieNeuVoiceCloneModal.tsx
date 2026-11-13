@@ -1,7 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import {
   Mic,
-  MicOff,
   Upload,
   Play,
   Square,
@@ -17,12 +16,11 @@ import {
   ChevronUp,
   Copy,
   Check,
-  AlertTriangle
+  AlertTriangle,
+  Download
 } from 'lucide-react';
 import { Capacitor } from '@capacitor/core';
-import { VieNeuNative } from '../plugins/vieneuPlugin';
-import { resolveApiUrl } from '../utils/apiUrl';
-import { cloneVoiceLocally } from '../utils/localVoiceCloner';
+import { VieNeuNative, VieNeuStatus, VieNeuProgressEvent } from '../plugins/vieneuPlugin';
 import { saveLocalCustomVoice } from '../data/vieneuVoices';
 
 export interface CustomVoiceItem {
@@ -94,10 +92,57 @@ export const VieNeuVoiceCloneModal: React.FC<VieNeuVoiceCloneModalProps> = ({
   const [copiedTechDetails, setCopiedTechDetails] = useState<boolean>(false);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
 
+  // Native ONNX cloning model readiness & download state
+  const [nativeStatus, setNativeStatus] = useState<VieNeuStatus | null>(null);
+  const [checkingModels, setCheckingModels] = useState<boolean>(false);
+  const [isDownloadingCloning, setIsDownloadingCloning] = useState<boolean>(false);
+  const [downloadProgress, setDownloadProgress] = useState<number>(0);
+  const [downloadMessage, setDownloadMessage] = useState<string>('');
+
+  const refreshNativeStatus = async () => {
+    if (!Capacitor.isNativePlatform()) return;
+    try {
+      setCheckingModels(true);
+      const st = await VieNeuNative.checkStatus();
+      setNativeStatus(st);
+    } catch (e) {
+      console.warn('[VieNeuVoiceCloneModal] checkStatus error:', e);
+    } finally {
+      setCheckingModels(false);
+    }
+  };
+
   useEffect(() => {
     if (!isOpen) {
       handleReset();
+      return;
     }
+
+    if (!Capacitor.isNativePlatform()) return;
+
+    refreshNativeStatus();
+    let removeSub: (() => Promise<void>) | null = null;
+    VieNeuNative.addListener('vieneu_download_progress', (event: VieNeuProgressEvent) => {
+      setDownloadProgress(event.percent);
+      setDownloadMessage(event.message);
+      if (event.status === 'completed') {
+        setIsDownloadingCloning(false);
+        refreshNativeStatus();
+      } else if (event.status === 'error') {
+        setIsDownloadingCloning(false);
+        setError(event.message || 'Lỗi tải gói AI Clone Giọng.');
+      } else if (event.status === 'cancelled') {
+        setIsDownloadingCloning(false);
+      }
+    })
+      .then((sub) => {
+        removeSub = sub.remove;
+      })
+      .catch(() => {});
+
+    return () => {
+      if (removeSub) removeSub();
+    };
   }, [isOpen]);
 
   const handleReset = () => {
@@ -138,7 +183,8 @@ export const VieNeuVoiceCloneModal: React.FC<VieNeuVoiceCloneModalProps> = ({
       };
 
       mediaRecorder.onstop = () => {
-        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
+        const actualMime = mediaRecorder.mimeType || 'audio/webm';
+        const audioBlob = new Blob(audioChunksRef.current, { type: actualMime });
         setRecordedBlob(audioBlob);
         const url = URL.createObjectURL(audioBlob);
         setRecordedAudioUrl(url);
@@ -207,10 +253,64 @@ export const VieNeuVoiceCloneModal: React.FC<VieNeuVoiceCloneModalProps> = ({
     setIsPlayingPreview(true);
   };
 
+  const handleDownloadCloningPack = async () => {
+    try {
+      setIsDownloadingCloning(true);
+      setError(null);
+      setDetailedError(null);
+      setDownloadProgress(2);
+      setDownloadMessage('Đang kết nối kho mô hình HuggingFace...');
+
+      if (nativeStatus?.isReady) {
+        const res = await VieNeuNative.downloadCloningModels();
+        if (res.isCloningReady) {
+          setDownloadProgress(100);
+          await refreshNativeStatus();
+        }
+      } else {
+        const res = await VieNeuNative.downloadModels({ includeCloning: true });
+        if (res.isReady) {
+          setDownloadProgress(100);
+          await refreshNativeStatus();
+        }
+      }
+    } catch (err: any) {
+      setError(err?.message || 'Không thể tải gói mô hình AI Clone Giọng.');
+      setIsDownloadingCloning(false);
+    }
+  };
+
+  const blobToBase64 = (blob: Blob): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        const dataUrl = reader.result as string;
+        if (!dataUrl) {
+          reject(new Error('Không đọc được dữ liệu âm thanh đầu vào.'));
+          return;
+        }
+        const b64 = dataUrl.includes(',') ? dataUrl.split(',')[1] : dataUrl;
+        resolve(b64);
+      };
+      reader.onerror = () => reject(new Error('Lỗi đọc dữ liệu FileReader từ âm thanh mẫu.'));
+      reader.readAsDataURL(blob);
+    });
+  };
+
   const handleStartClone = async () => {
     const activeBlob = tab === 'record' ? recordedBlob : uploadedFile;
     if (!activeBlob) {
       setError('Vui lòng ghi âm hoặc tải lên tệp âm thanh mẫu (tối thiểu 3 giây).');
+      return;
+    }
+
+    if (!Capacitor.isNativePlatform()) {
+      setDetailedError({
+        title: 'Chỉ Hỗ Trợ Nhân Bản Giọng Thật Trên Android APK',
+        message: 'Tính năng trích xuất Speaker Embedding 192 chiều & MOSS Audio Tokenizer ONNX chạy trực tiếp trên thiết bị Android.',
+        cause: 'Bạn đang mở trong trình duyệt web xem trước không có Native ONNX Engine.',
+        suggestion: 'Vui lòng sử dụng trực tiếp trên bản Android APK để nhân bản giọng thật.',
+      });
       return;
     }
 
@@ -221,74 +321,70 @@ export const VieNeuVoiceCloneModal: React.FC<VieNeuVoiceCloneModalProps> = ({
       setError(null);
       setDetailedError(null);
       setSuccessMsg(null);
-      setProcessStep('1/3: Đang phân tích sóng âm thanh offline trên thiết bị...');
 
-      // 1. Perform 100% Client-Side Local Voice Profile Extraction
-      const localResult = await cloneVoiceLocally(activeBlob, {
+      setProcessStep('1/3: Đang kiểm tra gói AI Clone ONNX trên thiết bị...');
+      const currentStatus = await VieNeuNative.checkStatus();
+      setNativeStatus(currentStatus);
+
+      if (!currentStatus.isCloningReady) {
+        throw new Error(
+          'Chưa cài đặt gói AI Clone Giọng thật (~64 MB: speaker_encoder.onnx + moss_audio_tokenizer_encode). Vui lòng bấm nút "Tải gói AI Clone Giọng" phía trên trước.'
+        );
+      }
+
+      setProcessStep('2/3: Đang giải mã, lọc khoảng lặng & chạy mô hình ONNX (Speaker Encoder + MOSS)...');
+      const audioBase64 = await blobToBase64(activeBlob);
+      const fileName = activeBlob instanceof File ? activeBlob.name : 'recorded_sample.webm';
+      const mimeType = activeBlob.type || 'audio/webm';
+
+      const cloneRes = await VieNeuNative.cloneVoice({
+        audioBase64,
         voiceName: cleanName,
         gender,
         accent,
+        fileName,
+        mimeType,
       });
 
-      setProcessStep('2/3: Đang trích xuất đặc trưng âm sắc 192 chiều & mã hóa 16 RVQ codebooks...');
-
-      const created: CustomVoiceItem = {
-        id: localResult.id,
-        name: localResult.name,
-        gender: localResult.gender,
-        accent: localResult.accent,
-        style: localResult.style,
-        description: localResult.description,
-        speaker_emb: localResult.speaker_emb,
-        codes: localResult.codes,
-        createdAt: localResult.createdAt,
-      };
-
-      // 2. Save locally in localStorage for immediate offline discovery
-      saveLocalCustomVoice(created as any);
-
-      // 3. If running on Android Native APK, sync into native VieNeuEngine
-      if (Capacitor.isNativePlatform() && created.speaker_emb && created.codes) {
-        try {
-          await VieNeuNative.saveCustomVoice({
-            name: created.name,
-            speakerEmb: created.speaker_emb,
-            codes: created.codes,
-          });
-          console.log('[VieNeuVoiceCloneModal] Saved custom voice to Android Native engine successfully');
-        } catch (nativeSaveErr) {
-          console.warn('[VieNeuVoiceCloneModal] Native save custom voice notice:', nativeSaveErr);
-        }
+      if (!cloneRes?.success || !cloneRes.voice) {
+        throw new Error('Không nhận được kết quả vector giọng nói từ Native ONNX Engine.');
       }
 
-      setProcessStep('3/3: Đang hoàn tất lưu giọng nhân bản...');
+      setProcessStep('3/3: Đang lưu giọng nhân bản chuẩn vào bộ nhớ máy...');
+      const created: CustomVoiceItem = {
+        id: cloneRes.voice.id || cleanName,
+        name: cloneRes.voice.name || cleanName,
+        gender: (cloneRes.voice.gender === 'female' ? 'female' : 'male'),
+        accent: (cloneRes.voice.accent === 'nam' || cloneRes.voice.accent === 'trung') ? cloneRes.voice.accent : 'bac',
+        style: cloneRes.voice.style || 'Nhân bản AI ONNX (Offline)',
+        description: cloneRes.voice.description || `Giọng nhân bản AI thật (${cloneRes.voice.numFrames || cloneRes.voice.codes?.length || 0} khung RVQ)`,
+        speaker_emb: cloneRes.voice.speaker_emb,
+        codes: cloneRes.voice.codes,
+        createdAt: cloneRes.voice.createdAt || new Date().toISOString(),
+      };
 
-      // 4. Background sync to server if server endpoint is available (completely non-blocking)
-      try {
-        const formData = new FormData();
-        formData.append('audio', activeBlob, 'voice_sample.wav');
-        formData.append('voiceName', cleanName);
-        formData.append('gender', gender);
-        formData.append('accent', accent);
-        const serverUrl = resolveApiUrl('/api/vieneu/clone-voice');
-        fetch(serverUrl, { method: 'POST', body: formData }).catch(() => {});
-      } catch (_) {}
-
-      setSuccessMsg(`Nhân bản thành công giọng "${created.name}" (Lưu offline trực tiếp)!`);
+      saveLocalCustomVoice(created as any);
+      const framesCount = cloneRes.voice.numFrames || created.codes?.length || 0;
+      setSuccessMsg(`Nhân bản giọng thật thành công "${created.name}" (${framesCount} khung tham chiếu ONNX)!`);
       onVoiceCreated(created);
 
       setTimeout(() => {
         onClose();
-      }, 1000);
-
+      }, 900);
     } catch (err: any) {
-      console.error('Local clone voice failure:', err);
+      console.error('Native ONNX clone voice failure:', err);
+      const rawMsg = err?.message || String(err);
+      const isMissingModel = rawMsg.includes('64 MB') || rawMsg.includes('CLONING_MODELS_MISSING') || rawMsg.includes('speaker_encoder');
       setDetailedError({
-        title: 'Lỗi Xử Lý Âm Thanh Local',
-        message: err?.message || 'Không thể trích xuất đặc trưng giọng nói từ mẫu âm thanh.',
-        cause: 'Tệp âm thanh tải lên hoặc bản ghi âm có định dạng không đọc được hoặc quá ngắn (dưới 1 giây).',
-        suggestion: '1. Vui lòng ghi âm lại hoặc chọn tệp âm thanh WAV, MP3, WebM có tiếng nói rõ ràng.\n2. Đảm bảo âm thanh có độ dài từ 2 đến 10 giây.',
-        technicalDetails: `Chi tiết lỗi: ${err?.stack || err?.message || String(err)}`,
+        title: isMissingModel ? 'Thiếu Gói Mô Hình AI Clone Giọng (~64 MB)' : 'Lỗi Nhân Bản Giọng AI (ONNX)',
+        message: rawMsg,
+        cause: isMissingModel
+          ? 'Thiết bị chưa có 2 mô hình ONNX thật để trích xuất đặc trưng giọng (speaker_encoder.onnx và moss_audio_tokenizer_encode.onnx).'
+          : 'Mẫu âm thanh quá ngắn, toàn tiếng im lặng, quá nhỏ hoặc định dạng tệp bị hỏng.',
+        suggestion: isMissingModel
+          ? 'Bấm nút "Tải gói AI Clone Giọng (~64 MB)" ở banner màu vàng ngay phía trên để tải về máy.'
+          : '1. Ghi âm hoặc chọn đoạn nói rõ ràng dài từ 3 đến 8 giây, không lẫn nhạc nền.\n2. Đặt micro cách miệng 15–20cm để giọng rõ ràng, không bị rè.',
+        technicalDetails: `Platform: Android Native ONNX\nDetails: ${err?.stack || rawMsg}`,
       });
     } finally {
       setIsProcessing(false);
@@ -365,6 +461,63 @@ export const VieNeuVoiceCloneModal: React.FC<VieNeuVoiceCloneModalProps> = ({
 
         {/* Modal Body */}
         <div className="p-5 space-y-4 max-h-[70vh] overflow-y-auto">
+          {Capacitor.isNativePlatform() && tab !== 'list' && (
+            checkingModels ? (
+              <div className="p-3 rounded-xl bg-white/5 border border-white/10 flex items-center gap-2 text-xs text-zinc-300">
+                <RefreshCw className="w-3.5 h-3.5 animate-spin text-amber-400" />
+                <span>Đang kiểm tra mô hình AI Clone Giọng trên máy...</span>
+              </div>
+            ) : nativeStatus?.isCloningReady ? (
+              <div className="px-3 py-2 rounded-xl bg-emerald-500/10 border border-emerald-500/25 flex items-center gap-2 text-[11px] text-emerald-300">
+                <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                <span>Đã sẵn sàng động cơ AI Clone Giọng thật (Speaker Encoder + MOSS ONNX Offline)</span>
+              </div>
+            ) : (
+              <div className="p-3.5 rounded-xl bg-amber-500/10 border border-amber-500/30 space-y-2.5">
+                <div className="flex items-start justify-between gap-2">
+                  <div className="space-y-0.5">
+                    <p className="text-xs font-bold text-amber-300">
+                      {nativeStatus?.isReady
+                        ? 'Cần tải gói AI Clone Giọng thật (~64 MB)'
+                        : 'Cần tải bộ mô hình VieNeu + Clone Giọng (~211 MB)'}
+                    </p>
+                    <p className="text-[11px] text-zinc-300 leading-relaxed">
+                      Gói này chứa 2 mạng nơ-ron thật (Speaker Encoder &amp; MOSS Tokenizer) giúp nhân bản đúng chất giọng của bạn.
+                    </p>
+                  </div>
+                </div>
+
+                {isDownloadingCloning ? (
+                  <div className="space-y-1.5">
+                    <div className="flex items-center justify-between text-[11px]">
+                      <span className="text-zinc-200 flex items-center gap-1.5">
+                        <RefreshCw className="w-3 h-3 animate-spin text-amber-400" />
+                        {downloadMessage || 'Đang tải xuống...'}
+                      </span>
+                      <span className="font-mono text-amber-400 font-bold">{downloadProgress}%</span>
+                    </div>
+                    <div className="w-full h-2 bg-zinc-800 rounded-full overflow-hidden">
+                      <div
+                        className="h-full bg-amber-500 transition-all duration-300"
+                        style={{ width: `${downloadProgress}%` }}
+                      />
+                    </div>
+                  </div>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={handleDownloadCloningPack}
+                    className="w-full flex items-center justify-center gap-2 px-3.5 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-black font-bold text-xs transition-all cursor-pointer"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    {nativeStatus?.isReady
+                      ? 'Tải ngay gói AI Clone Giọng (~64 MB)'
+                      : 'Tải trọn bộ VieNeu + Clone Giọng (~211 MB)'}
+                  </button>
+                )}
+              </div>
+            )
+          )}
           {tab === 'record' && (
             <div className="space-y-4">
               <div className="p-4 rounded-xl border border-white/10 bg-black/40 flex flex-col items-center justify-center text-center space-y-3">
@@ -675,7 +828,13 @@ export const VieNeuVoiceCloneModal: React.FC<VieNeuVoiceCloneModalProps> = ({
             <button
               type="button"
               onClick={handleStartClone}
-              disabled={isProcessing || (tab === 'record' && !recordedBlob) || (tab === 'upload' && !uploadedFile)}
+              disabled={
+                isProcessing ||
+                isDownloadingCloning ||
+                (tab === 'record' && !recordedBlob) ||
+                (tab === 'upload' && !uploadedFile) ||
+                (Capacitor.isNativePlatform() && nativeStatus !== null && !nativeStatus.isCloningReady)
+              }
               className="flex items-center gap-2 px-5 py-2.5 rounded-xl bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-400 hover:to-amber-500 text-black font-bold text-xs shadow-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
             >
               {isProcessing ? (

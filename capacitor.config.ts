@@ -11,7 +11,11 @@ const config: CapacitorConfig = {
   plugins: {
     Device: {},
     App: {},
-    Haptics: {}
+    Haptics: {},
+    SystemBars: {
+      insetsHandling: 'css',
+      style: 'DARK'
+    }
   }
 };
 

@@ -750,7 +750,22 @@ async function stretchAudioWithAtempo(
 
 async function startServer() {
   const app = express();
-  const PORT = Number(process.env.PORT) || 3000;
+  const argPortIdx = process.argv.indexOf('--port');
+  const cliPort =
+    argPortIdx !== -1 && process.argv[argPortIdx + 1]
+      ? Number(process.argv[argPortIdx + 1])
+      : Number((process.argv.find((a) => a.startsWith('--port=')) || '').split('=')[1]);
+  const envPort = Number(process.env.PORT);
+  const nginxConflict =
+    process.env.NODE_ENV !== 'production' &&
+    Boolean(process.env.NGINX_PORT) &&
+    envPort === Number(process.env.NGINX_PORT);
+  const PORT =
+    Number.isFinite(cliPort) && cliPort > 0
+      ? cliPort
+      : nginxConflict
+        ? Number(process.env.DEFAULT_APP_PORT) || 3000
+        : envPort || Number(process.env.DEFAULT_APP_PORT) || 3000;
 
   // Trust first proxy (Cloud Run / Nginx) for accurate req.ip resolution
   app.set('trust proxy', 1);

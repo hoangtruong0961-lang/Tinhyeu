@@ -1,6 +1,7 @@
 package com.bachduong.remixvideo;
 
 import android.content.Context;
+import android.util.Base64;
 import android.util.Log;
 
 import com.getcapacitor.JSArray;
@@ -24,7 +25,11 @@ import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.text.SimpleDateFormat;
+import java.util.Date;
 import java.util.List;
+import java.util.Locale;
+import java.util.TimeZone;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -77,11 +82,27 @@ public class VieNeuPlugin extends Plugin {
         return true;
     }
 
+    private boolean verifyCloningFiles(File dir) {
+        String[] required = new String[] {
+            "speaker_encoder.onnx",
+            "moss_audio_tokenizer_encode.onnx",
+            "moss_audio_tokenizer_encode.data"
+        };
+        for (String req : required) {
+            File f = new File(dir, req);
+            if (!f.exists() || f.length() == 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     @PluginMethod
     public void checkStatus(PluginCall call) {
         try {
             File dir = getModelsDir();
             boolean ready = verifyModelFiles(dir);
+            boolean cloningReady = verifyCloningFiles(dir);
 
             long totalBytes = 0;
             File[] files = dir.listFiles();
@@ -95,6 +116,7 @@ public class VieNeuPlugin extends Plugin {
 
             JSObject ret = new JSObject();
             ret.put("isReady", ready);
+            ret.put("isCloningReady", cloningReady);
             ret.put("isDownloading", isDownloading.get());
             ret.put("modelsPath", dir.getAbsolutePath());
             ret.put("totalSizeMB", Math.round((totalBytes / (1024.0 * 1024.0)) * 10.0) / 10.0);
@@ -113,36 +135,41 @@ public class VieNeuPlugin extends Plugin {
             return;
         }
 
-        boolean includeCloning = Boolean.TRUE.equals(call.getBoolean("includeCloning", false));
+        boolean includeCloning = Boolean.TRUE.equals(call.getBoolean("includeCloning", true));
         isDownloading.set(true);
         cancelRequested.set(false);
 
         executor.execute(() -> {
             File modelsDir = getModelsDir();
             File tempZip = new File(getContext().getCacheDir(), "vieneu_download.zip");
+            File cloneZip = new File(getContext().getCacheDir(), "cloning_download.zip");
 
             try {
-                Log.d(TAG, "Starting download of VieNeu Turbo INT8 from HuggingFace...");
-                emitProgress("downloading", 0, "Đang kết nối máy chủ HuggingFace...");
+                boolean coreReady = verifyModelFiles(modelsDir);
+                if (!coreReady) {
+                    Log.d(TAG, "Starting download of VieNeu Turbo INT8 from HuggingFace...");
+                    emitProgress("downloading", 0, "Đang kết nối máy chủ HuggingFace...");
 
-                boolean ok = downloadFileWithProgress(TURBO_INT8_URL, tempZip, 0, includeCloning ? 70 : 90);
-                if (!ok || cancelRequested.get()) {
-                    throw new Exception(cancelRequested.get() ? "Download canceled by user" : "Failed to download core model");
+                    boolean ok = downloadFileWithProgress(TURBO_INT8_URL, tempZip, 0, includeCloning ? 65 : 90);
+                    if (!ok || cancelRequested.get()) {
+                        throw new Exception(cancelRequested.get() ? "Download canceled by user" : "Failed to download core model");
+                    }
+
+                    emitProgress("extracting", includeCloning ? 65 : 90, "Đang giải nén mô hình vào máy...");
+                    unzipAndFlatten(tempZip, modelsDir);
+                    if (tempZip.exists()) tempZip.delete();
                 }
 
-                emitProgress("extracting", includeCloning ? 70 : 90, "Đang giải nén mô hình vào máy...");
-                unzipAndFlatten(tempZip, modelsDir);
-                tempZip.delete();
-
-                if (includeCloning && !cancelRequested.get()) {
-                    emitProgress("downloading", 70, "Đang tải gói nhân bản giọng nói (Cloning)...");
-                    File cloneZip = new File(getContext().getCacheDir(), "cloning_download.zip");
-                    boolean cloneOk = downloadFileWithProgress(CLONING_URL, cloneZip, 70, 95);
-                    if (cloneOk && !cancelRequested.get()) {
-                        emitProgress("extracting", 95, "Đang giải nén gói nhân bản...");
-                        unzipAndFlatten(cloneZip, modelsDir);
+                if (includeCloning && !verifyCloningFiles(modelsDir) && !cancelRequested.get()) {
+                    int pctStart = coreReady ? 0 : 70;
+                    emitProgress("downloading", pctStart, "Đang tải gói AI Clone Giọng thật (~64 MB)...");
+                    boolean cloneOk = downloadFileWithProgress(CLONING_URL, cloneZip, pctStart, 95);
+                    if (!cloneOk || cancelRequested.get()) {
+                        throw new Exception(cancelRequested.get() ? "Download canceled by user" : "Không thể tải gói AI Clone Giọng từ máy chủ.");
                     }
-                    cloneZip.delete();
+                    emitProgress("extracting", 95, "Đang giải nén gói AI Clone Giọng...");
+                    unzipAndFlatten(cloneZip, modelsDir);
+                    if (cloneZip.exists()) cloneZip.delete();
                 }
 
                 if (cancelRequested.get()) {
@@ -153,6 +180,9 @@ public class VieNeuPlugin extends Plugin {
                 if (!verified) {
                     throw new Exception("Verification failed: Some model files are missing or incomplete.");
                 }
+                if (includeCloning && !verifyCloningFiles(modelsDir)) {
+                    throw new Exception("Xác minh thất bại: Thiếu tệp mô hình AI Clone Giọng.");
+                }
 
                 // Pre-initialize engine instance
                 if (engineInstance == null) {
@@ -161,23 +191,195 @@ public class VieNeuPlugin extends Plugin {
                 engineInstance.initialize();
 
                 isDownloading.set(false);
+                boolean cloningReady = verifyCloningFiles(modelsDir);
                 emitProgress("completed", 100, "Tải mô hình thành công! Đã sẵn sàng hoạt động 100% Offline.");
 
                 JSObject res = new JSObject();
                 res.put("success", true);
                 res.put("modelsPath", modelsDir.getAbsolutePath());
                 res.put("isReady", true);
+                res.put("isCloningReady", cloningReady);
                 call.resolve(res);
 
             } catch (Exception e) {
                 Log.e(TAG, "Download error", e);
                 isDownloading.set(false);
-                if (tempZip.exists()) tempZip.delete();
-
                 emitProgress("error", 0, "Lỗi tải mô hình: " + e.getMessage());
                 call.reject("Download error: " + e.getMessage());
+            } finally {
+                if (tempZip.exists()) tempZip.delete();
+                if (cloneZip.exists()) cloneZip.delete();
             }
         });
+    }
+
+    @PluginMethod
+    public void downloadCloningModels(PluginCall call) {
+        if (isDownloading.get()) {
+            call.reject("A download is already in progress");
+            return;
+        }
+
+        File dirCheck = getModelsDir();
+        if (verifyCloningFiles(dirCheck)) {
+            JSObject res = new JSObject();
+            res.put("success", true);
+            res.put("isCloningReady", true);
+            res.put("isReady", verifyModelFiles(dirCheck));
+            call.resolve(res);
+            return;
+        }
+
+        isDownloading.set(true);
+        cancelRequested.set(false);
+
+        executor.execute(() -> {
+            File modelsDir = getModelsDir();
+            File cloneZip = new File(getContext().getCacheDir(), "cloning_download.zip");
+
+            try {
+                emitProgress("downloading", 0, "Đang tải gói AI Clone Giọng thật (~64 MB)...");
+                boolean ok = downloadFileWithProgress(CLONING_URL, cloneZip, 0, 90);
+                if (!ok || cancelRequested.get()) {
+                    throw new Exception(cancelRequested.get() ? "Download canceled by user" : "Không thể tải gói AI Clone Giọng.");
+                }
+
+                emitProgress("extracting", 90, "Đang giải nén Speaker Encoder & MOSS Tokenizer...");
+                unzipAndFlatten(cloneZip, modelsDir);
+                if (cloneZip.exists()) cloneZip.delete();
+
+                if (!verifyCloningFiles(modelsDir)) {
+                    throw new Exception("Giải nén hoàn tất nhưng thiếu tệp mô hình AI Clone Giọng.");
+                }
+
+                isDownloading.set(false);
+                emitProgress("completed", 100, "Đã cài đặt xong gói AI Clone Giọng thật (ONNX)!");
+
+                JSObject res = new JSObject();
+                res.put("success", true);
+                res.put("isCloningReady", true);
+                res.put("isReady", verifyModelFiles(modelsDir));
+                call.resolve(res);
+            } catch (Exception e) {
+                Log.e(TAG, "downloadCloningModels error", e);
+                isDownloading.set(false);
+                emitProgress("error", 0, "Lỗi tải gói Clone: " + e.getMessage());
+                call.reject("Download cloning error: " + e.getMessage());
+            } finally {
+                if (cloneZip.exists()) cloneZip.delete();
+            }
+        });
+    }
+
+    @PluginMethod
+    public void cloneVoice(PluginCall call) {
+        String audioBase64 = call.getString("audioBase64");
+        if (audioBase64 == null || audioBase64.trim().isEmpty()) {
+            call.reject("Thiếu dữ liệu âm thanh đầu vào (audioBase64).", "INVALID_AUDIO");
+            return;
+        }
+
+        String rawVoiceName = call.getString("voiceName", "");
+        String voiceName = (rawVoiceName != null && !rawVoiceName.trim().isEmpty())
+                ? rawVoiceName.trim()
+                : "Giọng nhân bản";
+        String gender = call.getString("gender", "male");
+        String accent = call.getString("accent", "bac");
+        String fileName = call.getString("fileName", "");
+        String mimeType = call.getString("mimeType", "");
+
+        executor.execute(() -> {
+            File tempInput = null;
+            try {
+                File dir = getModelsDir();
+                if (!verifyCloningFiles(dir)) {
+                    call.reject(
+                        "Chưa tải gói mô hình AI Clone Giọng (~64 MB). Vui lòng bấm tải gói Clone trước khi nhân bản.",
+                        "CLONING_MODELS_MISSING"
+                    );
+                    return;
+                }
+
+                String cleanB64 = audioBase64.trim();
+                int commaIdx = cleanB64.indexOf(',');
+                if (commaIdx >= 0 && cleanB64.substring(0, commaIdx).contains("base64")) {
+                    cleanB64 = cleanB64.substring(commaIdx + 1);
+                }
+                byte[] audioBytes = Base64.decode(cleanB64, Base64.DEFAULT);
+                if (audioBytes == null || audioBytes.length < 512) {
+                    throw new Exception("Tệp âm thanh mẫu quá ngắn hoặc bị lỗi.");
+                }
+
+                String ext = resolveAudioExtension(fileName, mimeType);
+                tempInput = new File(getContext().getCacheDir(), "clone_src_" + System.currentTimeMillis() + "." + ext);
+                try (FileOutputStream fos = new FileOutputStream(tempInput)) {
+                    fos.write(audioBytes);
+                    fos.flush();
+                }
+
+                if (engineInstance == null) {
+                    engineInstance = new VieNeuEngine(dir);
+                }
+
+                JSONObject cloneData = engineInstance.cloneVoiceFromAudio(
+                    voiceName,
+                    tempInput,
+                    getContext().getCacheDir()
+                );
+
+                SimpleDateFormat isoFmt = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US);
+                isoFmt.setTimeZone(TimeZone.getTimeZone("UTC"));
+
+                int numFrames = cloneData.optInt("numFrames", 0);
+                double activeDur = cloneData.optDouble("activeDurationSec", 0.0);
+
+                JSObject voiceObj = new JSObject();
+                voiceObj.put("id", voiceName);
+                voiceObj.put("name", voiceName);
+                voiceObj.put("gender", gender);
+                voiceObj.put("accent", accent);
+                voiceObj.put("style", "Nhân bản AI ONNX (Offline)");
+                voiceObj.put("description", String.format(Locale.US, "Giọng nhân bản AI thật (%d khung RVQ · %.1fs)", numFrames, activeDur));
+                voiceObj.put("speaker_emb", cloneData.getJSONArray("speaker_emb"));
+                voiceObj.put("codes", cloneData.getJSONArray("codes"));
+                voiceObj.put("numFrames", numFrames);
+                voiceObj.put("createdAt", isoFmt.format(new Date()));
+
+                JSObject res = new JSObject();
+                res.put("success", true);
+                res.put("voice", voiceObj);
+                call.resolve(res);
+            } catch (Exception e) {
+                Log.e(TAG, "cloneVoice failed", e);
+                call.reject(e.getMessage() != null ? e.getMessage() : "Lỗi trích xuất giọng nói ONNX", "CLONE_FAILED", e);
+            } finally {
+                if (tempInput != null && tempInput.exists()) {
+                    tempInput.delete();
+                }
+            }
+        });
+    }
+
+    private String resolveAudioExtension(String fileName, String mimeType) {
+        if (fileName != null) {
+            int dot = fileName.lastIndexOf('.');
+            if (dot >= 0 && dot < fileName.length() - 1) {
+                String ext = fileName.substring(dot + 1).toLowerCase(Locale.US).replaceAll("[^a-z0-9]", "");
+                if (!ext.isEmpty() && ext.length() <= 5) {
+                    return ext;
+                }
+            }
+        }
+        if (mimeType != null) {
+            String lower = mimeType.toLowerCase(Locale.US);
+            if (lower.contains("webm")) return "webm";
+            if (lower.contains("ogg")) return "ogg";
+            if (lower.contains("mp4") || lower.contains("m4a") || lower.contains("aac")) return "m4a";
+            if (lower.contains("mpeg") || lower.contains("mp3")) return "mp3";
+            if (lower.contains("wav")) return "wav";
+            if (lower.contains("flac")) return "flac";
+        }
+        return "bin";
     }
 
     @PluginMethod
@@ -245,10 +447,9 @@ public class VieNeuPlugin extends Plugin {
                 fos.write(customObj.toString(2).getBytes(StandardCharsets.UTF_8));
             }
 
-            // Reload engine presets
-            if (engineInstance != null) {
-                engineInstance.release();
-                engineInstance.initialize();
+            // Update in-memory engine presets cleanly without reloading all ONNX models
+            if (engineInstance != null && engineInstance.isInitialized()) {
+                engineInstance.updateCustomVoiceInMemory(name, voiceEntry);
             }
 
             Log.d(TAG, "Saved custom voice '" + name + "' to " + customFile.getAbsolutePath());
@@ -320,9 +521,8 @@ public class VieNeuPlugin extends Plugin {
                     }
                 }
             }
-            if (engineInstance != null) {
-                engineInstance.release();
-                engineInstance.initialize();
+            if (engineInstance != null && engineInstance.isInitialized()) {
+                engineInstance.removeCustomVoiceInMemory(name);
             }
             JSObject res = new JSObject();
             res.put("success", true);
@@ -490,11 +690,16 @@ public class VieNeuPlugin extends Plugin {
                 conn.setConnectTimeout(25000);
                 conn.setReadTimeout(30000);
                 conn.connect();
+                code = conn.getResponseCode();
+            }
+            if (code >= 400) {
+                Log.e(TAG, "HTTP error downloading " + downloadUrl + ": " + code);
+                return false;
             }
 
             long totalBytes = conn.getContentLength();
             if (totalBytes <= 0) {
-                totalBytes = 154532969L; // fallback estimation (~147 MB)
+                totalBytes = downloadUrl.contains("cloning") ? 67257683L : 154532969L;
             }
 
             in = new BufferedInputStream(conn.getInputStream());

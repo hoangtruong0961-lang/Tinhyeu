@@ -1,5 +1,12 @@
 @import "tailwindcss";
 
+:root {
+  --app-safe-top: max(var(--safe-area-inset-top, 0px), env(safe-area-inset-top, 0px));
+  --app-safe-bottom: max(var(--safe-area-inset-bottom, 0px), env(safe-area-inset-bottom, 0px));
+  --app-safe-left: max(var(--safe-area-inset-left, 0px), env(safe-area-inset-left, 0px));
+  --app-safe-right: max(var(--safe-area-inset-right, 0px), env(safe-area-inset-right, 0px));
+}
+
 html, body, #root {
   background-color: #08080c;
   color: #ffffff;
@@ -10,6 +17,13 @@ html, body, #root {
 }
 
 @layer utilities {
+  .pt-safe {
+    padding-top: var(--app-safe-top);
+  }
+  .pb-safe {
+    padding-bottom: var(--app-safe-bottom);
+  }
+
   /* Metallic background & card textures */
   .bg-metallic-dark {
     background: linear-gradient(135deg, #18191c 0%, #121316 50%, #0a0b0d 100%);

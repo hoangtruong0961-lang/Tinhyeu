@@ -1159,10 +1159,10 @@ export const CapCutBottomBar: React.FC<CapCutBottomBarProps> = ({
           )}
 
           <div
-            className={`fixed inset-x-0 bottom-0 z-[150] w-full max-w-md mx-auto bg-[#18181c] border-t border-slate-800 rounded-t-3xl shadow-2xl overflow-hidden transform-gpu transition-all duration-200 ease-out ${
+            className={`fixed inset-x-0 bottom-0 z-[150] w-full max-w-md mx-auto bg-[#18181c] border-t border-slate-800 rounded-t-3xl shadow-2xl overflow-hidden transform-gpu transition-all duration-200 ease-out pb-safe ${
               isSheetCollapsed
-                ? 'h-[44px] min-h-[44px] max-h-[44px]'
-                : 'h-auto max-h-[85vh] pb-safe animate-in slide-in-from-bottom duration-200'
+                ? 'min-h-[44px]'
+                : 'h-auto max-h-[85dvh] animate-in slide-in-from-bottom duration-200'
             }`}
           >
             <div className="w-full h-full flex flex-col min-h-0 relative">
@@ -3536,8 +3536,12 @@ export const CapCutBottomBar: React.FC<CapCutBottomBarProps> = ({
         </>
       )}
 
-      {/* Permanent Base Toolbar Slot (constant height in DOM flow prevents VideoPlayer layout shift) */}
-      <div className="w-full max-w-md mx-auto select-none flex flex-col flex-shrink-0 h-[62px] min-h-[62px] max-h-[62px] bg-[#0e0e13] border-t border-zinc-800/80 shadow-2xl justify-center relative rounded-none overflow-hidden z-30">
+      {/* Permanent Base Toolbar Slot (constant inner height prevents VideoPlayer layout shift; safe-area extends cleanly below) */}
+      <div
+        className="w-full max-w-md mx-auto select-none flex flex-col flex-shrink-0 min-h-[62px] bg-[#0e0e13] border-t border-zinc-800/80 shadow-2xl justify-center relative rounded-none overflow-hidden z-30"
+        style={{ paddingBottom: 'var(--app-safe-bottom)' }}
+      >
+        <div className="w-full h-[62px] relative flex flex-col justify-center">
         {selectedSubtitle ? (
         /* CAPCUT SUBTITLE BLOCK EDIT TOOLBAR (< | Tạo Audio | Nghe thử | Sửa | Quét lại | Config | Xóa) */
         <div className="w-full h-full bg-[#0e0e13] px-2 py-1.5 flex items-center gap-1.5 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden flex-shrink-0 animate-in fade-in duration-150">
@@ -4342,6 +4346,7 @@ export const CapCutBottomBar: React.FC<CapCutBottomBarProps> = ({
           </button>
         </div>
       )}
+        </div>
       </div>
 
       {/* Hidden file inputs for SRT, Audio, and Background Music */}
