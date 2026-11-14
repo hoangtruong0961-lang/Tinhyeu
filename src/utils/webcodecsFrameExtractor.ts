@@ -1,6 +1,6 @@
 import { RegionROI } from '../types';
 import { applyBackgroundFilter } from './localPaddleOcrEngine';
-import { detectTextPresenceInFrame, applyUnsharpMask, computeFrameDiffScore, computeLaplacianVariance, shouldOverrideFrameSkip, applyThresholdingNoiseFilter } from './ocrPreprocessing';
+import { detectTextPresenceInFrame, applyUnsharpMask, computeFrameDiffScore, computeLaplacianVariance, shouldOverrideFrameSkip, applyThresholdingNoiseFilter, GridCacheState } from './ocrPreprocessing';
 import { createFile as createMp4BoxFile, DataStream } from 'mp4box';
 
 /**
@@ -128,75 +128,126 @@ export async function extractFramesTrueWebCodecs(options: FrameExtractorOptions)
     isLocalPaddle,
   } = options;
 
-  if (onProgress) onProgress(0, 100, '⚡ [True WebCodecs] Đang nạp ArrayBuffer video để giải mã phần cứng...');
+  if (onProgress) onProgress(0, 100, '⚡ [True WebCodecs] Đang nạp luồng video để giải mã phần cứng...');
 
-  let arrayBuffer: ArrayBuffer;
+  const isMobileEnv = typeof navigator !== 'undefined' && /Android|iPhone|iPad|Mobile/i.test(navigator.userAgent);
+  const maxSafeBytes = isMobileEnv ? 450 * 1024 * 1024 : 1800 * 1024 * 1024;
+
+  const mp4File = createMp4File();
+  let videoTrack: any = null;
+  const allSamples: any[] = [];
+
+  mp4File.onReady = (info: any) => {
+    if (!info.videoTracks || info.videoTracks.length === 0) {
+      return;
+    }
+
+    videoTrack = info.videoTracks[0];
+
+    let description: Uint8Array | undefined = undefined;
+    try {
+      const trak = mp4File.getTrackById(videoTrack.id);
+      if (trak?.mdia?.minf?.stbl?.stsd?.entries?.[0]) {
+        const entry = trak.mdia.minf.stbl.stsd.entries[0];
+        const box = entry.avcC || entry.hvcC || entry.vpcC || entry.av1C;
+        if (box) {
+          const stream = new DataStream(undefined, 0, DataStream.BIG_ENDIAN);
+          box.write(stream);
+          description = new Uint8Array(stream.buffer, 8);
+        }
+      }
+    } catch (_e) {}
+
+    const decoderConfig: VideoDecoderConfig = {
+      codec: videoTrack.codec,
+      codedWidth: videoTrack.video.width,
+      codedHeight: videoTrack.video.height,
+      description,
+      hardwareAcceleration: 'prefer-hardware',
+      optimizeForLatency: true,
+    } as any;
+
+    if (typeof VideoDecoder !== 'undefined' && typeof VideoDecoder.isConfigSupported === 'function') {
+      VideoDecoder.isConfigSupported(decoderConfig).then((res) => {
+        console.log(`[WebCodecs Extract GPU Verification] Supported: ${res.supported} | HW Accel: ${res.config?.hardwareAcceleration || 'prefer-hardware'} | Codec: ${res.config?.codec || videoTrack.codec}`);
+      }).catch((err) => {
+        console.warn('[WebCodecs Extract GPU Verification] Error:', err);
+      });
+    }
+
+    // MUST set _decoderConfig BEFORE mp4File.start() because start() fires onSamples synchronously
+    (mp4File as any)._decoderConfig = decoderConfig;
+
+    const totalSamples = videoTrack.nb_samples || 500000;
+    mp4File.setExtractionOptions(videoTrack.id, null, { nbSamples: totalSamples });
+    mp4File.start();
+  };
+
+  mp4File.onSamples = (id: number, _user: any, samples: any[]) => {
+    if (samples && samples.length > 0) {
+      for (let i = 0; i < samples.length; i++) {
+        allSamples.push(samples[i]);
+      }
+      try {
+        const lastSample = samples[samples.length - 1];
+        if (lastSample && typeof lastSample.number === 'number' && typeof (mp4File as any).releaseUsedSamples === 'function') {
+          (mp4File as any).releaseUsedSamples(id, lastSample.number);
+        }
+      } catch (_) {}
+    }
+  };
+
   try {
     const res = await fetch(videoUrl);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    arrayBuffer = await res.arrayBuffer();
+    const contentLength = Number(res.headers.get('Content-Length') || '0');
+    if (contentLength > maxSafeBytes) {
+      throw new Error(`Video vượt quá ngưỡng RAM an toàn (${Math.round(contentLength / (1024 * 1024))}MB) cho giải mã buffer toàn phần, chuyển sang luồng streaming.`);
+    }
+
+    const reader = res.body?.getReader();
+    if (reader) {
+      let fileOffset = 0;
+      while (true) {
+        if (shouldCancel && shouldCancel()) {
+          try { await reader.cancel(); } catch {}
+          return 0;
+        }
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value && value.byteLength > 0) {
+          if (fileOffset + value.byteLength > maxSafeBytes) {
+            try { await reader.cancel(); } catch {}
+            throw new Error('Video vượt quá ngưỡng RAM an toàn, chuyển sang luồng streaming.');
+          }
+          const chunkBuf = value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength) as ArrayBuffer & { fileStart?: number };
+          chunkBuf.fileStart = fileOffset;
+          fileOffset += chunkBuf.byteLength;
+          mp4File.appendBuffer(chunkBuf);
+        }
+      }
+      mp4File.flush();
+    } else {
+      const arrayBuffer = await res.arrayBuffer();
+      if (arrayBuffer.byteLength > maxSafeBytes) {
+        throw new Error('Video vượt quá ngưỡng RAM an toàn, chuyển sang luồng streaming.');
+      }
+      (arrayBuffer as any).fileStart = 0;
+      mp4File.appendBuffer(arrayBuffer);
+      mp4File.flush();
+    }
   } catch (err) {
-    throw new Error(`CORS hoặc network error khi tải video ArrayBuffer cho WebCodecs VideoDecoder: ${String(err)}`);
+    throw new Error(`CORS/Stream error cho WebCodecs VideoDecoder: ${String(err)}`);
   }
 
   if (shouldCancel && shouldCancel()) return 0;
+  if (!videoTrack || allSamples.length === 0) {
+    throw new Error('Không tìm thấy luồng Video Track hợp lệ trong tệp MP4.');
+  }
 
   return new Promise<number>((resolve, reject) => {
     try {
-      const mp4File = createMp4File();
-      let videoTrack: any = null;
-
-      mp4File.onReady = (info: any) => {
-        if (!info.videoTracks || info.videoTracks.length === 0) {
-          reject(new Error('Không tìm thấy luồng Video Track trong tệp MP4.'));
-          return;
-        }
-
-        videoTrack = info.videoTracks[0];
-
-        let description: Uint8Array | undefined = undefined;
-        try {
-          const trak = mp4File.getTrackById(videoTrack.id);
-          if (trak?.mdia?.minf?.stbl?.stsd?.entries?.[0]) {
-            const entry = trak.mdia.minf.stbl.stsd.entries[0];
-            const box = entry.avcC || entry.hvcC || entry.vpcC || entry.av1C;
-            if (box) {
-              const stream = new DataStream(undefined, 0, DataStream.BIG_ENDIAN);
-              box.write(stream);
-              description = new Uint8Array(stream.buffer, 8);
-            }
-          }
-        } catch (_e) {}
-
-        const decoderConfig: VideoDecoderConfig = {
-          codec: videoTrack.codec,
-          codedWidth: videoTrack.video.width,
-          codedHeight: videoTrack.video.height,
-          description,
-          hardwareAcceleration: 'prefer-hardware',
-          optimizeForLatency: true,
-        } as any;
-
-        if (typeof VideoDecoder !== 'undefined' && typeof VideoDecoder.isConfigSupported === 'function') {
-          VideoDecoder.isConfigSupported(decoderConfig).then((res) => {
-            console.log(`[WebCodecs Extract GPU Verification] Supported: ${res.supported} | HW Accel: ${res.config?.hardwareAcceleration || 'prefer-hardware'} | Codec: ${res.config?.codec || videoTrack.codec}`);
-          }).catch((err) => {
-            console.warn('[WebCodecs Extract GPU Verification] Error:', err);
-          });
-        }
-
-        // MUST set _decoderConfig BEFORE mp4File.start() because start() fires onSamples synchronously
-        (mp4File as any)._decoderConfig = decoderConfig;
-
-        const totalSamples = videoTrack.nb_samples || 500000;
-        mp4File.setExtractionOptions(videoTrack.id, null, { nbSamples: totalSamples });
-        mp4File.start();
-      };
-
-      const allSamples: any[] = [];
-      mp4File.onSamples = (id: number, user: any, samples: any[]) => {
-        allSamples.push(...samples);
-      };
+      mp4File.onError = (e: any) => reject(e);
 
       const processAllSamples = async (samples: any[]) => {
         if (shouldCancel && shouldCancel()) {
@@ -263,6 +314,7 @@ export async function extractFramesTrueWebCodecs(options: FrameExtractorOptions)
           await new Promise<void>((pass1Resolve) => {
             let prevKfBuffer: Uint8ClampedArray | null = null;
             let decodedKeyframeIdx = 0;
+            const pass1GridCacheRef: { current: GridCacheState | null } = { current: null };
 
             const fallbackCanvas = typeof OffscreenCanvas !== 'undefined'
               ? new OffscreenCanvas(320, 160)
@@ -271,33 +323,36 @@ export async function extractFramesTrueWebCodecs(options: FrameExtractorOptions)
 
             const pass1Decoder = new VideoDecoder({
               output: async (frame: VideoFrame) => {
-                const tSec = frame.timestamp / 1_000_000;
-                const vW = frame.codedWidth || frame.displayWidth || 1280;
-                const vH = frame.codedHeight || frame.displayHeight || 720;
+                try {
+                  const tSec = frame.timestamp / 1_000_000;
+                  const vW = frame.codedWidth || frame.displayWidth || 1280;
+                  const vH = frame.codedHeight || frame.displayHeight || 720;
 
-                const cropX = Math.max(0, Math.floor((roi.x / 100) * vW));
-                const cropY = Math.max(0, Math.floor((roi.y / 100) * vH));
-                const cropW = Math.max(16, Math.floor((roi.width / 100) * vW));
-                const cropH = Math.max(16, Math.floor((roi.height / 100) * vH));
+                  const cropX = Math.max(0, Math.floor((roi.x / 100) * vW));
+                  const cropY = Math.max(0, Math.floor((roi.y / 100) * vH));
+                  const cropW = Math.max(16, Math.floor((roi.width / 100) * vW));
+                  const cropH = Math.max(16, Math.floor((roi.height / 100) * vH));
 
-                const cropBuffer = new Uint8ClampedArray(cropW * cropH * 4);
-                await copyVideoFrameRoiDirect(frame, cropX, cropY, cropW, cropH, cropBuffer, fallbackCanvas, fallbackCtx);
-                frame.close();
+                  const cropBuffer = new Uint8ClampedArray(cropW * cropH * 4);
+                  await copyVideoFrameRoiDirect(frame, cropX, cropY, cropW, cropH, cropBuffer, fallbackCanvas, fallbackCtx);
 
-                applyThresholdingNoiseFilter(cropBuffer, cropW, cropH);
-                let diffScore = 0;
-                if (prevKfBuffer && prevKfBuffer.length === cropBuffer.length) {
-                  diffScore = computeFrameDiffScore(cropBuffer, prevKfBuffer, cropW, cropH);
+                  applyThresholdingNoiseFilter(cropBuffer, cropW, cropH);
+                  let diffScore = 0;
+                  if (prevKfBuffer && prevKfBuffer.length === cropBuffer.length) {
+                    diffScore = computeFrameDiffScore(cropBuffer, prevKfBuffer, cropW, cropH);
+                  }
+                  prevKfBuffer = cropBuffer;
+
+                  const presence = detectTextPresenceInFrame(cropBuffer, cropW, cropH, bgFilterStrength, pass1GridCacheRef);
+                  keyframeInfoMap.set(Number(tSec.toFixed(2)), {
+                    hasText: presence.hasText,
+                    diffScore,
+                  });
+
+                  decodedKeyframeIdx++;
+                } finally {
+                  frame.close();
                 }
-                prevKfBuffer = cropBuffer;
-
-                const presence = detectTextPresenceInFrame(cropBuffer, cropW, cropH);
-                keyframeInfoMap.set(Number(tSec.toFixed(2)), {
-                  hasText: presence.hasText,
-                  diffScore,
-                });
-
-                decodedKeyframeIdx++;
               },
               error: (err) => {
                 console.warn('Pass 1 Keyframe Decoder warning:', err);
@@ -408,6 +463,7 @@ export async function extractFramesTrueWebCodecs(options: FrameExtractorOptions)
             let framesInCurrentSecond = 0;
             let consecutiveNoTextCount = 0;
             let consecutiveStaticCount = 0;
+            const workerGridCacheRef: { current: GridCacheState | null } = { current: null };
 
             interface SubtitleActiveBlock {
               startTime: number;
@@ -522,7 +578,7 @@ export async function extractFramesTrueWebCodecs(options: FrameExtractorOptions)
                   diffScore = computeFrameDiffScore(rawCropBuffer, prevDiffPixelData, cropW, cropH);
                   if (diffScore >= TRANSITION_DIFF_THRESHOLD) {
                     isTransitionFrame = true;
-                  } else if (diffScore >= 1.5 && shouldOverrideFrameSkip(rawCropBuffer, cropW, cropH, 15)) {
+                  } else if (diffScore >= 1.5 && shouldOverrideFrameSkip(rawCropBuffer, cropW, cropH, 15, workerGridCacheRef)) {
                     isTransitionFrame = true;
                   }
                 }
@@ -586,7 +642,7 @@ export async function extractFramesTrueWebCodecs(options: FrameExtractorOptions)
                 lastEmittedTimestamp = timestampSec;
                 framesInCurrentSecond++;
 
-                const { hasText } = detectTextPresenceInFrame(currPixelData, targetW, targetH);
+                const { hasText } = detectTextPresenceInFrame(currPixelData, targetW, targetH, bgFilterStrength, workerGridCacheRef);
                 
                 // Track quiet streak and static subtitle streak for adaptive interval expansion
                 if (hasText) {
@@ -726,7 +782,10 @@ export async function extractFramesTrueWebCodecs(options: FrameExtractorOptions)
                     duration: (dSample.duration * 1_000_000) / dSample.timescale,
                     data: dSample.data,
                   }));
+                  (dSample as any).data = null;
                 }
+                (kSample as any).data = null;
+                gop.deltas = [];
               }
 
               pass2Decoder.flush().then(() => {
@@ -747,11 +806,6 @@ export async function extractFramesTrueWebCodecs(options: FrameExtractorOptions)
         resolve(globalCapturedCount);
       };
 
-      mp4File.onError = (e: any) => reject(e);
-
-      (arrayBuffer as any).fileStart = 0;
-      mp4File.appendBuffer(arrayBuffer);
-      mp4File.flush();
       processAllSamples(allSamples).catch(reject);
     } catch (err) {
       reject(err);
@@ -885,6 +939,7 @@ export async function extractFramesFastPlayback(options: FrameExtractorOptions):
     };
 
     let consecutiveNoTextStreak = 0;
+    const fastGridCacheRef: { current: GridCacheState | null } = { current: null };
 
     const processFrame = (_now: number, metadata?: any) => {
       if (shouldCancel && shouldCancel()) {
@@ -909,9 +964,10 @@ export async function extractFramesFastPlayback(options: FrameExtractorOptions):
         }
 
         const imgData = ctx.getImageData(0, 0, targetW, targetH);
-        applyThresholdingNoiseFilter(imgData.data, targetW, targetH);
+        const diffCheckData = new Uint8ClampedArray(imgData.data);
+        applyThresholdingNoiseFilter(diffCheckData, targetW, targetH);
         // PRE-CHECK: Run Canny Edge & LAB Luminance check BEFORE full processing
-        const presence = detectTextPresenceInFrame(imgData.data, targetW, targetH, bgFilterStrength);
+        const presence = detectTextPresenceInFrame(diffCheckData, targetW, targetH, bgFilterStrength, fastGridCacheRef);
 
         if (presence.hasText) {
           consecutiveNoTextStreak = 0;
@@ -1067,9 +1123,10 @@ export async function extractFramesParallelVideo(options: FrameExtractorOptions)
   if (totalFrames === 0) return 0;
 
   const useFastCallback = isRequestVideoFrameCallbackSupported();
-  // Split into up to 12 parallel players based on CPU/GPU capacity for maximum extraction performance
+  // Cap parallel <video> elements safely: mobile/WebView hardware decoders choke above 2-3 concurrent video tags
   const logicalCores = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 4;
-  const maxWorkers = Math.min(12, Math.max(2, logicalCores));
+  const isMobileEnv = typeof navigator !== 'undefined' && /Android|iPhone|iPad|Mobile/i.test(navigator.userAgent);
+  const maxWorkers = isMobileEnv ? 2 : Math.min(4, Math.max(2, logicalCores));
   const workerCount = Math.min(maxWorkers, Math.max(1, Math.ceil(totalFrames / 6)));
   const chunkSize = Math.ceil(totalFrames / workerCount);
 
@@ -1167,6 +1224,7 @@ export async function extractFramesParallelVideo(options: FrameExtractorOptions)
 
     let workerCaptured = 0;
     let prevPixelData: Uint8ClampedArray | null = null;
+    const workerGridCacheRef: { current: GridCacheState | null } = { current: null };
 
     if (useFastCallback) {
       // Controlled fast playback pass (3.5x rate for smooth GPU decode without keyframe dropping)
@@ -1281,19 +1339,20 @@ export async function extractFramesParallelVideo(options: FrameExtractorOptions)
               }
 
               const imgData = ctx.getImageData(0, 0, targetW, targetH);
-              applyThresholdingNoiseFilter(imgData.data, targetW, targetH);
+              const diffCheckData = new Uint8ClampedArray(imgData.data);
+              applyThresholdingNoiseFilter(diffCheckData, targetW, targetH);
               let diffScore = 0;
               let isTransitionFrame = false;
 
               if (prevPixelData) {
-                diffScore = computeFrameDiffScore(imgData.data, prevPixelData, targetW, targetH);
+                diffScore = computeFrameDiffScore(diffCheckData, prevPixelData, targetW, targetH);
                 if (diffScore >= TRANSITION_DIFF_THRESHOLD) {
                   isTransitionFrame = true;
                 }
               }
-              prevPixelData = new Uint8ClampedArray(imgData.data);
+              prevPixelData = diffCheckData;
 
-              const presence = detectTextPresenceInFrame(imgData.data, targetW, targetH);
+              const presence = detectTextPresenceInFrame(diffCheckData, targetW, targetH, bgFilterStrength, workerGridCacheRef);
 
               if (options.speedUpMode) {
                 if (presence.hasText) {
@@ -1525,20 +1584,21 @@ export async function extractFramesParallelVideo(options: FrameExtractorOptions)
         }
 
         const imgData = ctx.getImageData(0, 0, targetW, targetH);
-        applyThresholdingNoiseFilter(imgData.data, targetW, targetH);
+        const diffCheckData = new Uint8ClampedArray(imgData.data);
+        applyThresholdingNoiseFilter(diffCheckData, targetW, targetH);
         let diffScore = 0;
         let isTransitionFrame = false;
 
         if (prevPixelData) {
-          diffScore = computeFrameDiffScore(imgData.data, prevPixelData, targetW, targetH);
+          diffScore = computeFrameDiffScore(diffCheckData, prevPixelData, targetW, targetH);
           if (diffScore >= TRANSITION_DIFF_THRESHOLD) {
             isTransitionFrame = true;
           }
         }
-        prevPixelData = new Uint8ClampedArray(imgData.data);
+        prevPixelData = diffCheckData;
 
         // PRE-CHECK BEFORE FULL CAPTURE
-        const presence = detectTextPresenceInFrame(imgData.data, targetW, targetH, bgFilterStrength);
+        const presence = detectTextPresenceInFrame(diffCheckData, targetW, targetH, bgFilterStrength, workerGridCacheRef);
 
         workerCaptured++;
         globalCapturedCount++;

@@ -12,6 +12,7 @@
  */
 
 import { LocalOcrResult } from './localPaddleOcrEngine';
+import { resolveApiUrl } from './apiUrl';
 
 export interface RawOcrItem {
   text: string;
@@ -237,9 +238,29 @@ export function isLatinLanguage(lang?: string): boolean {
     l.startsWith('pt') ||
     l.startsWith('it') ||
     l.startsWith('ru') ||
+    l.startsWith('th') ||
     l.includes('tiếng việt') ||
     l.includes('vietnamese') ||
-    l.includes('english')
+    l.includes('english') ||
+    l.includes('tiếng anh')
+  );
+}
+
+/**
+ * Helper to determine if a language code or name represents Chinese (Simplified/Traditional).
+ * Prevents Chinese-only Hanzi edge/noise filters from corrupting Japanese Kana, Korean Hangul, or English text.
+ */
+export function isChineseLanguage(lang?: string): boolean {
+  if (!lang) return true;
+  const l = lang.toLowerCase().trim();
+  if (l === 'auto' || l.includes('tự động')) return false;
+  return (
+    l.startsWith('zh') ||
+    l === 'ch' ||
+    l.includes('chinese') ||
+    l.includes('tiếng trung') ||
+    l.includes('mandarin') ||
+    l.includes('cantonese')
   );
 }
 
@@ -1150,8 +1171,12 @@ export function refineAndMergeSubtitles(
   stepInterval: number = 0.5,
   isLatinLanguage: boolean = true,
   transitionTimestamps?: number[],
-  minConfidence: number = 0.70
+  minConfidence: number = 0.70,
+  modelVariant: 'small' | 'tiny' = 'small',
+  sourceLang?: string
 ): LocalOcrResult[] {
+  const variantLabel = modelVariant === 'tiny' ? 'Tiny' : 'Small';
+  const isChineseExpected = !isLatinLanguage && (sourceLang ? isChineseLanguage(sourceLang) : true);
   if (!rawDetections || rawDetections.length === 0) return [];
 
   // Step A: Pre-filter candidate items
@@ -1166,16 +1191,16 @@ export function refineAndMergeSubtitles(
     if (itemConf < continuationConfidenceThreshold) continue;
     if (!applyWatermarkFilter(item.text, item.box)) continue;
 
-    let text = correctOcrTextAnomalies(item.text);
+    let text = isChineseExpected ? correctOcrTextAnomalies(item.text) : applySoftFilter(item.text);
     if (isLatinLanguage) {
       text = applyLatinFilter(text, true);
-    } else {
+    } else if (isChineseExpected) {
       text = stripEmbeddedNoiseTokens(text);
     }
 
-    if (!applyHardFilter(text, itemConf, continuationConfidenceThreshold, !isLatinLanguage)) continue;
+    if (!applyHardFilter(text, itemConf, continuationConfidenceThreshold, isChineseExpected)) continue;
     if (!applySingleCjkFilter(text, !isLatinLanguage)) continue;
-    if (!applyPhantomTextFilter(text, itemConf, 1, !isLatinLanguage)) continue;
+    if (!applyPhantomTextFilter(text, itemConf, 1, isChineseExpected)) continue;
 
     if (text.length > 0) {
       rawCandidateItems.push({ ...item, text });
@@ -1270,7 +1295,7 @@ export function refineAndMergeSubtitles(
       finalBestText,
       maxConfInGroup,
       group.readings.length,
-      !isLatinLanguage
+      isChineseExpected
     );
 
     if (!passesPhantomFilter) {
@@ -1299,7 +1324,7 @@ export function refineAndMergeSubtitles(
       startTime: Number(startTime.toFixed(2)),
       endTime: Number(endTime.toFixed(2)),
       originalText: finalBestText,
-      sourceLang: 'PaddleOCR PP-OCRv6 Tiny',
+      sourceLang: `PaddleOCR PP-OCRv6 ${variantLabel}`,
       confidence: Number(avgConfInGroup.toFixed(4)),
     });
   }
@@ -1312,16 +1337,16 @@ export function refineAndMergeSubtitles(
     if (!item.text || item.text.trim().length === 0) return false;
     if (!applyWatermarkFilter(item.text, item.box)) return false;
 
-    let txt = correctOcrTextAnomalies(item.text);
+    let txt = isChineseExpected ? correctOcrTextAnomalies(item.text) : applySoftFilter(item.text);
     if (isLatinLanguage) {
       txt = applyLatinFilter(txt, true);
-    } else {
+    } else if (isChineseExpected) {
       txt = stripEmbeddedNoiseTokens(txt);
     }
 
-    if (!applyHardFilter(txt, item.confidence ?? 0.35, 0.25, !isLatinLanguage)) return false;
+    if (!applyHardFilter(txt, item.confidence ?? 0.35, 0.25, isChineseExpected)) return false;
     if (!applySingleCjkFilter(txt, !isLatinLanguage)) return false;
-    if (!applyPhantomTextFilter(txt, item.confidence ?? 0.35, 1, !isLatinLanguage)) return false;
+    if (!applyPhantomTextFilter(txt, item.confidence ?? 0.35, 1, isChineseExpected)) return false;
     return true;
   });
 
@@ -1357,10 +1382,10 @@ export function refineAndMergeSubtitles(
     // Recover short interjections or dialogue lines (even single/double-frame clusters >= 1 frame)
     if (cluster.length >= 1) {
       const readings = cluster.map((c) => {
-        let txt = correctOcrTextAnomalies(c.text);
+        let txt = isChineseExpected ? correctOcrTextAnomalies(c.text) : applySoftFilter(c.text);
         if (isLatinLanguage) {
           txt = applyLatinFilter(txt, true);
-        } else {
+        } else if (isChineseExpected) {
           txt = stripEmbeddedNoiseTokens(txt);
         }
         return {
@@ -1368,8 +1393,8 @@ export function refineAndMergeSubtitles(
           confidence: c.confidence ?? 0.35,
         };
       }).filter(r => r.text && r.text.length > 0 &&
-        applyHardFilter(r.text, r.confidence, 0.25, !isLatinLanguage) &&
-        applyPhantomTextFilter(r.text, r.confidence, cluster.length, !isLatinLanguage)
+        applyHardFilter(r.text, r.confidence, 0.25, isChineseExpected) &&
+        applyPhantomTextFilter(r.text, r.confidence, cluster.length, isChineseExpected)
       );
 
       if (readings.length === 0) return;
@@ -1377,8 +1402,8 @@ export function refineAndMergeSubtitles(
       const bestText = pickBestReadingWithConfidence(readings);
 
       if (bestText && bestText.trim().length > 0 &&
-          applyHardFilter(bestText, 0.35, 0.25, !isLatinLanguage) &&
-          applyPhantomTextFilter(bestText, 0.35, cluster.length, !isLatinLanguage)) {
+          applyHardFilter(bestText, 0.35, 0.25, isChineseExpected) &&
+          applyPhantomTextFilter(bestText, 0.35, cluster.length, isChineseExpected)) {
         
         const startTime = Math.max(0, firstT - halfStep);
         const endTime = Math.max(startTime + 0.35, lastT + halfStep);
@@ -1422,7 +1447,7 @@ export function refineAndMergeSubtitles(
             startTime: Number(startTime.toFixed(2)),
             endTime: Number(endTime.toFixed(2)),
             originalText: bestText,
-            sourceLang: 'PaddleOCR PP-OCRv6 Tiny (Fallback)',
+            sourceLang: `PaddleOCR PP-OCRv6 ${variantLabel} (Fallback)`,
             confidence: Number(avgConfidence.toFixed(4)),
           });
         }
@@ -1570,8 +1595,10 @@ export function refineAndMergeSubtitles(
   return refined
     .map((sub) => {
       let text = sub.originalText || '';
-      if (!isLatinLanguage) {
+      if (isChineseExpected) {
         text = stripEdgeNoiseHanziTokens(stripEmbeddedNoiseTokens(text)).trim();
+      } else {
+        text = applySoftFilter(text);
       }
       return {
         ...sub,
@@ -1594,7 +1621,7 @@ export async function deduplicateSubtitlesWithGemini(
   if (!subtitles || subtitles.length === 0) return subtitles;
 
   try {
-    const response = await fetch('/api/deduplicate-subtitles', {
+    const response = await fetch(resolveApiUrl('/api/deduplicate-subtitles'), {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

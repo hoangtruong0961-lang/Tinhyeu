@@ -9,8 +9,10 @@
  */
 
 import JSZip from 'jszip';
+import { Capacitor } from '@capacitor/core';
 import { SubtitleItem, SubtitleStyleConfig, BlurOverlay, LogoOverlay, TextOverlay, VideoClip } from '../types';
 import { exportToSRT, exportToASS } from './srtParser';
+import { saveBlobToAndroidDownloads } from './mobileFfmpegExporter';
 
 export interface ProjectExportOptions {
   projectTitle: string;
@@ -31,9 +33,18 @@ export interface ProjectExportOptions {
 }
 
 /**
- * Trigger browser file download from Blob or String
+ * Trigger file download across Web/Electron and Android Capacitor APK (MediaStore.Downloads)
  */
-export function triggerFileDownload(content: Blob | string, filename: string, mimeType: string = 'application/octet-stream') {
+export async function triggerFileDownload(
+  content: Blob | string,
+  filename: string,
+  mimeType: string = 'application/octet-stream'
+): Promise<string | void> {
+  if (Capacitor.isNativePlatform() && Capacitor.getPlatform() === 'android') {
+    const res = await saveBlobToAndroidDownloads(content, filename, mimeType);
+    return res.savedPath;
+  }
+
   const blob = typeof content === 'string' ? new Blob([content], { type: mimeType }) : content;
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');

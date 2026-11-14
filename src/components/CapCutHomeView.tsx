@@ -39,14 +39,16 @@ import {
   ExternalLink,
   MessageCircle,
 } from 'lucide-react';
-import { Project, GeminiModelOption, AppSettings, VideoClip, TTSProviderOption } from '../types';
+import { Capacitor } from '@capacitor/core';
+import { Project, GeminiModelOption, AppSettings, VideoClip, TTSProviderOption, VideoMedia } from '../types';
 import { storeMediaFileDB } from '../utils/idbStorage';
 import { ConfigView } from './ConfigView';
 import { MultiPlatformDownloaderView } from './MultiPlatformDownloaderView';
 import { VIENEU_VOICES } from '../data/vieneuVoices';
 import { VieNeuModelDownloadModal } from './VieNeuModelDownloadModal';
 import { LicenseState, isWhitelistedAdminMember } from '../utils/licenseManager';
-import { resolveApiUrl, isMobileCapacitor, getBackendBaseUrl } from '../utils/apiUrl';
+import { resolveApiUrl } from '../utils/apiUrl';
+import { YoutubeDLNative } from '../plugins/youtubeDLPlugin';
 
 interface CapCutHomeViewProps {
   projects: Project[];
@@ -146,6 +148,7 @@ export const CapCutHomeView: React.FC<CapCutHomeViewProps> = ({
   
   // GenDownload Extractor State for Quick Import Modal
   const [isExtracting, setIsExtracting] = useState<boolean>(false);
+  const [isDownloadingExtracted, setIsDownloadingExtracted] = useState<boolean>(false);
   const [extractError, setExtractError] = useState<string | null>(null);
   const [extractedData, setExtractedData] = useState<{
     title: string;
@@ -154,6 +157,9 @@ export const CapCutHomeView: React.FC<CapCutHomeViewProps> = ({
     platform: string;
     thumbnail?: string;
     author?: string;
+    pageUrl?: string;
+    media?: VideoMedia;
+    httpHeaders?: Record<string, string>;
   } | null>(null);
 
   // Multi-video upload & concatenation states
@@ -300,8 +306,30 @@ export const CapCutHomeView: React.FC<CapCutHomeViewProps> = ({
     setExtractedData(null);
 
     try {
-      if (isMobileCapacitor() && !getBackendBaseUrl()) {
-        throw new Error('Trên app Android APK, vui lòng vào Cài Đặt (Config) và nhập link "Máy Chủ Backend (Render/Cloud)" để bóc tách video bằng yt-dlp.');
+      if (Capacitor.isNativePlatform() && Capacitor.getPlatform() === 'android') {
+        const nativeRes = await YoutubeDLNative.extractVideo({ url: customUrl.trim() });
+        if (!nativeRes || !nativeRes.success) {
+          throw new Error(nativeRes?.error || 'yt-dlp trên thiết bị không thể bóc tách liên kết này.');
+        }
+        const videoList = (nativeRes.medias || []).filter(
+          (m) => !m.isAudioOnly && m.extension.toLowerCase() !== 'mp3'
+        );
+        const bestMedia = videoList[0] || nativeRes.medias?.[0];
+        if (!bestMedia) {
+          throw new Error('Không tìm thấy luồng video phù hợp từ liên kết.');
+        }
+        setExtractedData({
+          title: nativeRes.title || 'Video Tải Từ Link',
+          videoUrl: bestMedia.url,
+          directUrl: bestMedia.directUrl || bestMedia.url,
+          platform: nativeRes.source || 'yt-dlp Native',
+          thumbnail: nativeRes.thumbnail,
+          author: nativeRes.author,
+          pageUrl: customUrl.trim(),
+          media: bestMedia,
+          httpHeaders: nativeRes.httpHeaders,
+        });
+        return;
       }
 
       const res = await fetch(resolveApiUrl('/api/download-video'), {
@@ -336,19 +364,49 @@ export const CapCutHomeView: React.FC<CapCutHomeViewProps> = ({
       });
     } catch (err: any) {
       console.error('Error extracting video:', err);
-      setExtractError(err.message || 'Lỗi khi kết nối API tải video GenDownload.');
+      setExtractError(err.message || 'Lỗi khi bóc tách liên kết video.');
     } finally {
       setIsExtracting(false);
     }
   };
 
-  const handleConfirmImportExtracted = () => {
-    if (extractedData) {
-      onCreateNewProject(extractedData.directUrl || extractedData.videoUrl, extractedData.title);
-      setShowImportModal(false);
-      setExtractedData(null);
-      setCustomUrl('');
+  const handleConfirmImportExtracted = async () => {
+    if (!extractedData) return;
+
+    if (Capacitor.isNativePlatform() && Capacitor.getPlatform() === 'android' && extractedData.media) {
+      setIsDownloadingExtracted(true);
+      setExtractError(null);
+      try {
+        const dlRes = await YoutubeDLNative.downloadMedia({
+          pageUrl: extractedData.pageUrl || customUrl.trim(),
+          videoUrl: extractedData.directUrl || extractedData.videoUrl,
+          audioUrl: extractedData.media.audioUrl,
+          title: extractedData.title || 'video',
+          quality: extractedData.media.quality,
+          extension: extractedData.media.extension || 'mp4',
+          isAudioOnly: Boolean(extractedData.media.isAudioOnly),
+          hasAudio: Boolean(extractedData.media.hasAudio),
+          saveToDownloads: false,
+          httpHeaders: extractedData.media.httpHeaders || extractedData.httpHeaders,
+          audioHeaders: extractedData.media.audioHeaders || extractedData.media.httpHeaders || extractedData.httpHeaders,
+        });
+        const playableUrl = Capacitor.convertFileSrc(dlRes.filePath);
+        onCreateNewProject(playableUrl, extractedData.title);
+        setShowImportModal(false);
+        setExtractedData(null);
+        setCustomUrl('');
+      } catch (err: any) {
+        setExtractError(err?.message || 'Lỗi tải & ghép video cục bộ trên thiết bị.');
+      } finally {
+        setIsDownloadingExtracted(false);
+      }
+      return;
     }
+
+    onCreateNewProject(extractedData.directUrl || extractedData.videoUrl, extractedData.title);
+    setShowImportModal(false);
+    setExtractedData(null);
+    setCustomUrl('');
   };
 
   const handleUrlSubmit = (e: React.FormEvent) => {
@@ -828,11 +886,21 @@ export const CapCutHomeView: React.FC<CapCutHomeViewProps> = ({
 
                       <button
                         type="button"
+                        disabled={isDownloadingExtracted}
                         onClick={handleConfirmImportExtracted}
-                        className="w-full mt-1 bg-sky-500 hover:bg-sky-400 active:scale-95 text-slate-950 font-extrabold text-xs py-2.5 rounded-xl transition flex items-center justify-center space-x-1.5 shadow-lg shadow-sky-500/20"
+                        className="w-full mt-1 bg-sky-500 hover:bg-sky-400 disabled:opacity-60 active:scale-95 text-slate-950 font-extrabold text-xs py-2.5 rounded-xl transition flex items-center justify-center space-x-1.5 shadow-lg shadow-sky-500/20"
                       >
-                        <Check className="w-4 h-4" />
-                        <span>MỞ DỰ ÁN VỚI VIDEO NÀY</span>
+                        {isDownloadingExtracted ? (
+                          <>
+                            <Loader2 className="w-4 h-4 animate-spin" />
+                            <span>Đang tải & ghép MP4 trên máy...</span>
+                          </>
+                        ) : (
+                          <>
+                            <Check className="w-4 h-4" />
+                            <span>MỞ DỰ ÁN VỚI VIDEO NÀY</span>
+                          </>
+                        )}
                       </button>
                     </div>
                   )}

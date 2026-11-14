@@ -42,8 +42,8 @@ if (typeof self !== 'undefined') {
 
 import * as ort from 'onnxruntime-web';
 import { PaddleOcrService } from 'ppu-paddle-ocr/web';
-import { detectTextPresenceInFrame, applyThresholdingNoiseFilter, applyUnsharpMask, findHorizontalTextBounds } from '../utils/ocrPreprocessing';
-import { applyHardFilter, applySingleCjkFilter, applyLatinFilter, stripEmbeddedNoiseTokens, stripEdgeNoiseHanziTokens, correctOcrTextAnomalies, applyPhantomTextFilter } from '../utils/ocrPostprocessing';
+import { detectTextPresenceInFrame, applyUnsharpMask, findHorizontalTextBounds } from '../utils/ocrPreprocessing';
+import { applyHardFilter, applyLatinFilter, applySoftFilter, stripEmbeddedNoiseTokens, stripEdgeNoiseHanziTokens, correctOcrTextAnomalies, applyPhantomTextFilter, isLatinLanguage, isChineseLanguage } from '../utils/ocrPostprocessing';
 
 // Pre-configure global ONNX runtime settings immediately
 try {
@@ -69,37 +69,35 @@ function dataUrlToArrayBuffer(dataUrl: string): ArrayBuffer {
   return bytes.buffer;
 }
 
-function isLatinLanguage(lang?: string): boolean {
-  if (!lang) return false;
-  const l = lang.toLowerCase();
-  return (
-    l.startsWith('vi') ||
-    l.startsWith('en') ||
-    l.startsWith('fr') ||
-    l.startsWith('es') ||
-    l.startsWith('de') ||
-    l.startsWith('id') ||
-    l.startsWith('pt') ||
-    l.startsWith('it') ||
-    l.startsWith('ru') ||
-    l.includes('tiếng việt') ||
-    l.includes('english')
-  );
-}
-
-function cleanOcrText(text: string, isLatin: boolean = false): string {
+function cleanOcrText(text: string, sourceLang?: string): string {
   if (!text) return '';
   let cleaned = text.replace(/[\x00-\x1F\x7F]/g, '').trim();
   cleaned = cleaned.replace(/[ \t]+/g, ' ').trim();
+  const isLatin = isLatinLanguage(sourceLang);
+  const isChinese = !isLatin && isChineseLanguage(sourceLang);
   if (isLatin) {
-    cleaned = applyLatinFilter(cleaned, true);
-  } else {
-    cleaned = stripEdgeNoiseHanziTokens(stripEmbeddedNoiseTokens(cleaned));
+    return applySoftFilter(applyLatinFilter(cleaned, true));
   }
-  return correctOcrTextAnomalies(cleaned);
+  if (isChinese) {
+    cleaned = stripEdgeNoiseHanziTokens(stripEmbeddedNoiseTokens(cleaned));
+    return correctOcrTextAnomalies(cleaned);
+  }
+  return applySoftFilter(cleaned);
 }
 
 let ocrService: PaddleOcrService | null = null;
+let initializedVariant: 'small' | 'tiny' | null = null;
+let initializedConfigKey: string | null = null;
+
+function isBufferSizeMatchingVariant(buf: ArrayBuffer | null | undefined, isDet: boolean, variant: 'small' | 'tiny'): boolean {
+  if (!buf) return false;
+  if (variant === 'small') {
+    return isDet ? buf.byteLength > 5000000 : buf.byteLength > 10000000;
+  }
+  return isDet
+    ? (buf.byteLength < 5000000 && buf.byteLength > 500000)
+    : (buf.byteLength < 10000000 && buf.byteLength > 1000000);
+}
 
 function isDictionaryMatchingVariant(buf: ArrayBuffer | string | null | undefined, variant: 'small' | 'tiny'): boolean {
   if (!buf) return false;
@@ -187,7 +185,6 @@ function getDetCandidates(variant: 'small' | 'tiny' = 'small'): string[] {
     variant === 'tiny' ? '/det_tiny.onnx' : '/det_small.onnx',
     `/api/paddle-models/det?variant=${variant}`,
     `/api/ocr/model/det?variant=${variant}`,
-    '/det.onnx',
     variant === 'tiny' ? HF_DET_TINY_URL : HF_DET_SMALL_URL,
   ];
 }
@@ -197,7 +194,6 @@ function getRecCandidates(variant: 'small' | 'tiny' = 'small'): string[] {
     variant === 'tiny' ? '/rec_tiny.onnx' : '/rec_small.onnx',
     `/api/paddle-models/rec?variant=${variant}`,
     `/api/ocr/model/rec?variant=${variant}`,
-    '/rec.onnx',
     variant === 'tiny' ? HF_REC_TINY_URL : HF_REC_SMALL_URL,
   ];
 }
@@ -217,7 +213,12 @@ function getDictCandidates(variant: 'small' | 'tiny' = 'small'): string[] {
       ];
 }
 
-async function fetchResourceBuffer(candidates: string[], isDict: boolean = false, variant: 'small' | 'tiny' = 'small'): Promise<ArrayBuffer | null> {
+async function fetchResourceBuffer(
+  candidates: string[],
+  isDict: boolean = false,
+  variant: 'small' | 'tiny' = 'small',
+  isDet: boolean = false
+): Promise<ArrayBuffer | null> {
   for (const rawUrl of candidates) {
     const url = rawUrl.includes('huggingface.co') && rawUrl.includes('/blob/')
       ? rawUrl.replace('/blob/', '/resolve/')
@@ -233,7 +234,9 @@ async function fetchResourceBuffer(candidates: string[], isDict: boolean = false
           return sanitizeDictionaryBuffer(buf);
         }
       } else {
-        if (buf && buf.byteLength > 50000 && isProtobufValidHeader(buf)) return buf;
+        if (buf && buf.byteLength > 50000 && isProtobufValidHeader(buf) && isBufferSizeMatchingVariant(buf, isDet, variant)) {
+          return buf;
+        }
       }
     } catch (_) {}
   }
@@ -296,11 +299,35 @@ async function drainWorkerMessageQueue() {
 }
 
 async function handleWorkerIncomingMessage(e: MessageEvent) {
-  const { type, detBuffer: incomingDet, recBuffer: incomingRec, dictBuffer: incomingDict, frames, workerId, modelVariant } = e.data;
+  const {
+    type,
+    detBuffer: incomingDet,
+    recBuffer: incomingRec,
+    dictBuffer: incomingDict,
+    frames,
+    workerId,
+    modelVariant,
+    ocrConfig,
+    sourceLang: initSourceLang,
+  } = e.data;
   const currentWorkerId = typeof workerId === 'number' ? workerId : 1;
   const activeVariant: 'small' | 'tiny' = modelVariant === 'tiny' ? 'tiny' : 'small';
 
   if (type === 'INIT') {
+    const detDbBoxThresh = typeof ocrConfig?.detDbBoxThresh === 'number' ? ocrConfig.detDbBoxThresh : 0.55;
+    const detDbThresh = typeof ocrConfig?.detDbThresh === 'number' ? ocrConfig.detDbThresh : 0.30;
+    const detLimitSideLen = typeof ocrConfig?.detLimitSideLen === 'number'
+      ? ocrConfig.detLimitSideLen
+      : (activeVariant === 'tiny' ? 960 : 1216);
+    const rawMaxLen = typeof ocrConfig?.maxTextLength === 'number' ? ocrConfig.maxTextLength : 25;
+    const maxTextLength = isLatinLanguage(initSourceLang) ? Math.max(rawMaxLen, 64) : rawMaxLen;
+    const dropScore = typeof ocrConfig?.dropScore === 'number' ? ocrConfig.dropScore : 0.78;
+    const recLang = typeof ocrConfig?.paddleOcrLang === 'string' && ocrConfig.paddleOcrLang
+      ? ocrConfig.paddleOcrLang
+      : 'ch';
+    const useCls = Boolean(ocrConfig?.cls);
+    const configKey = `${activeVariant}|${detDbBoxThresh}|${detDbThresh}|${detLimitSideLen}|${maxTextLength}|${dropScore}|${recLang}|${useCls}`;
+
     let hasWebGpu = false;
     try {
       hasWebGpu = await checkWebGpuSupport();
@@ -329,17 +356,23 @@ async function handleWorkerIncomingMessage(e: MessageEvent) {
         console.warn(`[OCR Worker #${currentWorkerId} Setup Warning]`, envErr);
       }
 
+      if (ocrService && (initializedVariant !== activeVariant || initializedConfigKey !== configKey)) {
+        ocrService = null;
+        initializedVariant = null;
+        initializedConfigKey = null;
+      }
+
       if (!ocrService) {
-        let detBuf = incomingDet && isProtobufValidHeader(incomingDet) ? incomingDet : null;
-        let recBuf = incomingRec && isProtobufValidHeader(incomingRec) ? incomingRec : null;
+        let detBuf = incomingDet && isProtobufValidHeader(incomingDet) && isBufferSizeMatchingVariant(incomingDet, true, activeVariant) ? incomingDet : null;
+        let recBuf = incomingRec && isProtobufValidHeader(incomingRec) && isBufferSizeMatchingVariant(incomingRec, false, activeVariant) ? incomingRec : null;
         let cleanDictBuf = incomingDict && isDictionaryMatchingVariant(incomingDict, activeVariant) ? sanitizeDictionaryBuffer(incomingDict) : null;
 
         if (!detBuf) {
-          detBuf = await fetchResourceBuffer(getDetCandidates(activeVariant));
+          detBuf = await fetchResourceBuffer(getDetCandidates(activeVariant), false, activeVariant, true);
         }
 
         if (!recBuf) {
-          recBuf = await fetchResourceBuffer(getRecCandidates(activeVariant));
+          recBuf = await fetchResourceBuffer(getRecCandidates(activeVariant), false, activeVariant, false);
         }
 
         if (!cleanDictBuf) {
@@ -347,7 +380,7 @@ async function handleWorkerIncomingMessage(e: MessageEvent) {
         }
 
         if (!detBuf || !recBuf) {
-          throw new Error('Không thể tải tệp trọng số ONNX Model PaddleOCR');
+          throw new Error(`Không thể tải tệp trọng số ONNX Model PaddleOCR (${activeVariant})`);
         }
 
         const providers: string[] = hasWebGpu ? ['webgpu', 'wasm'] : ['wasm'];
@@ -362,17 +395,17 @@ async function handleWorkerIncomingMessage(e: MessageEvent) {
             paddingVertical: 0.4,
             paddingHorizontal: 0.6,
             minimumAreaThreshold: 20,
-            dbBoxThresh: 0.55,
-            dbThresh: 0.30,
-            limitSideLen: activeVariant === 'tiny' ? 960 : 1216,
-            cls: false,
+            dbBoxThresh: detDbBoxThresh,
+            dbThresh: detDbThresh,
+            limitSideLen: detLimitSideLen,
+            cls: useCls,
           } as any,
           recognition: {
             imageHeight: 48,
             strategy: 'per-line',
-            minimumConfidence: 0.78,
-            maxTextLength: 25,
-            lang: 'ch',
+            minimumConfidence: dropScore,
+            maxTextLength,
+            lang: recLang,
           } as any,
           session: {
             executionProviders: providers,
@@ -385,6 +418,8 @@ async function handleWorkerIncomingMessage(e: MessageEvent) {
           },
         });
         await ocrService.initialize();
+        initializedVariant = activeVariant;
+        initializedConfigKey = configKey;
         if ((ocrService as any)?.platform) {
           (ocrService as any).platform.createCanvas = (_w: number, _h: number) => {
             const oc = new OffscreenCanvas(_w, _h);
@@ -399,12 +434,13 @@ async function handleWorkerIncomingMessage(e: MessageEvent) {
           (ocrService as any).recognitor.platform.createCanvas = (ocrService as any).platform.createCanvas;
         }
       }
-      console.log(`[OCR Worker #${currentWorkerId}] ppu-paddle-ocr initialized successfully (${hasWebGpu ? 'WebGPU' : 'WASM'})!`);
+      console.log(`[OCR Worker #${currentWorkerId}] ppu-paddle-ocr (${activeVariant}) initialized successfully (${hasWebGpu ? 'WebGPU' : 'WASM'})!`);
       self.postMessage({
         type: 'READY',
         workerId: currentWorkerId,
         detReady: true,
         recReady: true,
+        modelVariant: activeVariant,
         executionProvider: hasWebGpu ? 'webgpu' : 'wasm',
       });
     } catch (err: any) {
@@ -417,16 +453,16 @@ async function handleWorkerIncomingMessage(e: MessageEvent) {
         } catch (_) {}
 
         if (!ocrService) {
-          let detBuf = incomingDet && isProtobufValidHeader(incomingDet) ? incomingDet : null;
-          let recBuf = incomingRec && isProtobufValidHeader(incomingRec) ? incomingRec : null;
+          let detBuf = incomingDet && isProtobufValidHeader(incomingDet) && isBufferSizeMatchingVariant(incomingDet, true, activeVariant) ? incomingDet : null;
+          let recBuf = incomingRec && isProtobufValidHeader(incomingRec) && isBufferSizeMatchingVariant(incomingRec, false, activeVariant) ? incomingRec : null;
           let cleanDictBuf = incomingDict && isDictionaryMatchingVariant(incomingDict, activeVariant) ? sanitizeDictionaryBuffer(incomingDict) : null;
 
           if (!detBuf) {
-            detBuf = await fetchResourceBuffer(getDetCandidates(activeVariant));
+            detBuf = await fetchResourceBuffer(getDetCandidates(activeVariant), false, activeVariant, true);
           }
 
           if (!recBuf) {
-            recBuf = await fetchResourceBuffer(getRecCandidates(activeVariant));
+            recBuf = await fetchResourceBuffer(getRecCandidates(activeVariant), false, activeVariant, false);
           }
 
           if (!cleanDictBuf) {
@@ -434,7 +470,7 @@ async function handleWorkerIncomingMessage(e: MessageEvent) {
           }
 
           if (!detBuf || !recBuf) {
-            throw new Error('Không thể tải tệp trọng số ONNX Model PaddleOCR cho chế độ WASM');
+            throw new Error(`Không thể tải tệp trọng số ONNX Model PaddleOCR (${activeVariant}) cho chế độ WASM`);
           }
 
           ocrService = new PaddleOcrService({
@@ -447,17 +483,17 @@ async function handleWorkerIncomingMessage(e: MessageEvent) {
               paddingVertical: 0.4,
               paddingHorizontal: 0.6,
               minimumAreaThreshold: 20,
-              dbBoxThresh: 0.55,
-              dbThresh: 0.30,
-              limitSideLen: activeVariant === 'tiny' ? 960 : 1216,
-              cls: false,
+              dbBoxThresh: detDbBoxThresh,
+              dbThresh: detDbThresh,
+              limitSideLen: detLimitSideLen,
+              cls: useCls,
             } as any,
             recognition: {
               imageHeight: 48,
               strategy: 'per-line',
-              minimumConfidence: 0.78,
-              maxTextLength: 25,
-              lang: 'ch',
+              minimumConfidence: dropScore,
+              maxTextLength,
+              lang: recLang,
             } as any,
             session: {
               executionProviders: ['wasm'],
@@ -470,6 +506,8 @@ async function handleWorkerIncomingMessage(e: MessageEvent) {
             },
           });
           await ocrService.initialize();
+          initializedVariant = activeVariant;
+          initializedConfigKey = configKey;
           if ((ocrService as any)?.platform) {
             (ocrService as any).platform.createCanvas = (_w: number, _h: number) => {
               const oc = new OffscreenCanvas(_w, _h);
@@ -484,7 +522,7 @@ async function handleWorkerIncomingMessage(e: MessageEvent) {
             (ocrService as any).recognitor.platform.createCanvas = (ocrService as any).platform.createCanvas;
           }
         }
-        self.postMessage({ type: 'READY', workerId: currentWorkerId, detReady: true, recReady: true, executionProvider: 'wasm' });
+        self.postMessage({ type: 'READY', workerId: currentWorkerId, detReady: true, recReady: true, modelVariant: activeVariant, executionProvider: 'wasm' });
       } catch (fallbackErr: any) {
         console.error(`[OCR Worker #${currentWorkerId}] ppu-paddle-ocr init failed:`, fallbackErr);
         self.postMessage({ type: 'ERROR', workerId: currentWorkerId, error: fallbackErr?.message || 'Worker init error' });
@@ -494,8 +532,9 @@ async function handleWorkerIncomingMessage(e: MessageEvent) {
     try {
       const results: { timestamp: number; text: string; confidence?: number; deepScan?: boolean }[] = [];
       let skippedFramesCount = 0;
-      const { sourceLang, targetLang, enableDeepScan = true } = e.data;
+      const { sourceLang, enableDeepScan = true } = e.data;
       const isLatin = isLatinLanguage(sourceLang);
+      const isChinese = !isLatin && isChineseLanguage(sourceLang);
 
       self.postMessage({
         type: 'PROGRESS',
@@ -509,6 +548,8 @@ async function handleWorkerIncomingMessage(e: MessageEvent) {
       if (ocrService) {
         let usedOffscreen: OffscreenCanvas | null = null;
         let usedCtx: OffscreenCanvasRenderingContext2D | null = null;
+        let tempOffscreen: OffscreenCanvas | null = null;
+        let tempCtx: OffscreenCanvasRenderingContext2D | null = null;
 
         for (let i = 0; i < frames.length; i++) {
           const item = frames[i];
@@ -516,6 +557,8 @@ async function handleWorkerIncomingMessage(e: MessageEvent) {
 
           try {
             let res: any = null;
+            let activeWidth = item.width || 0;
+            let activeHeight = item.height || 0;
 
             // High-Performance Path: Prioritize zero-copy transferred pixelData with OffscreenCanvas
             if (item.pixelData && item.width && item.height && item.width > 0 && item.height > 0) {
@@ -549,6 +592,8 @@ async function handleWorkerIncomingMessage(e: MessageEvent) {
                 const bounds = findHorizontalTextBounds(typedArray, item.width, item.height);
                 const targetW = bounds.cropW;
                 const targetH = item.height;
+                activeWidth = targetW;
+                activeHeight = targetH;
 
                 if (!usedOffscreen || usedOffscreen.width !== targetW || usedOffscreen.height !== targetH) {
                   usedOffscreen = new OffscreenCanvas(targetW, targetH);
@@ -556,12 +601,14 @@ async function handleWorkerIncomingMessage(e: MessageEvent) {
                 }
                 if (usedCtx && usedOffscreen) {
                   if (bounds.isTightCropped) {
-                    const tempCanvas = new OffscreenCanvas(item.width, item.height);
-                    const tempCtx = tempCanvas.getContext('2d', { willReadFrequently: true });
-                    if (tempCtx) {
+                    if (!tempOffscreen || tempOffscreen.width !== item.width || tempOffscreen.height !== item.height) {
+                      tempOffscreen = new OffscreenCanvas(item.width, item.height);
+                      tempCtx = tempOffscreen.getContext('2d', { willReadFrequently: true }) as any;
+                    }
+                    if (tempCtx && tempOffscreen) {
                       tempCtx.putImageData(new ImageData(typedArray as any, item.width, item.height), 0, 0);
                       usedCtx.clearRect(0, 0, targetW, targetH);
-                      usedCtx.drawImage(tempCanvas, bounds.cropX, 0, bounds.cropW, item.height, 0, 0, targetW, targetH);
+                      usedCtx.drawImage(tempOffscreen, bounds.cropX, 0, bounds.cropW, item.height, 0, 0, targetW, targetH);
                     }
                   } else {
                     const imgData = new ImageData(typedArray as any, item.width, item.height);
@@ -592,13 +639,13 @@ async function handleWorkerIncomingMessage(e: MessageEvent) {
 
             let rawText = typeof res === 'string' ? res : res?.text || '';
             let confidence = typeof res === 'object' && res ? (res.confidence ?? res.score ?? 0.88) : 0.88;
-            let text = cleanOcrText(rawText, isLatin);
+            let text = cleanOcrText(rawText, sourceLang);
 
             // Tier 2: Deep Scan (Parse-Tầng 2)
-            // If Tier 1 produced empty text or very low confidence, re-process with unsharp sharpening & sensitive detection
-            if ((!text || text.length === 0 || confidence < 0.35) && enableDeepScan && usedCtx && usedOffscreen && item.width && item.height) {
+            // Use actual OffscreenCanvas dimensions (activeWidth x activeHeight) instead of uncropped item.width!
+            if ((!text || text.length === 0 || confidence < 0.35) && enableDeepScan && usedCtx && usedOffscreen && activeWidth > 0 && activeHeight > 0) {
               try {
-                applyUnsharpMask(usedCtx as any, item.width, item.height, 1.6, 1);
+                applyUnsharpMask(usedCtx, activeWidth, activeHeight, 1.6, 1);
                 const deepRes: any = await ocrService.recognize(usedOffscreen as any, {
                   flatten: true,
                   strategy: 'per-line',
@@ -608,14 +655,14 @@ async function handleWorkerIncomingMessage(e: MessageEvent) {
 
                 const deepRaw = typeof deepRes === 'string' ? deepRes : deepRes?.text || '';
                 const deepConf = typeof deepRes === 'object' && deepRes ? (deepRes.confidence ?? deepRes.score ?? 0.70) : 0.70;
-                const deepCleaned = cleanOcrText(deepRaw, isLatin);
+                const deepCleaned = cleanOcrText(deepRaw, sourceLang);
 
                 if (deepCleaned && deepCleaned.length > 0 && deepConf >= 0.18) {
                   text = deepCleaned;
                   confidence = deepConf;
                   console.log(`[DeepScan Tầng-2] Khôi phục phụ đề mờ tại ${item.timestamp}s: "${text}" (${Math.round(confidence * 100)}%)`);
                 }
-              } catch (deepErr) {
+              } catch (_deepErr) {
                 // Ignore deep scan failure gracefully
               }
             }
@@ -624,8 +671,8 @@ async function handleWorkerIncomingMessage(e: MessageEvent) {
             if (
               text &&
               confidence >= candidateMinConf &&
-              applyHardFilter(text, confidence, candidateMinConf, false) &&
-              applyPhantomTextFilter(text, confidence, 1, !isLatin)
+              applyHardFilter(text, confidence, candidateMinConf, isChinese) &&
+              applyPhantomTextFilter(text, confidence, 1, isChinese)
             ) {
               results.push({ timestamp: item.timestamp, text, confidence });
             }

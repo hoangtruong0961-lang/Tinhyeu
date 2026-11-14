@@ -34,10 +34,55 @@ export interface FFmpegLog {
   message: string;
 }
 
+export interface FFmpegResolveUrlResult {
+  exists: boolean;
+  filePath: string;
+  sizeBytes: number;
+}
+
+export interface FFmpegTempFileResult {
+  success: boolean;
+  filePath: string;
+}
+
+export interface FFmpegOutputPathResult {
+  success: boolean;
+  filePath: string;
+  fileName: string;
+}
+
+export interface FFmpegAppendChunkResult {
+  success: boolean;
+  bytesWritten: number;
+  totalSize: number;
+}
+
+export interface FFmpegSaveDownloadResult {
+  success: boolean;
+  savedPath: string;
+  fileName: string;
+  sizeMB: number;
+}
+
 export interface FFmpegKitNativePlugin {
   getInfo(): Promise<FFmpegKitInfo>;
   execute(options: { command: string }): Promise<FFmpegExecuteResult>;
   cancel(options?: { sessionId?: number }): Promise<{ cancelled: boolean }>;
+  resolveCapacitorUrl(options: { url: string }): Promise<FFmpegResolveUrlResult>;
+  openTempFile(options: { fileName: string }): Promise<FFmpegTempFileResult>;
+  appendFileChunk(options: {
+    filePath: string;
+    base64Chunk?: string;
+    textContent?: string;
+  }): Promise<FFmpegAppendChunkResult>;
+  prepareOutputPath(options: { fileName: string; format: string }): Promise<FFmpegOutputPathResult>;
+  saveToPublicDownloads(options: {
+    filePath: string;
+    fileName?: string;
+    mimeType?: string;
+    deleteSource?: boolean;
+  }): Promise<FFmpegSaveDownloadResult>;
+  deleteTempFile(options: { filePath: string }): Promise<{ success: boolean }>;
   addListener(
     eventName: 'ffmpegStatistics',
     listenerFunc: (stats: FFmpegStatistics) => void
@@ -61,6 +106,20 @@ const NativeFFmpegKit = registerPlugin<FFmpegKitNativePlugin>('FFmpegKitNative',
       throw new Error('FFmpegKitNative is only available on Android native app.');
     },
     cancel: async () => ({ cancelled: true }),
+    resolveCapacitorUrl: async () => ({ exists: false, filePath: '', sizeBytes: 0 }),
+    openTempFile: async () => {
+      throw new Error('Not available on web');
+    },
+    appendFileChunk: async () => {
+      throw new Error('Not available on web');
+    },
+    prepareOutputPath: async () => {
+      throw new Error('Not available on web');
+    },
+    saveToPublicDownloads: async () => {
+      throw new Error('Not available on web');
+    },
+    deleteTempFile: async () => ({ success: false }),
     addListener: async () => ({
       remove: async () => {}
     }),

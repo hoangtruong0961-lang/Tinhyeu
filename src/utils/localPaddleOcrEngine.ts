@@ -203,9 +203,31 @@ export async function ensurePaddleOcrModelsLoaded(
   onProgress?: (percent: number, msg: string) => void,
   variant: 'small' | 'tiny' = 'small'
 ): Promise<boolean> {
-  let detBuf = await getModelBufferDB(`paddleocr_det_${variant}`) || await getModelBufferDB('paddleocr_det');
-  let recBuf = await getModelBufferDB(`paddleocr_rec_${variant}`) || await getModelBufferDB('paddleocr_rec');
-  let dictBuf = await getModelBufferDB(`paddleocr_dict_${variant}`) || await getModelBufferDB('paddleocr_dict');
+  let detBuf = await getModelBufferDB(`paddleocr_det_${variant}`);
+  let recBuf = await getModelBufferDB(`paddleocr_rec_${variant}`);
+  let dictBuf = await getModelBufferDB(`paddleocr_dict_${variant}`);
+
+  if (!detBuf) {
+    const legacyDet = await getModelBufferDB('paddleocr_det');
+    if (legacyDet && isProtobufValidHeader(legacyDet) && isBufferSizeMatchingVariant(legacyDet, true, variant)) {
+      detBuf = legacyDet;
+      await storeModelBufferDB(`paddleocr_det_${variant}`, legacyDet, `det_${variant}.onnx`);
+    }
+  }
+  if (!recBuf) {
+    const legacyRec = await getModelBufferDB('paddleocr_rec');
+    if (legacyRec && isProtobufValidHeader(legacyRec) && isBufferSizeMatchingVariant(legacyRec, false, variant)) {
+      recBuf = legacyRec;
+      await storeModelBufferDB(`paddleocr_rec_${variant}`, legacyRec, `rec_${variant}.onnx`);
+    }
+  }
+  if (!dictBuf) {
+    const legacyDict = await getModelBufferDB('paddleocr_dict');
+    if (legacyDict && isDictionaryMatchingVariant(legacyDict, variant)) {
+      dictBuf = legacyDict;
+      await storeModelBufferDB(`paddleocr_dict_${variant}`, legacyDict, `ppocrv6_${variant}_dict.txt`);
+    }
+  }
 
   // Purge or re-fetch if corrupted or mismatched variant size
   if (detBuf && (!isProtobufValidHeader(detBuf) || !isBufferSizeMatchingVariant(detBuf, true, variant))) {
@@ -216,7 +238,6 @@ export async function ensurePaddleOcrModelsLoaded(
   }
   if (dictBuf && !isDictionaryMatchingVariant(dictBuf, variant)) {
     console.warn(`[PaddleOCR] Cached dictionary does not match variant '${variant}'. Discarding old dictionary.`);
-    await deleteModelBufferDB('paddleocr_dict');
     await deleteModelBufferDB(`paddleocr_dict_${variant}`);
     dictBuf = null;
   }
@@ -265,21 +286,21 @@ export async function checkPaddleOcrModelStatus(variant: 'small' | 'tiny' = 'sma
     recLoaded: recValid,
     dictLoaded,
     modelName: isReady ? `PP-OCRv6 ${variantName} Local ONNX (Đã lưu trong bộ nhớ)` : `Chưa tải Model PaddleOCR PP-OCRv6 ${variantName}`,
-    detSizeMB: detBuf && detBuf.byteLength > 100000 ? (detBuf.byteLength / (1024 * 1024)).toFixed(2) + ' MB' : undefined,
-    recSizeMB: recBuf && recBuf.byteLength > 100000 ? (recBuf.byteLength / (1024 * 1024)).toFixed(2) + ' MB' : undefined,
-    dictSizeKB: dictBuf && isDictionaryMatchingVariant(dictBuf, variant) ? (dictBuf.byteLength / 1024).toFixed(1) + ' KB' : undefined,
+    detSizeMB: detValid && detBuf ? (detBuf.byteLength / (1024 * 1024)).toFixed(2) + ' MB' : undefined,
+    recSizeMB: recValid && recBuf ? (recBuf.byteLength / (1024 * 1024)).toFixed(2) + ' MB' : undefined,
+    dictSizeKB: dictLoaded && dictBuf ? (dictBuf.byteLength / 1024).toFixed(1) + ' KB' : undefined,
   };
 }
 
 /**
  * Initializes local ONNX Runtime Web session from IndexedDB or ArrayBuffers
  */
-export async function initLocalOnnxEngine(): Promise<boolean> {
+export async function initLocalOnnxEngine(variant: 'small' | 'tiny' = 'small'): Promise<boolean> {
   try {
-    const detBuf = await getModelBufferDB('paddleocr_det');
-    const recBuf = await getModelBufferDB('paddleocr_rec');
-    const hasDet = !!detBuf && detBuf.byteLength > 100000;
-    const hasRec = !!recBuf && recBuf.byteLength > 100000;
+    const detBuf = await getModelBufferDB(`paddleocr_det_${variant}`) || await getModelBufferDB('paddleocr_det');
+    const recBuf = await getModelBufferDB(`paddleocr_rec_${variant}`) || await getModelBufferDB('paddleocr_rec');
+    const hasDet = !!detBuf && isProtobufValidHeader(detBuf) && isBufferSizeMatchingVariant(detBuf, true, variant);
+    const hasRec = !!recBuf && isProtobufValidHeader(recBuf) && isBufferSizeMatchingVariant(recBuf, false, variant);
     return hasDet || hasRec;
   } catch (err) {
     console.warn('[Local ONNX Engine Check]', err);
@@ -311,7 +332,6 @@ export async function downloadPaddleOcrModels(
         directStaticUrl,
         isDet ? `/api/paddle-models/det?variant=${variant}` : `/api/paddle-models/rec?variant=${variant}`,
         isDet ? `/api/ocr/model/det?variant=${variant}` : `/api/ocr/model/rec?variant=${variant}`,
-        isDet ? '/det.onnx' : '/rec.onnx',
         isDet ? detHfUrl : recHfUrl,
         mainUrl,
       ];
@@ -456,6 +476,11 @@ export async function clearPaddleOcrCache(): Promise<void> {
   onnxDetSession = null;
   onnxRecSession = null;
   mainThreadPaddleService = null;
+  activeMainThreadVariant = null;
+  while (globalWarmWorkers.length > 0) {
+    const w = globalWarmWorkers.pop();
+    try { w?.worker.terminate(); } catch {}
+  }
   console.log('[PaddleOCR] Local ONNX model & dictionary cache cleared.');
 }
 
@@ -465,8 +490,6 @@ import {
   applyBinarizationAndContrast,
   scaleFrameBitmap,
   SubtitleRoiCalibrator,
-  cropPixelDataVertical,
-  estimateTextVerticalRoi,
   findHorizontalTextBounds,
 } from './ocrPreprocessing';
 import {
@@ -500,6 +523,7 @@ export {
 };
 
 let mainThreadPaddleService: PaddleOcrService | null = null;
+let activeMainThreadVariant: 'small' | 'tiny' | null = null;
 
 function dataUrlToArrayBuffer(dataUrl: string): ArrayBuffer {
   const parts = dataUrl.split(',');
@@ -523,7 +547,7 @@ export function hasSubtitleTextCandidate(
 }
 
 export function applyBackgroundFilter(
-  ctx: CanvasRenderingContext2D,
+  ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
   width: number,
   height: number,
   mode: 'none' | 'contrast' | 'binarize' | 'adaptive' = 'none',
@@ -553,12 +577,13 @@ export function processTemporalClusteringAndSnapping(
   transitionTimestamps?: number[],
   minConfidence: number = 0.70,
   sourceLang?: string,
-  _targetLang?: string
+  _targetLang?: string,
+  modelVariant: 'small' | 'tiny' = 'small'
 ): LocalOcrResult[] {
   // IMPORTANT: The script type of OCR text inside video frames is determined by the video's SOURCE language!
   // Defaults to CJK (isLatin = false) if sourceLang is not explicitly a Latin language.
   const isLatin = sourceLang ? isLatinLanguage(sourceLang) : false;
-  return refineAndMergeSubtitles(detectedItems, stepInterval, isLatin, transitionTimestamps, minConfidence);
+  return refineAndMergeSubtitles(detectedItems, stepInterval, isLatin, transitionTimestamps, minConfidence, modelVariant, sourceLang);
 }
 
 /**
@@ -580,15 +605,26 @@ export async function runClientSideLocalOcrBatch(
 
   if (!frames || frames.length === 0) return [];
 
-  const activeVariant = paddleModelVariant || getAppSettings().paddleOcrModelVariant || 'small';
+  const settings = getAppSettings();
+  const activeVariant = paddleModelVariant || settings.paddleOcrModelVariant || 'small';
+  const batchRawMaxLen = settings.maxTextLength ?? 25;
+  const batchOcrConfig = {
+    detDbBoxThresh: settings.detDbBoxThresh ?? 0.55,
+    detDbThresh: settings.detDbThresh ?? 0.30,
+    detLimitSideLen: settings.detLimitSideLen ?? (activeVariant === 'tiny' ? 960 : 1216),
+    maxTextLength: isLatinLanguage(sourceLang) ? Math.max(batchRawMaxLen, 64) : batchRawMaxLen,
+    dropScore: settings.dropScore ?? 0.78,
+    paddleOcrLang: settings.paddleOcrLang || 'ch',
+    cls: settings.cls ?? false,
+  };
 
   await ensurePaddleOcrModelsLoaded((pct, msg) => {
     if (onProgress) onProgress(`[Tải Model Local OCR ${pct}%] ${msg}`);
   }, activeVariant);
 
-  let detBuf = await getModelBufferDB(`paddleocr_det_${activeVariant}`) || await getModelBufferDB('paddleocr_det');
-  let recBuf = await getModelBufferDB(`paddleocr_rec_${activeVariant}`) || await getModelBufferDB('paddleocr_rec');
-  let dictBuf = await getModelBufferDB(`paddleocr_dict_${activeVariant}`) || await getModelBufferDB('paddleocr_dict');
+  let detBuf = await getModelBufferDB(`paddleocr_det_${activeVariant}`);
+  let recBuf = await getModelBufferDB(`paddleocr_rec_${activeVariant}`);
+  let dictBuf = await getModelBufferDB(`paddleocr_dict_${activeVariant}`);
 
   if (dictBuf && !isDictionaryMatchingVariant(dictBuf, activeVariant)) {
     console.warn(`[PaddleOCR] Purging mismatched cached dictionary for variant '${activeVariant}'`);
@@ -696,6 +732,9 @@ export async function runClientSideLocalOcrBatch(
               type: 'PROCESS_BATCH',
               workerId,
               frames: processedFrames,
+              sourceLang,
+              targetLang,
+              enableDeepScan: true,
               minConfidence,
             });
           } else if (type === 'PROGRESS') {
@@ -730,6 +769,8 @@ export async function runClientSideLocalOcrBatch(
             recBuffer: recCopy,
             dictBuffer: dictCopy,
             modelVariant: activeVariant,
+            ocrConfig: batchOcrConfig,
+            sourceLang,
           },
           initTransferables
         );
@@ -762,6 +803,9 @@ export async function runClientSideLocalOcrBatch(
   if (detectedItems.length === 0) {
     if (onProgress) onProgress('Đang chạy PaddleOCR Engine trên Luồng chính (Main Thread)...');
     try {
+      if (mainThreadPaddleService && activeMainThreadVariant !== activeVariant) {
+        mainThreadPaddleService = null;
+      }
       if (!mainThreadPaddleService) {
         try {
           ort.env.logLevel = 'error';
@@ -778,12 +822,12 @@ export async function runClientSideLocalOcrBatch(
           console.warn('[Main Thread ONNX Setup Warning]', envErr);
         }
 
-        if (!isProtobufValidHeader(detBuf) || !isProtobufValidHeader(recBuf)) {
+        if (!isProtobufValidHeader(detBuf) || !isProtobufValidHeader(recBuf) || !isBufferSizeMatchingVariant(detBuf, true, activeVariant) || !isBufferSizeMatchingVariant(recBuf, false, activeVariant)) {
           await downloadPaddleOcrModels((pct, msg) => {
             if (onProgress) onProgress(`[Main Thread Model Setup ${pct}%] ${msg}`);
-          });
-          detBuf = await getModelBufferDB('paddleocr_det');
-          recBuf = await getModelBufferDB('paddleocr_rec');
+          }, activeVariant);
+          detBuf = await getModelBufferDB(`paddleocr_det_${activeVariant}`);
+          recBuf = await getModelBufferDB(`paddleocr_rec_${activeVariant}`);
         }
 
         if (!detBuf || !recBuf || !isProtobufValidHeader(detBuf) || !isProtobufValidHeader(recBuf)) {
@@ -821,6 +865,7 @@ export async function runClientSideLocalOcrBatch(
         });
         try {
           await mainThreadPaddleService.initialize();
+          activeMainThreadVariant = activeVariant;
         } catch (initErr) {
           console.warn('[Main Thread PaddleOCR Init Attempt 1 Warning]', initErr);
           try {
@@ -852,8 +897,10 @@ export async function runClientSideLocalOcrBatch(
               processing: { engine: 'canvas-native' },
             });
             await mainThreadPaddleService.initialize();
+            activeMainThreadVariant = activeVariant;
           } catch (retryErr) {
             mainThreadPaddleService = null;
+            activeMainThreadVariant = null;
             throw retryErr;
           }
         }
@@ -912,7 +959,7 @@ export async function runClientSideLocalOcrBatch(
           if (!res) continue;
 
           const rawText = typeof res === 'string' ? res : res?.text || '';
-          const text = cleanOcrText(rawText);
+          const text = cleanOcrText(rawText, isLatinLanguage(sourceLang));
           if (text) {
             detectedItems.push({ timestamp: f.timestamp, text });
           }
@@ -931,7 +978,7 @@ export async function runClientSideLocalOcrBatch(
     console.warn('Failed to save raw_ocr_results to localStorage:', e);
   }
 
-  return processTemporalClusteringAndSnapping(detectedItems, inferredInterval, transitionTimestamps, minConfidence, sourceLang, targetLang);
+  return processTemporalClusteringAndSnapping(detectedItems, inferredInterval, transitionTimestamps, minConfidence, sourceLang, targetLang, activeVariant);
 }
 
 /**
@@ -944,6 +991,8 @@ export interface PersistentWorker {
   isBusy: boolean;
   inFlightCount: number;
   currentBatchTimestamps?: number[];
+  modelVariant?: 'small' | 'tiny';
+  configKey?: string;
 }
 
 // Global cache for initialized warm workers to prevent re-initializing ONNX sessions between scans
@@ -972,6 +1021,17 @@ export class StreamingOcrPool {
   private isExtractionFinished: boolean = false;
   private activeBackend: 'webgpu' | 'wasm' = 'wasm';
   private speedUpMode: boolean = false;
+  private modelVariant: 'small' | 'tiny' = 'small';
+  private ocrConfig: {
+    detDbBoxThresh: number;
+    detDbThresh: number;
+    detLimitSideLen: number;
+    maxTextLength: number;
+    dropScore: number;
+    paddleOcrLang: string;
+    cls: boolean;
+  };
+  private configKey: string;
   private frameMetadataMap: Map<number, { segStartTime?: number; segEndTime?: number }> = new Map();
 
   // Trick 1: Fast ROI Subtitle Hash / Pixel Diff state
@@ -982,9 +1042,6 @@ export class StreamingOcrPool {
   private pendingDuplicateFrames: Map<number, LocalFrameItem[]> = new Map(); // parentTimestamp -> childFrames[]
   private completedOcrResultsMap: Map<number, { text: string; timestamp: number; confidence?: number } | null> = new Map();
 
-  // Subtitle ROI Auto-Calibration State
-  private roiCalibrator: SubtitleRoiCalibrator = new SubtitleRoiCalibrator();
-  private hasLoggedRoiLock: boolean = false;
   private sourceLang: string = 'zh_cn';
   private targetLang: string = 'Tiếng Việt';
 
@@ -997,15 +1054,39 @@ export class StreamingOcrPool {
     sourceLang?: string;
     targetLang?: string;
     speedUpMode?: boolean;
+    paddleModelVariant?: 'small' | 'tiny';
+    ocrConfig?: {
+      detDbBoxThresh?: number;
+      detDbThresh?: number;
+      detLimitSideLen?: number;
+      maxTextLength?: number;
+      dropScore?: number;
+      paddleOcrLang?: string;
+      cls?: boolean;
+    };
     onProgress?: (msg: string) => void;
   }) {
+    const settings = getAppSettings();
     this.stepInterval = options?.stepInterval ?? 0.5;
     this.transitionTimestamps = options?.transitionTimestamps ?? [];
     this.minConfidence = options?.minConfidence ?? 0.70;
     this.sourceLang = options?.sourceLang ?? 'zh_cn';
     this.targetLang = options?.targetLang ?? 'Tiếng Việt';
     this.speedUpMode = options?.speedUpMode ?? false;
+    this.modelVariant = options?.paddleModelVariant || settings.paddleOcrModelVariant || 'small';
     this.onProgress = options?.onProgress;
+
+    const rawMaxLen = options?.ocrConfig?.maxTextLength ?? settings.maxTextLength ?? 25;
+    this.ocrConfig = {
+      detDbBoxThresh: options?.ocrConfig?.detDbBoxThresh ?? settings.detDbBoxThresh ?? 0.55,
+      detDbThresh: options?.ocrConfig?.detDbThresh ?? settings.detDbThresh ?? 0.30,
+      detLimitSideLen: options?.ocrConfig?.detLimitSideLen ?? settings.detLimitSideLen ?? (this.modelVariant === 'tiny' ? 960 : 1216),
+      maxTextLength: isLatinLanguage(this.sourceLang) ? Math.max(rawMaxLen, 64) : rawMaxLen,
+      dropScore: options?.ocrConfig?.dropScore ?? settings.dropScore ?? 0.78,
+      paddleOcrLang: options?.ocrConfig?.paddleOcrLang ?? settings.paddleOcrLang ?? 'ch',
+      cls: options?.ocrConfig?.cls ?? settings.cls ?? false,
+    };
+    this.configKey = `${this.modelVariant}|${this.ocrConfig.detDbBoxThresh}|${this.ocrConfig.detDbThresh}|${this.ocrConfig.detLimitSideLen}|${this.ocrConfig.maxTextLength}|${this.ocrConfig.dropScore}|${this.ocrConfig.paddleOcrLang}|${this.ocrConfig.cls}`;
 
     const logicalCores = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 4;
     // Unlocked CPU cores: scale up to 12 parallel Web Workers (8 cores -> 7 workers, 12-16 cores -> max 12 workers)
@@ -1101,50 +1182,69 @@ export class StreamingOcrPool {
   }
 
   public async init(): Promise<boolean> {
+    const activeVariant = this.modelVariant || 'small';
+    const variantLabel = activeVariant === 'tiny' ? 'Tiny' : 'Small';
+
     if (this.onProgress) {
-      this.onProgress(`⚡ Khởi tạo luồng xử lý song song Streaming OCR Pool (${this.poolSize} Workers)...`);
+      this.onProgress(`⚡ Khởi tạo luồng xử lý song song PP-OCRv6 ${variantLabel} (${this.poolSize} Workers)...`);
     }
 
-    // Try to reuse warm workers first
+    // Reuse ONLY warm workers whose modelVariant and configKey match; terminate mismatched warm workers
     let reusedCount = 0;
     const workersToUse: PersistentWorker[] = [];
+    const remainingWarm: PersistentWorker[] = [];
 
-    while (globalWarmWorkers.length > 0 && workersToUse.length < this.poolSize) {
+    while (globalWarmWorkers.length > 0) {
       const w = globalWarmWorkers.pop()!;
-      w.isBusy = false;
-      w.inFlightCount = 0;
-      w.currentBatchTimestamps = undefined;
-      workersToUse.push(w);
-      reusedCount++;
+      if (w.modelVariant === activeVariant && w.configKey === this.configKey && workersToUse.length < this.poolSize) {
+        w.isBusy = false;
+        w.inFlightCount = 0;
+        w.currentBatchTimestamps = undefined;
+        workersToUse.push(w);
+        reusedCount++;
+      } else if (w.modelVariant !== activeVariant || w.configKey !== this.configKey) {
+        try { w.worker.terminate(); } catch {}
+      } else {
+        remainingWarm.push(w);
+      }
+    }
+    while (remainingWarm.length > 0) {
+      globalWarmWorkers.push(remainingWarm.pop()!);
     }
 
     if (reusedCount > 0 && this.onProgress) {
-      this.onProgress(`⚡ Tái sử dụng ${reusedCount} luồng OCR ấm (sẵn sàng hoạt động)...`);
+      this.onProgress(`⚡ Tái sử dụng ${reusedCount} luồng OCR ${variantLabel} ấm (sẵn sàng hoạt động)...`);
     }
 
     await ensurePaddleOcrModelsLoaded((pct, msg) => {
       if (this.onProgress) {
-        this.onProgress(`[Tải Model Local OCR ${pct}%] ${msg}`);
+        this.onProgress(`[Tải Model ${variantLabel} ${pct}%] ${msg}`);
       }
-    });
+    }, activeVariant);
 
-    let detBuf = await getModelBufferDB('paddleocr_det');
-    let recBuf = await getModelBufferDB('paddleocr_rec');
-    let dictBuf = await getModelBufferDB('paddleocr_dict');
+    let detBuf = await getModelBufferDB(`paddleocr_det_${activeVariant}`);
+    let recBuf = await getModelBufferDB(`paddleocr_rec_${activeVariant}`);
+    let dictBuf = await getModelBufferDB(`paddleocr_dict_${activeVariant}`);
 
-    if (!isProtobufValidHeader(detBuf) || !isProtobufValidHeader(recBuf)) {
+    if (
+      !isProtobufValidHeader(detBuf) ||
+      !isProtobufValidHeader(recBuf) ||
+      !isBufferSizeMatchingVariant(detBuf, true, activeVariant) ||
+      !isBufferSizeMatchingVariant(recBuf, false, activeVariant)
+    ) {
       await downloadPaddleOcrModels((pct, msg) => {
         if (this.onProgress) {
-          this.onProgress(`[Tải Model Local OCR ${pct}%] ${msg}`);
+          this.onProgress(`[Tải Model ${variantLabel} ${pct}%] ${msg}`);
         }
-      });
-      detBuf = await getModelBufferDB('paddleocr_det');
-      recBuf = await getModelBufferDB('paddleocr_rec');
+      }, activeVariant);
+      detBuf = await getModelBufferDB(`paddleocr_det_${activeVariant}`);
+      recBuf = await getModelBufferDB(`paddleocr_rec_${activeVariant}`);
     }
 
-    if (!dictBuf || dictBuf.byteLength < 10) {
-      const fetchedDict = await fetchDictionaryFromCandidates();
-      if (fetchedDict && fetchedDict.byteLength > 10) {
+    if (!dictBuf || !isDictionaryMatchingVariant(dictBuf, activeVariant)) {
+      const fetchedDict = await fetchDictionaryFromCandidates(activeVariant);
+      if (fetchedDict && isDictionaryMatchingVariant(fetchedDict, activeVariant)) {
+        await storeModelBufferDB(`paddleocr_dict_${activeVariant}`, fetchedDict, `ppocrv6_${activeVariant}_dict.txt`);
         await storeModelBufferDB('paddleocr_dict', fetchedDict, 'dict.txt');
         dictBuf = fetchedDict;
       }
@@ -1161,7 +1261,6 @@ export class StreamingOcrPool {
         entry.worker.onmessage = (e: MessageEvent) => {
           this.handleWorkerMessage(entry, e);
         };
-        // Reused workers are already fully initialized
         resolve(true);
       });
       initPromises.push(p);
@@ -1174,7 +1273,15 @@ export class StreamingOcrPool {
       const p = new Promise<boolean>((resolve) => {
         try {
           const worker = new Worker(new URL('../workers/ocr.worker.ts', import.meta.url), { type: 'module' });
-          const entry: PersistentWorker = { id: workerId, worker, isBusy: false, inFlightCount: 0, currentBatchTimestamps: undefined };
+          const entry: PersistentWorker = {
+            id: workerId,
+            worker,
+            isBusy: false,
+            inFlightCount: 0,
+            currentBatchTimestamps: undefined,
+            modelVariant: activeVariant,
+            configKey: this.configKey,
+          };
           this.workers.push(entry);
 
           worker.onmessage = (e: MessageEvent) => {
@@ -1183,7 +1290,6 @@ export class StreamingOcrPool {
               if (e.data.executionProvider === 'webgpu') {
                 this.activeBackend = 'webgpu';
               }
-              // Switch to dynamic message handler once initialized
               worker.onmessage = (ev: MessageEvent) => {
                 this.handleWorkerMessage(entry, ev);
               };
@@ -1196,14 +1302,21 @@ export class StreamingOcrPool {
           const detCopy = detBuf ? detBuf.slice(0) : undefined;
           const recCopy = recBuf ? recBuf.slice(0) : undefined;
           const dictCopy = cleanDictBuf ? cleanDictBuf.slice(0) : undefined;
+          const transferables = [detCopy, recCopy, dictCopy].filter(Boolean) as Transferable[];
 
-          worker.postMessage({
-            type: 'INIT',
-            workerId,
-            detBuffer: detCopy,
-            recBuffer: recCopy,
-            dictBuffer: dictCopy,
-          });
+          worker.postMessage(
+            {
+              type: 'INIT',
+              workerId,
+              detBuffer: detCopy,
+              recBuffer: recCopy,
+              dictBuffer: dictCopy,
+              modelVariant: activeVariant,
+              ocrConfig: this.ocrConfig,
+              sourceLang: this.sourceLang,
+            },
+            transferables
+          );
         } catch (err) {
           console.warn(`[Streaming OCR Pool Worker #${workerId}] init error:`, err);
           resolve(false);
@@ -1295,8 +1408,9 @@ export class StreamingOcrPool {
     const busyWorkers = this.workers.filter((w) => w.inFlightCount > 0).length;
 
     const backendTag = this.activeBackend === 'webgpu' ? 'WebGPU' : 'WASM SIMD';
+    const variantTag = this.modelVariant === 'tiny' ? 'Tiny' : 'Small';
     const modeTag = this.speedUpMode ? '⚡ TĂNG TỐC 1 Sub/Frame' : 'Đa luồng Pool';
-    const msg = `🚀 [${modeTag} ${this.poolSize} luồng (${backendTag}) | Active: ${busyWorkers}/${this.poolSize}] Đang bóc OCR: ${completedCount}/${totalPushed} ${this.speedUpMode ? 'câu' : 'khung'} (${pct}%) ${this.speedUpMode ? '' : `| Bỏ qua trùng: ${this.skippedDuplicateCount} khung`}`;
+    const msg = `🚀 [${modeTag} • PP-OCRv6 ${variantTag} • ${this.poolSize} luồng (${backendTag}) | Active: ${busyWorkers}/${this.poolSize}] Đang bóc OCR: ${completedCount}/${totalPushed} ${this.speedUpMode ? 'câu' : 'khung'} (${pct}%) ${this.speedUpMode ? '' : `| Bỏ qua trùng: ${this.skippedDuplicateCount} khung`}`;
     this.latestProgressMessage = msg;
     if (this.onProgress) {
       this.onProgress(msg);
@@ -1460,7 +1574,8 @@ export class StreamingOcrPool {
       this.transitionTimestamps,
       this.minConfidence,
       this.sourceLang,
-      this.targetLang
+      this.targetLang,
+      this.modelVariant
     );
   }
 

@@ -75,24 +75,27 @@ export const ExtractionSettings: React.FC<ExtractionSettingsProps> = ({
     }
   };
 
+  const activePaddleVariant = appSettings?.paddleOcrModelVariant || 'small';
+  const activePaddleVariantLabel = activePaddleVariant === 'tiny' ? 'Tiny' : 'Small';
+
   const [paddleStatus, setPaddleStatus] = useState<PaddleOcrModelStatus | null>(null);
   const [isDownloadingPaddle, setIsDownloadingPaddle] = useState<boolean>(false);
   const [paddleProgressMsg, setPaddleProgressMsg] = useState<string>('');
 
   useEffect(() => {
     if (appSettings?.ocrEngine === 'paddleocr') {
-      checkPaddleOcrModelStatus().then((res) => setPaddleStatus(res)).catch(() => {});
+      checkPaddleOcrModelStatus(activePaddleVariant).then((res) => setPaddleStatus(res)).catch(() => {});
     }
-  }, [appSettings?.ocrEngine]);
+  }, [appSettings?.ocrEngine, activePaddleVariant]);
 
   const handleDownloadPaddle = async () => {
     setIsDownloadingPaddle(true);
-    setPaddleProgressMsg('Đang nạp model...');
-    const ok = await downloadPaddleOcrModels((pct, msg) => {
+    setPaddleProgressMsg(`Đang nạp model ${activePaddleVariantLabel}...`);
+    await downloadPaddleOcrModels((pct, msg) => {
       setPaddleProgressMsg(`${pct}% - ${msg}`);
-    });
+    }, activePaddleVariant);
     setIsDownloadingPaddle(false);
-    const updated = await checkPaddleOcrModelStatus();
+    const updated = await checkPaddleOcrModelStatus(activePaddleVariant);
     setPaddleStatus(updated);
   };
 
@@ -117,7 +120,7 @@ export const ExtractionSettings: React.FC<ExtractionSettingsProps> = ({
               <span className="font-bold text-amber-400 font-mono bg-amber-500/10 px-1.5 py-0.5 rounded border border-amber-500/20">
                 {appSettings?.ocrEngine === 'gemini_vision'
                   ? 'Gemini Vision AI (Trực tiếp)'
-                  : 'PaddleOCR Siêu Tốc (WebGPU / WASM SIMD)'}
+                  : `PaddleOCR PP-OCRv6 ${activePaddleVariantLabel} (WebGPU / WASM SIMD)`}
               </span>
               <span className="font-bold text-emerald-400 font-mono bg-emerald-500/10 px-1.5 py-0.5 rounded border border-emerald-500/20 flex items-center gap-1">
                 <span>⚡ Tăng Tốc WebGPU + Quét Thích Ứng (Adaptive Stepping)</span>
@@ -126,7 +129,7 @@ export const ExtractionSettings: React.FC<ExtractionSettingsProps> = ({
                 paddleStatus?.isReady ? (
                   <span className="text-[10px] text-emerald-300 bg-emerald-950/60 border border-emerald-500/30 px-1.5 py-0.5 rounded font-mono flex items-center gap-1">
                     <CheckCircle2 className="w-3 h-3 text-emerald-400" />
-                    Model ONNX Đã Sẵn Sàng
+                    PP-OCRv6 {activePaddleVariantLabel} Đã Sẵn Sàng
                   </span>
                 ) : (
                   <button
@@ -142,7 +145,7 @@ export const ExtractionSettings: React.FC<ExtractionSettingsProps> = ({
                     ) : (
                       <>
                         <DownloadCloud className="w-3 h-3 text-amber-400" />
-                        <span>Tải Model PaddleOCR Ngay</span>
+                        <span>Tải Model PP-OCRv6 {activePaddleVariantLabel} Ngay</span>
                       </>
                     )}
                   </button>

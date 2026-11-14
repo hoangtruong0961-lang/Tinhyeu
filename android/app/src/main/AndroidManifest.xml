@@ -10,6 +10,7 @@
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="true"
         android:hardwareAccelerated="true"
+        android:extractNativeLibs="true"
         android:largeHeap="true">
 
         <activity

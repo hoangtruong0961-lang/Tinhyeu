@@ -1,4 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
+import { Capacitor } from '@capacitor/core';
 import {
   ChevronDown,
   SlidersHorizontal,
@@ -17,6 +18,11 @@ import {
   ExportFrameRate,
   ExportBitrate,
 } from '../types';
+import {
+  computeExportDimensions,
+  getSupportedFormatsForEngine,
+  normalizeExportFormat,
+} from '../utils/exportResolution';
 
 interface TopExportSettingsDropdownProps {
   settings: ExportSettingsConfig;
@@ -37,6 +43,9 @@ export const TopExportSettingsDropdown: React.FC<TopExportSettingsDropdownProps>
 }) => {
   const [internalIsOpen, setInternalIsOpen] = useState<boolean>(false);
   const isPanelOpen = controlledIsOpen !== undefined ? controlledIsOpen : internalIsOpen;
+
+  const isElectron = typeof window !== 'undefined' && Boolean(window.electronAPI?.isElectron);
+  const isNativeAndroid = Capacitor.isNativePlatform() && Capacitor.getPlatform() === 'android';
 
   const toggleOpen = () => {
     if (onToggleOpen) {
@@ -77,38 +86,83 @@ export const TopExportSettingsDropdown: React.FC<TopExportSettingsDropdownProps>
     key: K,
     val: ExportSettingsConfig[K]
   ) => {
+    if (key === 'engine') {
+      const nextEngine = val as ExportEngine;
+      const normalizedFormat = normalizeExportFormat(nextEngine, settings.format);
+      onChangeSettings({
+        ...settings,
+        engine: nextEngine,
+        format: normalizedFormat,
+      });
+      return;
+    }
     onChangeSettings({
       ...settings,
       [key]: val,
     });
   };
 
-  const engines: { id: ExportEngine; label: string; sub: string; badge?: string }[] = [
-    { id: 'mediabunny', label: 'Mediabunny', sub: 'WebCodecs GPU MP4', badge: 'Khuyên dùng' },
-    { id: 'ffmpeg_wasm', label: 'FFmpeg Wasm', sub: 'WebAssembly in Browser', badge: 'WASM' },
-    { id: 'ffmpeg_native', label: 'FFmpeg Native', sub: 'Desktop C/C++ GPU', badge: 'Desktop' },
-    { id: 'ffmpeg_mobile', label: 'FFmpeg Mobile', sub: 'Android ARM64 Native', badge: 'Mobile' },
-    { id: 'mediarecorder', label: 'MediaRecoder', sub: 'HTML5 MediaStream', badge: 'Fallback' },
+  const allEngines: { id: ExportEngine; label: string; sub: string; available: boolean }[] = [
+    {
+      id: 'ffmpeg_mobile',
+      label: 'FFmpeg Mobile',
+      sub: 'Android ARM64 Native + MediaCodec',
+      available: isNativeAndroid,
+    },
+    {
+      id: 'ffmpeg_native',
+      label: 'FFmpeg Native',
+      sub: 'Desktop C/C++ GPU/CPU',
+      available: isElectron,
+    },
+    {
+      id: 'mediabunny',
+      label: 'Mediabunny',
+      sub: 'WebCodecs Hardware Engine',
+      available: true,
+    },
+    {
+      id: 'mediarecorder',
+      label: 'MediaRecorder',
+      sub: 'HTML5 MediaStream Fallback',
+      available: true,
+    },
   ];
+  const engines = allEngines.filter((e) => e.available);
 
-  const formats: { id: ExportVideoFormat; label: string; desc: string }[] = [
+  const effectiveEngine: ExportEngine =
+    engines.find((e) => e.id === settings.engine)?.id || engines[0].id;
+
+  const supportedFormats = getSupportedFormatsForEngine(effectiveEngine);
+  const effectiveFormat = normalizeExportFormat(effectiveEngine, settings.format);
+
+  const allFormats: { id: ExportVideoFormat; label: string; desc: string }[] = [
     { id: 'mp4', label: 'MP4', desc: 'H.264 / AAC (Khuyên dùng)' },
     { id: 'webm', label: 'WebM', desc: 'VP9 / Opus (Mã nguồn mở)' },
-    { id: 'mov', label: 'MOV', desc: 'QuickTime ProRes' },
-    { id: 'mkv', label: 'MKV', desc: 'Matroska' },
+    { id: 'mov', label: 'MOV', desc: 'QuickTime (H.264 / AAC)' },
+    { id: 'mkv', label: 'MKV', desc: 'Matroska (H.264 / AAC)' },
   ];
+  const formats = allFormats.filter((f) => supportedFormats.includes(f.id));
+
+  const formatDimText = (res: ExportResolution, fallback: string) => {
+    const dims = computeExportDimensions(res, videoDimensions?.width, videoDimensions?.height);
+    if (dims) return `${dims.width} × ${dims.height}`;
+    return fallback;
+  };
 
   const resolutions: { id: ExportResolution; label: string; desc: string }[] = [
     {
       id: 'original',
       label: 'Độ phân giải gốc',
-      desc: videoDimensions ? `${videoDimensions.width} × ${videoDimensions.height} (Khuyến nghị)` : 'Theo video nguồn (Khuyến nghị)',
+      desc: videoDimensions
+        ? `${videoDimensions.width} × ${videoDimensions.height} (Khuyến nghị)`
+        : 'Theo video nguồn (Khuyến nghị)',
     },
-    { id: '4k', label: '4K Ultra HD', desc: '3840 × 2160' },
-    { id: '2k', label: '2K Quad HD', desc: '2560 × 1440' },
-    { id: '1080p', label: 'Full HD 1080p', desc: '1920 × 1080' },
-    { id: '720p', label: 'HD 720p', desc: '1280 × 720' },
-    { id: '480p', label: 'SD 480p', desc: '854 × 480' },
+    { id: '4k', label: '4K Ultra HD', desc: formatDimText('4k', '3840 × 2160') },
+    { id: '2k', label: '2K Quad HD', desc: formatDimText('2k', '2560 × 1440') },
+    { id: '1080p', label: 'Full HD 1080p', desc: formatDimText('1080p', '1920 × 1080') },
+    { id: '720p', label: 'HD 720p', desc: formatDimText('720p', '1280 × 720') },
+    { id: '480p', label: 'SD 480p', desc: formatDimText('480p', '854 × 480') },
   ];
 
   const frameRates: { id: ExportFrameRate; label: string; desc: string }[] = [
@@ -129,11 +183,16 @@ export const TopExportSettingsDropdown: React.FC<TopExportSettingsDropdownProps>
     { id: 2000000, label: '2 Mbps', desc: 'Tiết kiệm dung lượng (Nhanh)' },
   ];
 
-  const currentEngineObj = engines.find((e) => e.id === settings.engine) || engines[0];
+  const currentEngineObj = engines.find((e) => e.id === effectiveEngine) || engines[0];
+  const gpuTechLabel = isNativeAndroid
+    ? 'Android MediaCodec / WebCodecs'
+    : isElectron
+    ? 'NVENC / QSV / VideoToolbox'
+    : 'WebCodecs Hardware / WebGL2';
 
   return (
     <div className="inline-block" ref={dropdownRef}>
-      {/* 1. KÉO XUỐNG BUTTON (Đồng bộ với các nút top bar) */}
+      {/* 1. KÉO XUỐNG BUTTON */}
       <button
         type="button"
         onClick={toggleOpen}
@@ -156,13 +215,11 @@ export const TopExportSettingsDropdown: React.FC<TopExportSettingsDropdownProps>
       {/* 2. PANEL ĐƯỢC KÉO XUỐNG HIỂN THỊ TÙY CHỌN */}
       {isPanelOpen && (
         <>
-          {/* Backdrop */}
           <div
             className="fixed inset-0 bg-black/60 z-[95] backdrop-blur-[1px] animate-in fade-in duration-150"
             onClick={closePanel}
           />
 
-          {/* Panel tùy chọn - Tông màu tối đồng bộ với Editor */}
           <div className="absolute top-full left-2 right-2 sm:left-auto sm:right-3 mt-1.5 z-[100] sm:w-[390px] max-w-[calc(100%-16px)] bg-[#18181d] border border-zinc-800 rounded-2xl shadow-2xl p-4 text-zinc-200 animate-in fade-in slide-in-from-top-1 duration-150">
             {/* Header */}
             <div className="flex items-center justify-between pb-3 border-b border-zinc-800/90 mb-3.5">
@@ -202,7 +259,7 @@ export const TopExportSettingsDropdown: React.FC<TopExportSettingsDropdownProps>
                   </span>
                 </div>
                 <select
-                  value={settings.engine}
+                  value={effectiveEngine}
                   onChange={(e) => updateSetting('engine', e.target.value as ExportEngine)}
                   className="w-full bg-[#202026] border border-zinc-800/80 rounded-xl px-3 py-2 text-xs text-zinc-200 focus:outline-none focus:border-zinc-600 cursor-pointer"
                 >
@@ -222,11 +279,11 @@ export const TopExportSettingsDropdown: React.FC<TopExportSettingsDropdownProps>
                     <span>Định dạng tệp</span>
                   </label>
                   <span className="text-[10.5px] font-mono text-zinc-400 uppercase font-medium">
-                    .{settings.format}
+                    .{effectiveFormat}
                   </span>
                 </div>
                 <select
-                  value={settings.format}
+                  value={effectiveFormat}
                   onChange={(e) => updateSetting('format', e.target.value as ExportVideoFormat)}
                   className="w-full bg-[#202026] border border-zinc-800/80 rounded-xl px-3 py-2 text-xs text-zinc-200 focus:outline-none focus:border-zinc-600 cursor-pointer"
                 >
@@ -320,7 +377,7 @@ export const TopExportSettingsDropdown: React.FC<TopExportSettingsDropdownProps>
                 </select>
               </div>
 
-              {/* 6. GPU HARDWARE ACCELERATION TOGGLE */}
+              {/* 6. HARDWARE ACCELERATION TOGGLE */}
               <div className="pt-2 border-t border-zinc-800/60">
                 <div className="flex items-center justify-between p-2.5 rounded-xl bg-[#202026] border border-zinc-800/80">
                   <div className="flex items-center gap-2">
@@ -329,10 +386,10 @@ export const TopExportSettingsDropdown: React.FC<TopExportSettingsDropdownProps>
                     </div>
                     <div>
                       <div className="text-[11px] font-medium text-zinc-200 flex items-center gap-1.5">
-                        <span>GPU Acceleration</span>
-                        <span className="text-[9.5px] px-1.5 py-0.2 rounded bg-amber-500/15 text-amber-300 font-mono">Tăng tốc 3-5X</span>
+                        <span>Hardware Encode</span>
+                        <span className="text-[9.5px] px-1.5 py-0.2 rounded bg-amber-500/15 text-amber-300 font-mono">GPU Chip</span>
                       </div>
-                      <div className="text-[10px] text-zinc-400">WebGL / WebGPU / NVENC</div>
+                      <div className="text-[10px] text-zinc-400">{gpuTechLabel}</div>
                     </div>
                   </div>
                   <button
@@ -357,7 +414,7 @@ export const TopExportSettingsDropdown: React.FC<TopExportSettingsDropdownProps>
               <div className="flex items-center gap-1.5 text-[10.5px] text-zinc-400 truncate max-w-[230px]">
                 <Check className="w-3.5 h-3.5 text-zinc-300 shrink-0" />
                 <span className="truncate">
-                  {currentEngineObj.label} • {settings.format.toUpperCase()} •{' '}
+                  {currentEngineObj.label} • {effectiveFormat.toUpperCase()} •{' '}
                   {settings.resolution === 'original' ? 'Gốc' : settings.resolution} •{' '}
                   {settings.frameRate === 'original' ? 'FPS gốc' : `${settings.frameRate}fps`}
                 </span>

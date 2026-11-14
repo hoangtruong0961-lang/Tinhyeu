@@ -105,7 +105,7 @@ interface CapCutBottomBarProps {
   // Extract actions
   onExtractSingleFrame: () => void;
   isExtractingSingle: boolean;
-  onStartFullScan: (startTime: number, endTime: number, interval: number, customContext: string, speedUpMode?: boolean) => void;
+  onStartFullScan: (startTime: number, endTime: number, interval: number, customContext: string, speedUpMode?: boolean, sourceLangOverride?: string) => void;
   scanProgress: OCRScanProgress;
   onCancelScan: () => void;
   videoDuration: number;
@@ -126,7 +126,7 @@ interface CapCutBottomBarProps {
   onSelectTargetLang: (lang: string) => void;
   selectedModel: GeminiModelOption;
   onSelectModel: (model: GeminiModelOption) => void;
-  onReTranslateAll: (overrideModel?: GeminiModelOption, optimizeForTts?: boolean, customContext?: string) => void;
+  onReTranslateAll: (overrideModel?: GeminiModelOption, optimizeForTts?: boolean, customContext?: string, avoidTikTokPolicy?: boolean) => void;
   isTranslatingBatch: boolean;
   translationProgressMsg?: string;
   // Audio TTS actions
@@ -281,6 +281,12 @@ export const CapCutBottomBar: React.FC<CapCutBottomBarProps> = ({
     if (appSettings?.ocrInterval) return appSettings.ocrInterval;
     return videoDuration > 300 ? 0.8 : 0.6;
   });
+
+  useEffect(() => {
+    if (typeof appSettings?.ocrInterval === 'number' && appSettings.ocrInterval > 0) {
+      setScanInterval(appSettings.ocrInterval);
+    }
+  }, [appSettings?.ocrInterval]);
   const [contextPrompt, setContextPrompt] = useState<string>(customContext || '');
   const [showTranslationContext, setShowTranslationContext] = useState<boolean>(false);
 
@@ -1049,22 +1055,37 @@ export const CapCutBottomBar: React.FC<CapCutBottomBarProps> = ({
 
   // Bottom Sheet animation & collapse/expand state ("Ngạch Ngang" handle bar)
   const [isSheetCollapsed, setIsSheetCollapsed] = useState<boolean>(false);
-  const [sourceLang, setSourceLang] = useState<string>('Tiếng Trung');
-  const [ocrMode, setOcrMode] = useState<'fast' | 'deep'>('fast');
-  const [isOcrModeExpanded, setIsOcrModeExpanded] = useState<boolean>(false);
-  const [isOcrFilterExpanded, setIsOcrFilterExpanded] = useState<boolean>(false);
+  const OCR_SOURCE_LANG_OPTIONS = React.useMemo(() => [
+    { code: 'zh_cn', label: 'Tiếng Trung' },
+    { code: 'en', label: 'Tiếng Anh' },
+    { code: 'ko', label: 'Tiếng Hàn' },
+    { code: 'ja', label: 'Tiếng Nhật' },
+    { code: 'vi', label: 'Tiếng Việt' },
+    { code: 'auto', label: 'Tự động phát hiện AI' },
+  ], []);
+
+  const mapCodeToSourceLangLabel = (code?: string): string => {
+    const found = OCR_SOURCE_LANG_OPTIONS.find((item) => item.code === code);
+    if (found) return found.label;
+    if (code === 'zh' || code === 'zh_tw') return 'Tiếng Trung';
+    return 'Tiếng Trung';
+  };
+
+  const mapSourceLangLabelToCode = (label: string): string => {
+    const found = OCR_SOURCE_LANG_OPTIONS.find((item) => item.label === label);
+    return found ? found.code : 'zh_cn';
+  };
+
+  const [sourceLang, setSourceLang] = useState<string>(() => mapCodeToSourceLangLabel(appSettings?.sourceLang));
   const [isOcrLangExpanded, setIsOcrLangExpanded] = useState<boolean>(false);
   const [showOcrHelpModal, setShowOcrHelpModal] = useState<boolean>(false);
-  const [filterStrength, setFilterStrength] = useState<string>(
-    appSettings?.bgFilterStrength !== undefined ? `${appSettings.bgFilterStrength}%` : '70%'
-  );
 
   React.useEffect(() => {
-    if (typeof appSettings?.bgFilterStrength === 'number') {
-      const target = `${appSettings.bgFilterStrength}%`;
-      setFilterStrength((prev) => (prev !== target ? target : prev));
+    if (appSettings?.sourceLang) {
+      setSourceLang(mapCodeToSourceLangLabel(appSettings.sourceLang));
     }
-  }, [appSettings?.bgFilterStrength]);
+  }, [appSettings?.sourceLang]);
+
   const isAiRefineActive = appSettings?.autoAiRefine !== false;
   const isAdaptiveSamplingActive = appSettings?.adaptiveSampling !== false;
   const [isSpeedUpActive, setIsSpeedUpActive] = useState<boolean>(false);
@@ -1442,22 +1463,27 @@ export const CapCutBottomBar: React.FC<CapCutBottomBarProps> = ({
                             <ChevronDown className={`w-4 h-4 text-zinc-400 transition-transform ${isOcrLangExpanded ? 'rotate-180' : ''}`} />
                           </button>
 
+                          {(mapSourceLangLabelToCode(sourceLang) === 'vi' || mapSourceLangLabelToCode(sourceLang) === 'ja' || mapSourceLangLabelToCode(sourceLang) === 'ko' || mapSourceLangLabelToCode(sourceLang) === 'auto') && appSettings?.ocrEngine !== 'gemini_vision' && (
+                            <div className="mt-2 text-[11px] text-sky-300/90 bg-sky-950/40 border border-sky-500/25 rounded-xl px-2.5 py-1.5">
+                              Sẽ tự động chuyển sang AI Vision để nhận diện chính xác bộ ký tự/dấu của ngôn ngữ này.
+                            </div>
+                          )}
+
                           {isOcrLangExpanded && (
                             <div className="mt-2.5 pt-2.5 border-t border-zinc-800/80 grid grid-cols-2 gap-1.5">
-                              {[
-                                { label: 'Tiếng Trung', full: 'Tiếng Trung (Trung Quốc)' },
-                                { label: 'Tiếng Anh', full: 'Tiếng Anh (English)' },
-                                { label: 'Tiếng Hàn', full: 'Tiếng Hàn (Korean)' },
-                                { label: 'Tiếng Nhật', full: 'Tiếng Nhật (Japanese)' },
-                                { label: 'Tiếng Việt', full: 'Tiếng Việt' },
-                                { label: 'Tự động phát hiện AI', full: 'Tự động phát hiện AI' },
-                              ].map((item) => (
+                              {OCR_SOURCE_LANG_OPTIONS.map((item) => (
                                 <button
-                                  key={item.label}
+                                  key={item.code}
                                   type="button"
                                   onClick={() => {
                                     setSourceLang(item.label);
                                     setIsOcrLangExpanded(false);
+                                    if (onSaveSettings) {
+                                      onSaveSettings({
+                                        ...appSettings,
+                                        sourceLang: item.code,
+                                      });
+                                    }
                                   }}
                                   className={`py-1.5 px-2.5 rounded-xl text-xs font-semibold text-left transition border cursor-pointer ${
                                     sourceLang === item.label
@@ -1470,6 +1496,40 @@ export const CapCutBottomBar: React.FC<CapCutBottomBarProps> = ({
                               ))}
                             </div>
                           )}
+                        </div>
+
+                        {/* Card 1B: Tần suất quét khung hình */}
+                        <div className="bg-[#212124] border border-[#2d2d33] rounded-2xl p-3 flex items-center justify-between gap-2">
+                          <div className="flex flex-col">
+                            <span className="text-sm font-bold text-white">Tần suất lấy mẫu</span>
+                            <span className="text-[11px] text-zinc-400 mt-0.5">
+                              Nhỏ hơn bắt câu nhanh tốt hơn, lớn hơn quét nhanh hơn
+                            </span>
+                          </div>
+                          <div className="flex items-center gap-1 shrink-0">
+                            {[0.3, 0.5, 0.7, 1.0, 1.5].map((iv) => (
+                              <button
+                                key={iv}
+                                type="button"
+                                onClick={() => {
+                                  setScanInterval(iv);
+                                  if (onSaveSettings) {
+                                    onSaveSettings({
+                                      ...appSettings,
+                                      ocrInterval: iv,
+                                    });
+                                  }
+                                }}
+                                className={`px-2 py-1 rounded-lg text-[11px] font-mono font-bold border transition cursor-pointer ${
+                                  Math.abs(scanInterval - iv) < 0.05
+                                    ? 'bg-[#162738] border-[#00a2ff] text-[#00a2ff]'
+                                    : 'bg-[#18181b] border-zinc-800 text-zinc-400 hover:text-zinc-200'
+                                }`}
+                              >
+                                {iv}s
+                              </button>
+                            ))}
+                          </div>
                         </div>
 
                         {/* Card 2: Tăng tốc */}
@@ -1515,7 +1575,7 @@ export const CapCutBottomBar: React.FC<CapCutBottomBarProps> = ({
                         <div className="pt-0.5">
                           <button
                             type="button"
-                            onClick={() => onStartFullScan(0, Math.ceil(videoDuration) || 60, scanInterval, contextPrompt, isSpeedUpActive)}
+                            onClick={() => onStartFullScan(0, Math.ceil(videoDuration) || 60, scanInterval, contextPrompt, isSpeedUpActive, mapSourceLangLabelToCode(sourceLang))}
                             className="w-full py-3 bg-[#00a2ff] hover:bg-[#0091e6] active:scale-[0.99] text-white font-bold text-sm tracking-wider uppercase rounded-2xl shadow-lg shadow-sky-500/20 transition-all flex items-center justify-center cursor-pointer"
                           >
                             BẮT ĐẦU BÓC TÁCH
@@ -1773,7 +1833,9 @@ export const CapCutBottomBar: React.FC<CapCutBottomBarProps> = ({
                   {/* Card 1: Engine dịch thuật */}
                   <div className="bg-[#212124] border border-[#2d2d33] rounded-2xl p-3 transition">
                     <div className="flex flex-col">
-                      <span className="text-xs text-zinc-400 font-normal">Engine dịch thuật</span>
+                      <span className="text-xs text-zinc-400 font-normal">
+                        Engine dịch thuật {appSettings.apiMode === 'groq' ? '(Groq AI)' : appSettings.apiMode === 'proxy' ? '(Proxy)' : ''}
+                      </span>
                       <div className="relative flex items-center mt-0.5">
                         <select
                           value={appSettings.apiMode === 'proxy' ? (appSettings.proxyTargetModel || appSettings.customModelName || selectedModel) : selectedModel}
@@ -1792,14 +1854,13 @@ export const CapCutBottomBar: React.FC<CapCutBottomBarProps> = ({
                           }}
                           className="w-full bg-transparent text-sm font-semibold text-white focus:outline-none appearance-none pr-6 cursor-pointer"
                         >
-                          <option value="gemini-2.5-flash" className="bg-[#1c1c21] text-white">Gemini_API</option>
-                          <option value="GEMINI_WEB" className="bg-[#1c1c21] text-white">Gemini_Web</option>
-                          <option value="gemini-2.5-flash" className="bg-[#1c1c21] text-white">gemini-2.5-flash</option>
-                          <option value="gemini-2.5-pro" className="bg-[#1c1c21] text-white">gemini-2.5-pro</option>
-                          <option value="gemini-2.0-flash" className="bg-[#1c1c21] text-white">gemini-2.0-flash</option>
-                          <option value="gemini-1.5-flash" className="bg-[#1c1c21] text-white">gemini-1.5-flash</option>
-                          <option value="gemini-3.6-flash" className="bg-[#1c1c21] text-white">gemini-3.6-flash</option>
-                          <option value="gemini-3.1-pro-preview" className="bg-[#1c1c21] text-white">gemini-3.1-pro-preview</option>
+                          <option value="gemini-2.5-flash" className="bg-[#1c1c21] text-white">Gemini 2.5 Flash (Nhanh & Cân bằng)</option>
+                          <option value="gemini-2.5-pro" className="bg-[#1c1c21] text-white">Gemini 2.5 Pro (Dịch sâu & Mượt)</option>
+                          <option value="gemini-3.6-flash" className="bg-[#1c1c21] text-white">Gemini 3.6 Flash</option>
+                          <option value="gemini-3.1-pro-preview" className="bg-[#1c1c21] text-white">Gemini 3.1 Pro Preview</option>
+                          <option value="gemini-2.0-flash" className="bg-[#1c1c21] text-white">Gemini 2.0 Flash</option>
+                          <option value="gemini-1.5-flash" className="bg-[#1c1c21] text-white">Gemini 1.5 Flash</option>
+                          <option value="GEMINI_WEB" className="bg-[#1c1c21] text-white">Gemini Web (Cookie Google)</option>
                         </select>
                         <ChevronDown className="w-4 h-4 text-zinc-400 absolute right-0 pointer-events-none" />
                       </div>
@@ -1812,7 +1873,7 @@ export const CapCutBottomBar: React.FC<CapCutBottomBarProps> = ({
                       <span className="text-xs text-zinc-400 font-normal">Dịch sang ngôn ngữ</span>
                       <div className="relative flex items-center mt-0.5">
                         <select
-                          value={targetLang}
+                          value={targetLang === 'Vietnamese' ? 'Tiếng Việt' : targetLang}
                           onChange={(e) => {
                             const newLang = e.target.value;
                             onSelectTargetLang(newLang);
@@ -1820,7 +1881,6 @@ export const CapCutBottomBar: React.FC<CapCutBottomBarProps> = ({
                           }}
                           className="w-full bg-transparent text-sm font-semibold text-white focus:outline-none appearance-none pr-6 cursor-pointer"
                         >
-                          <option value="Vietnamese" className="bg-[#1c1c21] text-white">Vietnamese</option>
                           <option value="Tiếng Việt" className="bg-[#1c1c21] text-white">Tiếng Việt</option>
                           <option value="English" className="bg-[#1c1c21] text-white">English</option>
                           <option value="Tiếng Trung" className="bg-[#1c1c21] text-white">Tiếng Trung</option>
@@ -1839,13 +1899,13 @@ export const CapCutBottomBar: React.FC<CapCutBottomBarProps> = ({
                     <div className="flex flex-col pr-3">
                       <span className="text-sm font-semibold text-white">Tối ưu cho thuyết minh (TTS)</span>
                       <span className="text-[11px] text-zinc-400 mt-0.5">
-                        Rút gọn câu dịch khớp tốc độ đọc giọng nói
+                        Bật: Cân đối độ dài khớp nhịp nói & rà soát câu quá tải • Tắt: Dịch đủ ý nguyên bản
                       </span>
                     </div>
                     <button
                       type="button"
                       onClick={() => setOptimizeForTts(!optimizeForTts)}
-                      className={`w-12 h-6 rounded-full transition-colors relative cursor-pointer ${
+                      className={`w-12 h-6 rounded-full transition-colors relative cursor-pointer shrink-0 ${
                         optimizeForTts ? 'bg-[#00a2ff]' : 'bg-[#3a3a40]'
                       }`}
                     >
@@ -1862,13 +1922,13 @@ export const CapCutBottomBar: React.FC<CapCutBottomBarProps> = ({
                     <div className="flex flex-col pr-3">
                       <span className="text-sm font-semibold text-white">Tránh vi phạm chính sách TikTok</span>
                       <span className="text-[11px] text-zinc-400 mt-0.5">
-                        Dịch nguyên văn, không lọc từ nhạy cảm
+                        Bật: Làm mềm từ nhạy cảm • Tắt: Dịch nguyên văn không lọc
                       </span>
                     </div>
                     <button
                       type="button"
                       onClick={() => setTiktokFilterOff(!tiktokFilterOff)}
-                      className={`w-12 h-6 rounded-full transition-colors relative cursor-pointer ${
+                      className={`w-12 h-6 rounded-full transition-colors relative cursor-pointer shrink-0 ${
                         tiktokFilterOff ? 'bg-[#00a2ff]' : 'bg-[#3a3a40]'
                       }`}
                     >
@@ -1880,11 +1940,23 @@ export const CapCutBottomBar: React.FC<CapCutBottomBarProps> = ({
                     </button>
                   </div>
 
+                  {/* Card 5: Ghi chú bối cảnh / nhân vật (tùy chọn) */}
+                  <div className="bg-[#212124] border border-[#2d2d33] rounded-2xl p-2.5">
+                    <span className="text-[11px] text-zinc-400 font-normal block mb-1">Ghi chú bối cảnh / xưng hô (tùy chọn)</span>
+                    <input
+                      type="text"
+                      value={contextPrompt}
+                      onChange={(e) => setContextPrompt(e.target.value)}
+                      placeholder="VD: Phim cổ trang tiên hiệp, nam chính gọi sư phụ..."
+                      className="w-full bg-[#18181b] border border-[#303038] rounded-xl px-2.5 py-1.5 text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-[#00a2ff]"
+                    />
+                  </div>
+
                   {/* Action Button: BẮT ĐẦU DỊCH */}
                   <div className="pt-0.5">
                     <button
                       type="button"
-                      onClick={() => onReTranslateAll(selectedModel, optimizeForTts, contextPrompt)}
+                      onClick={() => onReTranslateAll(selectedModel, optimizeForTts, contextPrompt, tiktokFilterOff)}
                       disabled={isTranslatingBatch || subtitles.length === 0}
                       className={`w-full py-3 font-bold text-sm tracking-wider uppercase rounded-2xl shadow-lg transition-all flex items-center justify-center ${
                         subtitles.length > 0 && !isTranslatingBatch

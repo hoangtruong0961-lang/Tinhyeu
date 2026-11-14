@@ -1,11 +1,11 @@
-import { SubtitleItem, SubtitleStyleConfig, BlurOverlay, LogoOverlay, TextOverlay, AudioEffectType } from '../types';
-import { wrapSubtitleText } from './srtParser';
+import { SubtitleItem, SubtitleStyleConfig, BlurOverlay, LogoOverlay, TextOverlay, AudioEffectType, ExportVideoFormat, ExportResolution } from '../types';
 import { generateVoiceoverAudioBuffer } from './audioExporter';
 import { applyAudioEffectChain } from './audioEffects';
-import { createFile as createMp4BoxFile, DataStream } from 'mp4box';
+import { createFile as createMp4BoxFile } from 'mp4box';
 import fixWebmDuration from 'fix-webm-duration';
 import { loadAllSavedCustomFonts, getSavedCustomFonts } from './fontStorage';
 import { renderCompositedFrame } from './canvasRenderer';
+import { computeExportDimensions, getMimeTypeForFormat, toEvenDimension } from './exportResolution';
 import {
   Input,
   ALL_FORMATS,
@@ -13,6 +13,9 @@ import {
   BufferTarget,
   Output,
   Mp4OutputFormat,
+  WebMOutputFormat,
+  MovOutputFormat,
+  MkvOutputFormat,
   CanvasSink,
   CanvasSource,
   AudioBufferSource,
@@ -322,7 +325,8 @@ export function drawSubtitleOverlay(
   blurOverlays: BlurOverlay[] = [],
   logoOverlays: LogoOverlay[] = [],
   textOverlays: TextOverlay[] = [],
-  logoBitmaps: Record<string, HTMLImageElement | ImageBitmap> = {}
+  logoBitmaps: Record<string, HTMLImageElement | ImageBitmap> = {},
+  gpuAcceleration?: boolean
 ) {
   renderCompositedFrame(ctx, {
     videoSource: video,
@@ -335,12 +339,13 @@ export function drawSubtitleOverlay(
     logoOverlays,
     textOverlays,
     logoBitmaps,
+    gpuAcceleration,
   });
 }
 
 /**
- * Renders video with subtitles using Mediabunny CanvasSink, CanvasSource, AudioBufferSource, and Mp4OutputFormat.
- * Guarantees zero tearing, perfect PTS/DTS sync, and hardware-accelerated encoding with fallback.
+ * Renders video with subtitles using Mediabunny CanvasSink, CanvasSource, AudioBufferSource, and requested container format.
+ * Guarantees zero tearing, real FPS resampling, aspect-preserving scaling, and hardware-accelerated encoding with fallback.
  */
 export async function renderWithMp4Muxer(
   videoUrl: string,
@@ -356,12 +361,15 @@ export async function renderWithMp4Muxer(
     ttsPitch?: number;
     videoVolume?: number;
     videoAudioEffect?: AudioEffectType;
+    format?: ExportVideoFormat;
+    resolution?: ExportResolution;
     targetWidth?: number;
     targetHeight?: number;
     fps?: number;
     bitrate?: number;
     videoDuration?: number;
     knownDuration?: number;
+    gpuAcceleration?: boolean;
   } = {},
   preferSoftware = false
 ): Promise<Blob> {
@@ -440,11 +448,11 @@ export async function renderWithMp4Muxer(
 
   const totalEstimatedFrames = Math.max(1, Math.round(duration * videoFps));
 
-  const toEven = (val: number) => Math.max(2, Math.floor(val / 2) * 2);
   const trackWidth = videoTrack.displayWidth || videoTrack.codedWidth || 1280;
   const trackHeight = videoTrack.displayHeight || videoTrack.codedHeight || 720;
-  const vWidth = toEven(options.targetWidth || trackWidth);
-  const vHeight = toEven(options.targetHeight || trackHeight);
+  const resolvedDims = computeExportDimensions(options.resolution, trackWidth, trackHeight);
+  const vWidth = resolvedDims?.width || toEvenDimension(options.targetWidth || trackWidth);
+  const vHeight = resolvedDims?.height || toEvenDimension(options.targetHeight || trackHeight);
 
   // 4. Decode Original Audio (if present)
   let originalAudioBuffer: AudioBuffer | null = null;
@@ -485,17 +493,30 @@ export async function renderWithMp4Muxer(
     audioBuffer = await adjustAudioBufferVolume(originalAudioBuffer, videoVolume, duration, videoAudioEffect);
   }
 
+  const outFmt: ExportVideoFormat = options.format || 'mp4';
+
   onProgress({
     percentage: 0,
     currentTime: 0,
     duration,
-    status: 'Khởi tạo bộ giải mã phần cứng WebCodecs GPU...',
+    status: preferSoftware
+      ? `Khởi tạo Software Encoder (CPU) • ${vWidth}×${vHeight}...`
+      : `Khởi tạo WebCodecs Hardware Encoder • ${vWidth}×${vHeight}...`,
   });
 
-  // 6. Setup Mediabunny Output, BufferTarget, CanvasSink & CanvasSource
+  // 6. Setup Mediabunny Output matching requested container format
   const target = new BufferTarget();
+  const outputFormatInstance =
+    outFmt === 'webm'
+      ? new WebMOutputFormat()
+      : outFmt === 'mov'
+      ? new MovOutputFormat({ fastStart: 'in-memory' })
+      : outFmt === 'mkv'
+      ? new MkvOutputFormat()
+      : new Mp4OutputFormat({ fastStart: 'in-memory' });
+
   const output = new Output({
-    format: new Mp4OutputFormat({ fastStart: 'in-memory' }),
+    format: outputFormatInstance,
     target,
   });
 
@@ -511,8 +532,11 @@ export async function renderWithMp4Muxer(
     ? options.bitrate
     : getDynamicBitrate(vWidth, vHeight);
 
-  // Determine encodable video codec
-  const encodableVideoCodec = (await getFirstEncodableVideoCodec(['avc', 'hevc', 'vp9', 'av1'])) || 'avc';
+  // Determine container-compatible video/audio codecs
+  const candidateVideoCodecs = outFmt === 'webm'
+    ? (['vp9', 'vp8', 'av1'] as const)
+    : (['avc', 'hevc', 'vp9', 'av1'] as const);
+  const encodableVideoCodec = (await getFirstEncodableVideoCodec([...candidateVideoCodecs])) || (outFmt === 'webm' ? 'vp8' : 'avc');
 
   // Create render canvas
   const canvas = document.createElement('canvas');
@@ -533,7 +557,10 @@ export async function renderWithMp4Muxer(
 
   let audioSource: AudioBufferSource | null = null;
   if (audioBuffer) {
-    const encodableAudioCodec = (await getFirstEncodableAudioCodec(['aac', 'opus'])) || 'aac';
+    const candidateAudioCodecs = outFmt === 'webm'
+      ? (['opus', 'vorbis'] as const)
+      : (['aac', 'opus'] as const);
+    const encodableAudioCodec = (await getFirstEncodableAudioCodec([...candidateAudioCodecs])) || (outFmt === 'webm' ? 'opus' : 'aac');
     audioSource = new AudioBufferSource({
       codec: encodableAudioCodec,
       bitrate: 128_000,
@@ -548,7 +575,7 @@ export async function renderWithMp4Muxer(
     audioSource.close();
   }
 
-  // Setup CanvasSink to decode source frames
+  // Setup CanvasSink to decode source frames (aspect-preserving target dimensions)
   const canvasSink = new CanvasSink(videoTrack, {
     width: vWidth,
     height: vHeight,
@@ -558,41 +585,75 @@ export async function renderWithMp4Muxer(
     },
   });
 
+  const targetFps = options.fps && options.fps > 0 ? options.fps : undefined;
+  const frameInterval = targetFps ? 1 / targetFps : 0;
+  let nextOutputTime = 0;
+
   let frameIdx = 0;
   let lastProgressReportTime = 0;
   const startTimeMs = performance.now();
 
   for await (const wrapped of canvasSink.canvases()) {
-    // 1. Draw base video frame
-    ctx.drawImage(wrapped.canvas, 0, 0, vWidth, vHeight);
+    const srcStart = Math.max(0, wrapped.timestamp);
+    const srcDur = wrapped.duration > 0 ? wrapped.duration : (frameInterval || 1 / 30);
+    const srcEnd = Math.min(duration, srcStart + srcDur);
 
-    // 2. Draw overlays (Subtitles, Blur, Logos, Text)
-    drawSubtitleOverlay(
-      ctx,
-      wrapped.canvas as any,
-      vWidth,
-      vHeight,
-      wrapped.timestamp,
-      subtitles,
-      styleConfig,
-      options.blurOverlays,
-      options.logoOverlays,
-      options.textOverlays,
-      logoBitmaps
-    );
+    if (targetFps) {
+      // Skip frames already covered by previous resampled timestamps (downsample e.g. 60->30fps)
+      if (srcEnd <= nextOutputTime + 1e-4) {
+        continue;
+      }
 
-    // 3. Add to canvasSource
-    await canvasSource.add(wrapped.timestamp, wrapped.duration);
+      // Draw & composite once for this source frame
+      ctx.drawImage(wrapped.canvas, 0, 0, vWidth, vHeight);
+      drawSubtitleOverlay(
+        ctx,
+        wrapped.canvas as any,
+        vWidth,
+        vHeight,
+        wrapped.timestamp,
+        subtitles,
+        styleConfig,
+        options.blurOverlays,
+        options.logoOverlays,
+        options.textOverlays,
+        logoBitmaps,
+        options.gpuAcceleration
+      );
 
-    frameIdx++;
+      // Emit constant-framerate frames covering [srcStart, srcEnd] (supports both downsampling & upsampling)
+      while (nextOutputTime < srcEnd - 1e-4 && nextOutputTime < duration - 1e-4) {
+        const stepDur = Math.min(frameInterval, Math.max(0.001, duration - nextOutputTime));
+        await canvasSource.add(nextOutputTime, stepDur);
+        nextOutputTime += frameInterval;
+        frameIdx++;
+      }
+    } else {
+      ctx.drawImage(wrapped.canvas, 0, 0, vWidth, vHeight);
+      drawSubtitleOverlay(
+        ctx,
+        wrapped.canvas as any,
+        vWidth,
+        vHeight,
+        wrapped.timestamp,
+        subtitles,
+        styleConfig,
+        options.blurOverlays,
+        options.logoOverlays,
+        options.textOverlays,
+        logoBitmaps,
+        options.gpuAcceleration
+      );
+      await canvasSource.add(wrapped.timestamp, wrapped.duration);
+      frameIdx++;
+    }
 
     // Accurate real-time progress strictly tied to current video timestamp (PTS) and frame count
-    const currentTimestamp = Math.min(duration, Math.max(0, wrapped.timestamp));
+    const currentTimestamp = Math.min(duration, Math.max(0, targetFps ? nextOutputTime : wrapped.timestamp));
     const now = performance.now();
     const elapsedSec = (now - startTimeMs) / 1000;
     const currentFps = elapsedSec > 0 ? (frameIdx / elapsedSec) : 30;
 
-    // Real progress strictly measured from 0.0% to 100.0%
     const timeProgress = duration > 0 ? Math.min(1, currentTimestamp / duration) : 0;
     const frameProgress = totalEstimatedFrames > 0 ? Math.min(1, frameIdx / totalEstimatedFrames) : timeProgress;
     const progressRatio = Math.max(timeProgress, frameProgress);
@@ -612,7 +673,7 @@ export async function renderWithMp4Muxer(
         totalFrames: totalEstimatedFrames,
         fps: Number(currentFps.toFixed(1)),
         etaSeconds,
-        status: `Đang xuất video thực: ${realPercentage}% • ${currentTimestamp.toFixed(1)}s / ${duration.toFixed(1)}s • Khung ${frameIdx}/${totalEstimatedFrames} (${currentFps.toFixed(1)} fps)`,
+        status: `Đang xuất ${outFmt.toUpperCase()} (${vWidth}×${vHeight}): ${realPercentage}% • ${currentTimestamp.toFixed(1)}s / ${duration.toFixed(1)}s`,
       });
     }
   }
@@ -625,7 +686,7 @@ export async function renderWithMp4Muxer(
     totalFrames: totalEstimatedFrames,
     fps: 30,
     etaSeconds: 0,
-    status: 'Đang đóng gói và hoàn thiện tệp video MP4...',
+    status: `Đang đóng gói tệp .${outFmt.toUpperCase()}...`,
   });
 
   canvasSource.close();
@@ -642,8 +703,8 @@ export async function renderWithMp4Muxer(
     status: 'Đã hoàn tất xuất video 100%!',
   });
 
-  const finalMp4Blob = new Blob([target.buffer!], { type: 'video/mp4' });
-  return finalMp4Blob;
+  const finalBlob = new Blob([target.buffer!], { type: getMimeTypeForFormat(outFmt) });
+  return finalBlob;
 }
 
 async function preloadLogoOverlays(logoOverlays: LogoOverlay[]): Promise<Record<string, HTMLImageElement>> {
@@ -684,9 +745,16 @@ export async function renderWithMediaRecorder(
     ttsSpeed?: number;
     ttsPitch?: number;
     videoVolume?: number;
+    videoAudioEffect?: AudioEffectType;
     preferredFormat?: 'mp4' | 'webm';
+    resolution?: ExportResolution;
+    targetWidth?: number;
+    targetHeight?: number;
+    fps?: number;
+    bitrate?: number;
     videoDuration?: number;
     knownDuration?: number;
+    gpuAcceleration?: boolean;
   } = {}
 ): Promise<Blob> {
   return new Promise(async (resolve, reject) => {
@@ -710,8 +778,11 @@ export async function renderWithMediaRecorder(
 
     video.onloadedmetadata = async () => {
       try {
-        const vWidth = video.videoWidth || 1280;
-        const vHeight = video.videoHeight || 720;
+        const srcW = video.videoWidth || 1280;
+        const srcH = video.videoHeight || 720;
+        const resolvedDims = computeExportDimensions(options.resolution, srcW, srcH);
+        const vWidth = resolvedDims?.width || toEvenDimension(options.targetWidth || srcW);
+        const vHeight = resolvedDims?.height || toEvenDimension(options.targetHeight || srcH);
         const duration = Math.max(0.1, options.videoDuration || options.knownDuration || video.duration || 10);
 
         const canvas = document.createElement('canvas');
@@ -740,6 +811,7 @@ export async function renderWithMediaRecorder(
 
         // Synthesize and mix voiceover audio track if requested
         const videoVolume = options.videoVolume ?? 1.0;
+        const videoAudioEffect = options.videoAudioEffect || 'none';
         let audioBuffer: AudioBuffer | null = null;
         if (options.includeVoiceover) {
           try {
@@ -750,13 +822,13 @@ export async function renderWithMediaRecorder(
               options.ttsPitch || 0
             );
             const ttsAudioBuffer = result.buffer;
-            audioBuffer = await mixAudioBuffers(originalAudioBuffer, ttsAudioBuffer, duration, videoVolume);
+            audioBuffer = await mixAudioBuffers(originalAudioBuffer, ttsAudioBuffer, duration, videoVolume, videoAudioEffect);
           } catch (e) {
             console.warn('[MediaRecorder Fallback] Không thể dựng audio thuyết minh, sẽ dùng audio gốc:', e);
-            audioBuffer = await adjustAudioBufferVolume(originalAudioBuffer, videoVolume, duration);
+            audioBuffer = await adjustAudioBufferVolume(originalAudioBuffer, videoVolume, duration, videoAudioEffect);
           }
         } else {
-          audioBuffer = await adjustAudioBufferVolume(originalAudioBuffer, videoVolume, duration);
+          audioBuffer = await adjustAudioBufferVolume(originalAudioBuffer, videoVolume, duration, videoAudioEffect);
         }
 
         const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
@@ -775,7 +847,8 @@ export async function renderWithMediaRecorder(
           audioSourceNode.connect(dest);
         }
 
-        const canvasStream = canvas.captureStream(30);
+        const targetFps = options.fps && options.fps > 0 ? options.fps : 30;
+        const canvasStream = canvas.captureStream(targetFps);
         const combinedTracks: MediaStreamTrack[] = [...canvasStream.getVideoTracks()];
         if (audioBuffer) {
           combinedTracks.push(...dest.stream.getAudioTracks());
@@ -807,8 +880,17 @@ export async function renderWithMediaRecorder(
           }
         }
 
-        const recorderOptions = mimeType ? { mimeType } : undefined;
-        const recorder = new MediaRecorder(combinedStream, recorderOptions);
+        const recorderOptions: MediaRecorderOptions = {};
+        if (mimeType) recorderOptions.mimeType = mimeType;
+        if (options.bitrate && options.bitrate > 0) {
+          recorderOptions.videoBitsPerSecond = options.bitrate;
+        }
+        let recorder: MediaRecorder;
+        try {
+          recorder = new MediaRecorder(combinedStream, Object.keys(recorderOptions).length ? recorderOptions : undefined);
+        } catch {
+          recorder = new MediaRecorder(combinedStream, mimeType ? { mimeType } : undefined);
+        }
         const chunks: Blob[] = [];
 
         recorder.ondataavailable = (e) => {
@@ -930,15 +1012,15 @@ export async function renderWithMediaRecorder(
 }
 
 /**
- * Main export video entry point. Uses mp4-muxer for MP4 format when supported,
- * with graceful fallback to MediaRecorder.
+ * Main export video entry point. Uses Mediabunny (MP4/WebM/MOV/MKV) when supported,
+ * or MediaRecorder directly if explicitly selected / as fallback.
  */
 export async function renderVideoWithSubtitles(
   videoUrl: string,
   subtitles: SubtitleItem[],
   styleConfig: SubtitleStyleConfig,
   onProgress: (progress: RenderProgress) => void,
-  preferredFormat: 'mp4' | 'webm' | 'mediarecorder' = 'mp4',
+  preferredFormat: ExportVideoFormat | 'mediarecorder' = 'mp4',
   options: {
     blurOverlays?: BlurOverlay[];
     logoOverlays?: LogoOverlay[];
@@ -948,45 +1030,78 @@ export async function renderVideoWithSubtitles(
     ttsPitch?: number;
     videoVolume?: number;
     videoAudioEffect?: AudioEffectType;
+    resolution?: ExportResolution;
     targetWidth?: number;
     targetHeight?: number;
     fps?: number;
     bitrate?: number;
     videoDuration?: number;
     knownDuration?: number;
+    gpuAcceleration?: boolean;
+    engine?: 'mediabunny' | 'mediarecorder';
   } = {}
-): Promise<{ blob: Blob; formatUsed: 'mp4' | 'webm' }> {
-  if (preferredFormat === 'mp4' && typeof VideoEncoder !== 'undefined') {
+): Promise<{ blob: Blob; formatUsed: ExportVideoFormat }> {
+  const actualFormat: ExportVideoFormat =
+    preferredFormat === 'mediarecorder' ? 'mp4' : preferredFormat;
+  const forceMediaRecorder =
+    preferredFormat === 'mediarecorder' || options.engine === 'mediarecorder';
+
+  if (!forceMediaRecorder && typeof VideoEncoder !== 'undefined') {
+    const preferSoftwareFirst = options.gpuAcceleration === false;
     try {
-      const blob = await renderWithMp4Muxer(videoUrl, subtitles, styleConfig, onProgress, options, false);
-      return { blob, formatUsed: 'mp4' };
+      const blob = await renderWithMp4Muxer(
+        videoUrl,
+        subtitles,
+        styleConfig,
+        onProgress,
+        {
+          ...options,
+          format: actualFormat,
+        },
+        preferSoftwareFirst
+      );
+      return { blob, formatUsed: actualFormat };
     } catch (err: any) {
-      console.warn('[Mediabunny] GPU/HW rendering failed, retrying with Software Encoder (prefer-software)...', err);
-      onProgress({
-        percentage: 0,
-        currentTime: 0,
-        duration: 1,
-        status: 'GPU encoder gián đoạn, đang tự động thử lại bằng Software Encoder (CPU)...',
-      });
-      try {
-        const blob = await renderWithMp4Muxer(videoUrl, subtitles, styleConfig, onProgress, options, true);
-        return { blob, formatUsed: 'mp4' };
-      } catch (retryErr: any) {
-        console.warn('[Mediabunny] Software rendering failed too, falling back to MediaRecorder:', retryErr);
+      if (!preferSoftwareFirst) {
+        console.warn('[Mediabunny] GPU/HW rendering failed, retrying with Software Encoder (prefer-software)...', err);
         onProgress({
           percentage: 0,
           currentTime: 0,
           duration: 1,
-          status: 'Chuyển sang MediaRecorder fallback...',
+          status: 'GPU encoder gián đoạn, đang tự động thử lại bằng Software Encoder (CPU)...',
         });
+        try {
+          const blob = await renderWithMp4Muxer(
+            videoUrl,
+            subtitles,
+            styleConfig,
+            onProgress,
+            {
+              ...options,
+              format: actualFormat,
+            },
+            true
+          );
+          return { blob, formatUsed: actualFormat };
+        } catch (retryErr: any) {
+          console.warn('[Mediabunny] Software rendering failed too, falling back to MediaRecorder:', retryErr);
+        }
+      } else {
+        console.warn('[Mediabunny] Software rendering failed, falling back to MediaRecorder:', err);
       }
+      onProgress({
+        percentage: 0,
+        currentTime: 0,
+        duration: 1,
+        status: 'Chuyển sang MediaRecorder fallback...',
+      });
     }
   }
 
   const blob = await renderWithMediaRecorder(videoUrl, subtitles, styleConfig, onProgress, {
     ...options,
-    preferredFormat: preferredFormat === 'webm' ? 'webm' : 'mp4',
+    preferredFormat: actualFormat === 'webm' ? 'webm' : 'mp4',
   });
-  const formatUsed = blob.type.includes('mp4') ? 'mp4' : 'webm';
+  const formatUsed: ExportVideoFormat = blob.type.includes('mp4') ? 'mp4' : 'webm';
   return { blob, formatUsed };
 }

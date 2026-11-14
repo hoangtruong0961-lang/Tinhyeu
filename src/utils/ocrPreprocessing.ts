@@ -110,14 +110,20 @@ export function compareCoarseLumaGrids(gridA: Uint8Array, gridB: Uint8Array): nu
   return totalDiff / len;
 }
 
-// Module-level cache for ultra-fast coarse grid decision reuse across consecutive video frames
-let lastGridCache: { grid: Uint8Array; decision: TextPresenceDecision; filterStrength: number } | null = null;
+// Per-stream cache type for ultra-fast coarse grid decision reuse across consecutive frames
+export interface GridCacheState {
+  grid: Uint8Array;
+  decision: TextPresenceDecision;
+  filterStrength: number;
+  width: number;
+  height: number;
+}
 
 /**
  * 1. [Decision] & [Edge]: Dual-Check Classical Computer Vision Pre-filter (LAB + Canny Edge)
  * Controlled by "Độ mạnh lọc chữ nền" (filterStrength: 0% -> 100%).
- * 
- * 1. Coarse 16x16 Grid Check: Ultra-fast (<0.02ms) skip for static video scenes
+ *
+ * 1. Coarse 16x16 Grid Check: Ultra-fast (<0.02ms) skip for static video scenes (only when caller supplies an isolated gridCacheRef)
  * 2. LAB Color Space: Specifically detects White/Yellow text (the 2 most dominant subtitle colors)
  * 3. Canny Edge: Detects text of any arbitrary color with contrast edges
  * 4. Compares density/pixel count against filterStrength-adjusted thresholds
@@ -126,7 +132,8 @@ export function detectTextPresenceInFrame(
   pixelData: Uint8ClampedArray | Uint8Array,
   width: number,
   height: number,
-  filterStrength: number = 40
+  filterStrength: number = 40,
+  gridCacheRef?: { current: GridCacheState | null }
 ): TextPresenceDecision {
   if (!pixelData || pixelData.length < 16 || width < 10 || height < 10) {
     return {
@@ -140,18 +147,25 @@ export function detectTextPresenceInFrame(
     };
   }
 
-  // Pre-Filter 0: Ultra-cheap 16x16 coarse luma grid check against previous frame
-  const currGrid = computeCoarseLumaGrid(pixelData, width, height, 16);
-  if (lastGridCache && lastGridCache.filterStrength === filterStrength) {
-    const gridDiff = compareCoarseLumaGrids(currGrid, lastGridCache.grid);
-    // If previous frame already had text, reusing true is safe for minor changes (<0.40 luma)
-    if (lastGridCache.decision.hasText && gridDiff < 0.40) {
-      return { ...lastGridCache.decision };
-    }
-    // If previous frame had NO text, NEVER reuse false unless the image is virtually identical (<0.08 luma)
-    // to avoid dropping short 3-4 character subtitles that produce low average grid change!
-    if (!lastGridCache.decision.hasText && gridDiff < 0.08) {
-      return { ...lastGridCache.decision };
+  let currGrid: Uint8Array | null = null;
+  if (gridCacheRef) {
+    currGrid = computeCoarseLumaGrid(pixelData, width, height, 16);
+    const cached = gridCacheRef.current;
+    if (
+      cached &&
+      cached.filterStrength === filterStrength &&
+      cached.width === width &&
+      cached.height === height
+    ) {
+      const gridDiff = compareCoarseLumaGrids(currGrid, cached.grid);
+      // If previous frame already had text, reusing true is safe for minor changes (<0.40 luma)
+      if (cached.decision.hasText && gridDiff < 0.40) {
+        return { ...cached.decision };
+      }
+      // If previous frame had NO text, NEVER reuse false unless image is virtually identical (<0.08 luma)
+      if (!cached.decision.hasText && gridDiff < 0.08) {
+        return { ...cached.decision };
+      }
     }
   }
 
@@ -159,7 +173,9 @@ export function detectTextPresenceInFrame(
   if (isOpenCVLoaded()) {
     const cvResult = detectTextPresenceOpenCV(pixelData, width, height, filterStrength);
     if (cvResult) {
-      lastGridCache = { grid: currGrid, decision: cvResult, filterStrength };
+      if (gridCacheRef && currGrid) {
+        gridCacheRef.current = { grid: currGrid, decision: cvResult, filterStrength, width, height };
+      }
       return cvResult;
     }
   }
@@ -281,7 +297,9 @@ export function detectTextPresenceInFrame(
     detectionSource,
   };
 
-  lastGridCache = { grid: currGrid, decision, filterStrength };
+  if (gridCacheRef && currGrid) {
+    gridCacheRef.current = { grid: currGrid, decision, filterStrength, width, height };
+  }
   return decision;
 }
 
@@ -376,10 +394,11 @@ export function shouldOverrideFrameSkip(
   pixelData: Uint8ClampedArray | Uint8Array,
   width: number,
   height: number,
-  filterStrength: number = 25
+  filterStrength: number = 25,
+  gridCacheRef?: { current: GridCacheState | null }
 ): boolean {
   if (!pixelData || pixelData.length < 16) return false;
-  const presence = detectTextPresenceInFrame(pixelData, width, height, filterStrength);
+  const presence = detectTextPresenceInFrame(pixelData, width, height, filterStrength, gridCacheRef);
   // High contrast text edges or presence detected (supports short 3-4 character lines)
   return presence.hasText || presence.edgeRatio >= 0.001 || presence.labLuminanceVariance >= 6.0;
 }
@@ -771,7 +790,7 @@ export class SubtitleRoiCalibrator {
  * Sharpens blurry character strokes from compressed video sources before ONNX OCR inference
  */
 export function applyUnsharpMask(
-  ctx: CanvasRenderingContext2D,
+  ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
   w: number,
   h: number,
   amount: number = 1.3,

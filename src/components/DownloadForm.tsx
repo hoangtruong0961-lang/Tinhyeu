@@ -1,8 +1,21 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
+import { Capacitor } from '@capacitor/core';
 import { fetchDownloadLinks } from '../apiService';
-import { GenDownloadResponse, SubtitleTrack, VideoMedia } from '../types';
-import { Download, Film, Loader2, Play, AlertCircle, Sparkles, ExternalLink, CheckCircle2, MessageSquare, Subtitles } from 'lucide-react';
+import { GenDownloadResponse, VideoMedia, SubtitleTrack } from '../types';
+import {
+  Download,
+  Film,
+  Loader2,
+  Play,
+  AlertCircle,
+  Sparkles,
+  CheckCircle2,
+  MessageSquare,
+  Subtitles,
+  RefreshCw,
+} from 'lucide-react';
 import { resolveApiUrl } from '../utils/apiUrl';
+import { YoutubeDLNative, YoutubeDLProgressEvent } from '../plugins/youtubeDLPlugin';
 
 interface DownloadFormProps {
   onSelectVideoForEditor?: (videoUrl: string, title?: string) => void;
@@ -10,9 +23,77 @@ interface DownloadFormProps {
 }
 
 export const DownloadForm: React.FC<DownloadFormProps> = ({ onSelectVideoForEditor, onSwitchToMiniApp }) => {
+  const isNativeAndroid = Capacitor.isNativePlatform() && Capacitor.getPlatform() === 'android';
+
   const [inputUrl, setInputUrl] = useState<string>('');
   const [loading, setLoading] = useState<boolean>(false);
   const [result, setResult] = useState<GenDownloadResponse | null>(null);
+
+  // Native Android yt-dlp state
+  const [ytdlpVersion, setYtdlpVersion] = useState<string>('');
+  const [isUpdatingEngine, setIsUpdatingEngine] = useState<boolean>(false);
+  const [activeTaskKey, setActiveTaskKey] = useState<string | null>(null);
+  const [progressInfo, setProgressInfo] = useState<YoutubeDLProgressEvent | null>(null);
+  const [nativeNotice, setNativeNotice] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+
+  useEffect(() => {
+    let listenerHandle: { remove: () => Promise<void> } | null = null;
+    let active = true;
+
+    if (isNativeAndroid) {
+      YoutubeDLNative.checkStatus({ autoInit: false })
+        .then((st) => {
+          if (active && st?.ytdlpVersion) {
+            setYtdlpVersion(st.ytdlpVersion);
+          }
+        })
+        .catch(() => {});
+
+      YoutubeDLNative.addListener('youtubedl_download_progress', (ev) => {
+        if (!active) return;
+        setProgressInfo(ev);
+      })
+        .then((handle) => {
+          if (active) {
+            listenerHandle = handle;
+          } else {
+            handle.remove().catch(() => {});
+          }
+        })
+        .catch(() => {});
+    }
+
+    return () => {
+      active = false;
+      if (listenerHandle) {
+        listenerHandle.remove().catch(() => {});
+      }
+    };
+  }, [isNativeAndroid]);
+
+  const handleUpdateYoutubeDL = async () => {
+    if (!isNativeAndroid || isUpdatingEngine) return;
+    setIsUpdatingEngine(true);
+    setNativeNotice(null);
+    setProgressInfo({ status: 'updating', percent: 10, message: 'Đang kiểm tra bản cập nhật yt-dlp...' });
+    try {
+      const res = await YoutubeDLNative.updateYoutubeDL({ channel: 'stable' });
+      if (res.ytdlpVersion) {
+        setYtdlpVersion(res.ytdlpVersion);
+      }
+      setNativeNotice({
+        type: 'success',
+        message: res.message || `Đã cập nhật yt-dlp (${res.ytdlpVersion || 'Mới nhất'}).`,
+      });
+    } catch (err: any) {
+      setNativeNotice({
+        type: 'error',
+        message: err?.message || 'Không thể cập nhật yt-dlp lúc này.',
+      });
+    } finally {
+      setIsUpdatingEngine(false);
+    }
+  };
 
   const handleDownload = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -20,10 +101,94 @@ export const DownloadForm: React.FC<DownloadFormProps> = ({ onSelectVideoForEdit
 
     setLoading(true);
     setResult(null);
+    setNativeNotice(null);
+    if (isNativeAndroid) {
+      setProgressInfo({ status: 'extracting', percent: 8, message: 'Đang bóc tách liên kết bằng yt-dlp trên điện thoại...' });
+    }
 
     const data = await fetchDownloadLinks(inputUrl.trim());
     setResult(data);
     setLoading(false);
+    if (isNativeAndroid && data.success) {
+      setProgressInfo(null);
+    }
+  };
+
+  const handleNativeMediaAction = async (
+    media: VideoMedia,
+    taskKey: string,
+    mode: 'download' | 'edit'
+  ) => {
+    if (!isNativeAndroid || activeTaskKey) return;
+    setActiveTaskKey(taskKey);
+    setNativeNotice(null);
+    setProgressInfo({
+      status: 'downloading',
+      percent: 5,
+      message: mode === 'edit' ? 'Đang tải video & audio về máy để mở biên tập...' : 'Đang chuẩn bị tải video về máy...',
+    });
+
+    try {
+      const res = await YoutubeDLNative.downloadMedia({
+        pageUrl: inputUrl.trim(),
+        videoUrl: media.directUrl || media.url,
+        audioUrl: media.audioUrl,
+        title: result?.title || 'video',
+        quality: media.quality,
+        extension: media.extension || 'mp4',
+        isAudioOnly: Boolean(media.isAudioOnly || media.extension.toLowerCase() === 'mp3'),
+        hasAudio: Boolean(media.hasAudio),
+        saveToDownloads: mode === 'download',
+        httpHeaders: media.httpHeaders || result?.httpHeaders,
+        audioHeaders: media.audioHeaders || media.httpHeaders || result?.httpHeaders,
+      });
+
+      if (mode === 'edit' && onSelectVideoForEditor) {
+        const playableUrl = Capacitor.convertFileSrc(res.filePath);
+        onSelectVideoForEditor(playableUrl, result?.title);
+      } else {
+        setNativeNotice({
+          type: 'success',
+          message: `Đã lưu thành công: ${res.savedPath} (${res.sizeMB} MB)`,
+        });
+      }
+    } catch (err: any) {
+      setNativeNotice({
+        type: 'error',
+        message: err?.message || 'Không thể tải hoặc ghép video trên thiết bị.',
+      });
+    } finally {
+      setActiveTaskKey(null);
+      setProgressInfo(null);
+    }
+  };
+
+  const handleNativeSubtitleDownload = async (sub: SubtitleTrack, taskKey: string) => {
+    if (!isNativeAndroid || activeTaskKey) return;
+    setActiveTaskKey(taskKey);
+    setNativeNotice(null);
+    try {
+      const res = await YoutubeDLNative.downloadSubtitle({
+        subUrl: sub.url,
+        lang: sub.lang,
+        ext: sub.ext,
+        type: sub.type || (sub.isDanmaku ? 'danmaku' : sub.isAuto ? 'auto' : 'official'),
+        title: result?.title || 'subtitle',
+        saveToDownloads: true,
+        httpHeaders: sub.httpHeaders || result?.httpHeaders,
+      });
+      setNativeNotice({
+        type: 'success',
+        message: `Đã chuyển đổi & lưu phụ đề SRT: ${res.savedPath}`,
+      });
+    } catch (err: any) {
+      setNativeNotice({
+        type: 'error',
+        message: err?.message || 'Lỗi tải phụ đề trên thiết bị.',
+      });
+    } finally {
+      setActiveTaskKey(null);
+    }
   };
 
   // Helper to separate video vs audio formats
@@ -53,6 +218,34 @@ export const DownloadForm: React.FC<DownloadFormProps> = ({ onSelectVideoForEdit
 
   return (
     <div className="max-w-xl mx-auto my-3 p-4 sm:p-5 bg-metallic-card border-metallic rounded-2xl shadow-2xl font-sans text-slate-100">
+      {/* Native Android yt-dlp Engine Bar */}
+      {isNativeAndroid && (
+        <div className="mb-4 p-2.5 bg-slate-900/90 border border-slate-700/70 rounded-xl flex items-center justify-between gap-2">
+          <div className="min-w-0">
+            <div className="text-[11px] font-bold text-sky-300 flex items-center gap-1.5">
+              <span>yt-dlp Android Native</span>
+              {ytdlpVersion && (
+                <span className="text-[10px] font-mono text-slate-300 bg-slate-800 px-1.5 py-0.5 rounded">
+                  {ytdlpVersion}
+                </span>
+              )}
+            </div>
+            <p className="text-[10px] text-slate-400 truncate">
+              Tự xử lý tải song song & ghép FFmpeg -c copy ngay trên máy
+            </p>
+          </div>
+          <button
+            type="button"
+            disabled={isUpdatingEngine || loading || Boolean(activeTaskKey)}
+            onClick={handleUpdateYoutubeDL}
+            className="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-sky-300 border border-slate-600/70 rounded-lg text-[11px] font-bold flex items-center gap-1 flex-shrink-0 transition cursor-pointer active:scale-95"
+          >
+            <RefreshCw className={`w-3 h-3 ${isUpdatingEngine ? 'animate-spin' : ''}`} />
+            <span>{isUpdatingEngine ? 'Đang cập nhật...' : 'Cập nhật yt-dlp'}</span>
+          </button>
+        </div>
+      )}
+
       {/* Form Input URL */}
       <form onSubmit={handleDownload} className="mb-5 space-y-2.5">
         <label className="text-xs font-bold text-metallic-silver uppercase tracking-wider flex items-center space-x-1.5">
@@ -69,7 +262,7 @@ export const DownloadForm: React.FC<DownloadFormProps> = ({ onSelectVideoForEdit
           />
           <button
             type="submit"
-            disabled={loading || !inputUrl.trim()}
+            disabled={loading || !inputUrl.trim() || Boolean(activeTaskKey)}
             className="btn-metallic active:scale-95 disabled:opacity-50 text-slate-950 font-black px-4 py-2.5 rounded-xl transition cursor-pointer flex items-center justify-center space-x-1.5 text-xs flex-shrink-0 shadow-lg"
           >
             {loading ? (
@@ -86,6 +279,40 @@ export const DownloadForm: React.FC<DownloadFormProps> = ({ onSelectVideoForEdit
           </button>
         </div>
       </form>
+
+      {/* Live Progress Bar for Native Android Operations */}
+      {isNativeAndroid && progressInfo && (loading || isUpdatingEngine || Boolean(activeTaskKey)) && (
+        <div className="mb-4 p-3 bg-slate-900/90 border border-sky-500/40 rounded-xl space-y-2">
+          <div className="flex items-center justify-between text-[11px]">
+            <span className="text-sky-300 font-semibold truncate pr-2">{progressInfo.message}</span>
+            <span className="font-mono text-slate-300 flex-shrink-0">{progressInfo.percent}%</span>
+          </div>
+          <div className="w-full h-1.5 bg-slate-800 rounded-full overflow-hidden">
+            <div
+              className="h-full bg-gradient-to-r from-sky-500 to-blue-400 transition-all duration-200"
+              style={{ width: `${Math.max(4, Math.min(100, progressInfo.percent || 0))}%` }}
+            />
+          </div>
+        </div>
+      )}
+
+      {/* Native Download / Update Notification */}
+      {nativeNotice && (
+        <div
+          className={`mb-4 p-3 rounded-xl text-xs flex items-center space-x-2 border ${
+            nativeNotice.type === 'success'
+              ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
+              : 'bg-rose-500/10 border-rose-500/30 text-rose-300'
+          }`}
+        >
+          {nativeNotice.type === 'success' ? (
+            <CheckCircle2 className="w-4 h-4 text-emerald-400 flex-shrink-0" />
+          ) : (
+            <AlertCircle className="w-4 h-4 text-rose-400 flex-shrink-0" />
+          )}
+          <span className="break-words">{nativeNotice.message}</span>
+        </div>
+      )}
 
       {/* Error Display */}
       {result && !result.success && (
@@ -176,13 +403,16 @@ export const DownloadForm: React.FC<DownloadFormProps> = ({ onSelectVideoForEdit
                   const streamUrl = media.directUrl ? resolveApiUrl(media.directUrl) : resolveApiUrl(`/api/proxy-video?url=${encodeURIComponent(media.url)}`);
                   const downloadUrl = resolveApiUrl(`/api/download-media?pageUrl=${encodeURIComponent(inputUrl.trim())}&formatId=${encodeURIComponent(media.formatId || '')}&filename=${encodeURIComponent(filename)}&fallbackUrl=${encodeURIComponent(media.url)}`);
 
+                  const editKey = `edit-${index}`;
+                  const dlKey = `video-${index}`;
+
                   return (
                     <div
                       key={index}
-                      className="bg-[#18191e] border border-slate-800/90 rounded-xl p-3 flex items-center justify-between hover:border-slate-700 transition"
+                      className="bg-[#18191e] border border-slate-800/90 rounded-xl p-3 flex items-center justify-between hover:border-slate-700 transition gap-2"
                     >
-                      <div>
-                        <div className="text-xs font-bold text-white">
+                      <div className="min-w-0">
+                        <div className="text-xs font-bold text-white truncate">
                           {media.quality.includes('p') || media.quality.includes('MP4')
                             ? media.quality
                             : `${media.quality} (${media.extension.toUpperCase()})`}
@@ -192,24 +422,53 @@ export const DownloadForm: React.FC<DownloadFormProps> = ({ onSelectVideoForEdit
                         )}
                       </div>
 
-                      <div className="flex items-center space-x-2">
+                      <div className="flex items-center space-x-2 flex-shrink-0">
                         {onSelectVideoForEditor && (
+                          isNativeAndroid ? (
+                            <button
+                              type="button"
+                              disabled={Boolean(activeTaskKey)}
+                              onClick={() => handleNativeMediaAction(media, editKey, 'edit')}
+                              className="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-300 rounded-lg text-xs font-bold transition border border-slate-700 active:scale-95 cursor-pointer flex items-center space-x-1"
+                            >
+                              {activeTaskKey === editKey && <Loader2 className="w-3 h-3 animate-spin" />}
+                              <span>Biên Tập</span>
+                            </button>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() => onSelectVideoForEditor(streamUrl, result.title)}
+                              className="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-bold transition border border-slate-700 active:scale-95 cursor-pointer"
+                            >
+                              Biên Tập
+                            </button>
+                          )
+                        )}
+
+                        {isNativeAndroid ? (
                           <button
                             type="button"
-                            onClick={() => onSelectVideoForEditor(streamUrl, result.title)}
-                            className="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-bold transition border border-slate-700 active:scale-95 cursor-pointer"
+                            disabled={Boolean(activeTaskKey)}
+                            onClick={() => handleNativeMediaAction(media, dlKey, 'download')}
+                            className="bg-[#0088ff] hover:bg-sky-400 disabled:opacity-50 text-white font-bold px-3.5 py-1.5 rounded-lg text-xs transition flex items-center space-x-1 shadow-md active:scale-95 cursor-pointer"
                           >
-                            Biên Tập
+                            {activeTaskKey === dlKey ? (
+                              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                            ) : (
+                              <Download className="w-3.5 h-3.5" />
+                            )}
+                            <span>Tải về</span>
                           </button>
+                        ) : (
+                          <a
+                            href={downloadUrl}
+                            download={filename}
+                            className="bg-[#0088ff] hover:bg-sky-400 text-white font-bold px-3.5 py-1.5 rounded-lg text-xs transition flex items-center space-x-1 shadow-md active:scale-95 cursor-pointer"
+                          >
+                            <Download className="w-3.5 h-3.5" />
+                            <span>Tải về</span>
+                          </a>
                         )}
-                        <a
-                          href={downloadUrl}
-                          download={filename}
-                          className="bg-[#0088ff] hover:bg-sky-400 text-white font-bold px-3.5 py-1.5 rounded-lg text-xs transition flex items-center space-x-1 shadow-md active:scale-95 cursor-pointer"
-                        >
-                          <Download className="w-3.5 h-3.5" />
-                          <span>Tải về</span>
-                        </a>
                       </div>
                     </div>
                   );
@@ -231,16 +490,16 @@ export const DownloadForm: React.FC<DownloadFormProps> = ({ onSelectVideoForEdit
                     .trim()
                     .substring(0, 80);
                   const filename = `${safeTitle}_Audio.${media.extension || 'mp3'}`;
-                  const streamUrl = media.directUrl ? resolveApiUrl(media.directUrl) : resolveApiUrl(`/api/proxy-video?url=${encodeURIComponent(media.url)}`);
                   const downloadUrl = resolveApiUrl(`/api/download-media?pageUrl=${encodeURIComponent(inputUrl.trim())}&audioOnly=1&filename=${encodeURIComponent(filename)}&fallbackUrl=${encodeURIComponent(media.url)}`);
+                  const audioKey = `audio-${index}`;
 
                   return (
                     <div
                       key={index}
-                      className="bg-[#18191e] border border-slate-800/90 rounded-xl p-3 flex items-center justify-between hover:border-slate-700 transition"
+                      className="bg-[#18191e] border border-slate-800/90 rounded-xl p-3 flex items-center justify-between hover:border-slate-700 transition gap-2"
                     >
-                      <div>
-                        <div className="text-xs font-bold text-white">
+                      <div className="min-w-0">
+                        <div className="text-xs font-bold text-white truncate">
                           {media.quality.toLowerCase().includes('audio') ? media.quality : `Audio (${media.extension.toUpperCase()})`}
                         </div>
                         {media.size && (
@@ -248,14 +507,30 @@ export const DownloadForm: React.FC<DownloadFormProps> = ({ onSelectVideoForEdit
                         )}
                       </div>
 
-                      <a
-                        href={downloadUrl}
-                        download={filename}
-                        className="bg-[#0088ff] hover:bg-sky-400 text-white font-bold px-3.5 py-1.5 rounded-lg text-xs transition flex items-center space-x-1 shadow-md active:scale-95 cursor-pointer"
-                      >
-                        <Download className="w-3.5 h-3.5" />
-                        <span>Tải về</span>
-                      </a>
+                      {isNativeAndroid ? (
+                        <button
+                          type="button"
+                          disabled={Boolean(activeTaskKey)}
+                          onClick={() => handleNativeMediaAction(media, audioKey, 'download')}
+                          className="bg-[#0088ff] hover:bg-sky-400 disabled:opacity-50 text-white font-bold px-3.5 py-1.5 rounded-lg text-xs transition flex items-center space-x-1 shadow-md active:scale-95 cursor-pointer flex-shrink-0"
+                        >
+                          {activeTaskKey === audioKey ? (
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          ) : (
+                            <Download className="w-3.5 h-3.5" />
+                          )}
+                          <span>Tải về</span>
+                        </button>
+                      ) : (
+                        <a
+                          href={downloadUrl}
+                          download={filename}
+                          className="bg-[#0088ff] hover:bg-sky-400 text-white font-bold px-3.5 py-1.5 rounded-lg text-xs transition flex items-center space-x-1 shadow-md active:scale-95 cursor-pointer flex-shrink-0"
+                        >
+                          <Download className="w-3.5 h-3.5" />
+                          <span>Tải về</span>
+                        </a>
+                      )}
                     </div>
                   );
                 })}
@@ -280,18 +555,27 @@ export const DownloadForm: React.FC<DownloadFormProps> = ({ onSelectVideoForEdit
                 </div>
               </div>
 
-              {onSelectVideoForEditor && (
+              {onSelectVideoForEditor && displayVideoMedias[0] && (
                 <button
                   type="button"
+                  disabled={Boolean(activeTaskKey)}
                   onClick={() => {
-                    const streamUrl = displayVideoMedias[0]?.directUrl || displayVideoMedias[0]?.url || '';
-                    if (streamUrl) {
-                      onSelectVideoForEditor(streamUrl, result.title);
+                    if (isNativeAndroid) {
+                      handleNativeMediaAction(displayVideoMedias[0], 'edit-ai-sub', 'edit');
+                    } else {
+                      const streamUrl = displayVideoMedias[0]?.directUrl || displayVideoMedias[0]?.url || '';
+                      if (streamUrl) {
+                        onSelectVideoForEditor(streamUrl, result.title);
+                      }
                     }
                   }}
-                  className="w-full bg-gradient-to-r from-sky-500 to-blue-600 hover:from-sky-400 hover:to-blue-500 text-white font-black py-2.5 px-4 rounded-xl text-xs flex items-center justify-center space-x-2 transition shadow-lg shadow-sky-900/30 active:scale-98 cursor-pointer"
+                  className="w-full bg-gradient-to-r from-sky-500 to-blue-600 hover:from-sky-400 hover:to-blue-500 disabled:opacity-50 text-white font-black py-2.5 px-4 rounded-xl text-xs flex items-center justify-center space-x-2 transition shadow-lg shadow-sky-900/30 active:scale-98 cursor-pointer"
                 >
-                  <Sparkles className="w-4 h-4 text-white animate-pulse" />
+                  {activeTaskKey === 'edit-ai-sub' ? (
+                    <Loader2 className="w-4 h-4 text-white animate-spin" />
+                  ) : (
+                    <Sparkles className="w-4 h-4 text-white animate-pulse" />
+                  )}
                   <span>🎙️ Tự Động Tạo & Dịch Phụ Đề Bằng AI (Gemini Auto-Subtitles)</span>
                 </button>
               )}
@@ -321,6 +605,7 @@ export const DownloadForm: React.FC<DownloadFormProps> = ({ onSelectVideoForEdit
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                 {officialSubtitles.map((sub, index) => {
                   const srtDownloadUrl = sub.downloadUrl ? resolveApiUrl(sub.downloadUrl) : resolveApiUrl(`/api/proxy-subtitle?url=${encodeURIComponent(sub.url)}&lang=${encodeURIComponent(sub.lang)}&type=official`);
+                  const subKey = `sub-official-${index}`;
                   return (
                     <div
                       key={index}
@@ -336,17 +621,34 @@ export const DownloadForm: React.FC<DownloadFormProps> = ({ onSelectVideoForEdit
                         </div>
                       </div>
 
-                      <a
-                        href={srtDownloadUrl}
-                        target="_blank"
-                        rel="noreferrer"
-                        download={`sub_${sub.lang}.srt`}
-                        className="bg-emerald-600 hover:bg-emerald-500 text-white font-bold px-2.5 py-1.5 rounded-lg text-[11px] transition flex items-center space-x-1 flex-shrink-0 shadow"
-                        title="Tải phụ đề chuẩn định dạng SRT"
-                      >
-                        <Download className="w-3 h-3" />
-                        <span>Tải SRT</span>
-                      </a>
+                      {isNativeAndroid ? (
+                        <button
+                          type="button"
+                          disabled={Boolean(activeTaskKey)}
+                          onClick={() => handleNativeSubtitleDownload(sub, subKey)}
+                          className="bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-bold px-2.5 py-1.5 rounded-lg text-[11px] transition flex items-center space-x-1 flex-shrink-0 shadow cursor-pointer"
+                          title="Tải & chuyển đổi sang chuẩn SRT trên điện thoại"
+                        >
+                          {activeTaskKey === subKey ? (
+                            <Loader2 className="w-3 h-3 animate-spin" />
+                          ) : (
+                            <Download className="w-3 h-3" />
+                          )}
+                          <span>Tải SRT</span>
+                        </button>
+                      ) : (
+                        <a
+                          href={srtDownloadUrl}
+                          target="_blank"
+                          rel="noreferrer"
+                          download={`sub_${sub.lang}.srt`}
+                          className="bg-emerald-600 hover:bg-emerald-500 text-white font-bold px-2.5 py-1.5 rounded-lg text-[11px] transition flex items-center space-x-1 flex-shrink-0 shadow"
+                          title="Tải phụ đề chuẩn định dạng SRT"
+                        >
+                          <Download className="w-3 h-3" />
+                          <span>Tải SRT</span>
+                        </a>
+                      )}
                     </div>
                   );
                 })}
@@ -375,6 +677,7 @@ export const DownloadForm: React.FC<DownloadFormProps> = ({ onSelectVideoForEdit
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                 {autoSubtitles.map((sub, index) => {
                   const srtDownloadUrl = sub.downloadUrl ? resolveApiUrl(sub.downloadUrl) : resolveApiUrl(`/api/proxy-subtitle?url=${encodeURIComponent(sub.url)}&lang=${encodeURIComponent(sub.lang)}&type=auto`);
+                  const subKey = `sub-auto-${index}`;
                   return (
                     <div
                       key={index}
@@ -389,16 +692,32 @@ export const DownloadForm: React.FC<DownloadFormProps> = ({ onSelectVideoForEdit
                         </div>
                       </div>
 
-                      <a
-                        href={srtDownloadUrl}
-                        target="_blank"
-                        rel="noreferrer"
-                        download={`sub_${sub.lang}_auto.srt`}
-                        className="bg-slate-800 hover:bg-slate-700 text-sky-400 border border-slate-700 font-bold px-2.5 py-1 rounded-lg text-[11px] transition flex items-center space-x-1 flex-shrink-0"
-                      >
-                        <Download className="w-3 h-3" />
-                        <span>Tải SRT</span>
-                      </a>
+                      {isNativeAndroid ? (
+                        <button
+                          type="button"
+                          disabled={Boolean(activeTaskKey)}
+                          onClick={() => handleNativeSubtitleDownload(sub, subKey)}
+                          className="bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-sky-400 border border-slate-700 font-bold px-2.5 py-1 rounded-lg text-[11px] transition flex items-center space-x-1 flex-shrink-0 cursor-pointer"
+                        >
+                          {activeTaskKey === subKey ? (
+                            <Loader2 className="w-3 h-3 animate-spin" />
+                          ) : (
+                            <Download className="w-3 h-3" />
+                          )}
+                          <span>Tải SRT</span>
+                        </button>
+                      ) : (
+                        <a
+                          href={srtDownloadUrl}
+                          target="_blank"
+                          rel="noreferrer"
+                          download={`sub_${sub.lang}_auto.srt`}
+                          className="bg-slate-800 hover:bg-slate-700 text-sky-400 border border-slate-700 font-bold px-2.5 py-1 rounded-lg text-[11px] transition flex items-center space-x-1 flex-shrink-0"
+                        >
+                          <Download className="w-3 h-3" />
+                          <span>Tải SRT</span>
+                        </a>
+                      )}
                     </div>
                   );
                 })}
@@ -426,6 +745,7 @@ export const DownloadForm: React.FC<DownloadFormProps> = ({ onSelectVideoForEdit
               <div className="grid grid-cols-1 gap-2">
                 {danmakuTracks.map((sub, index) => {
                   const srtDanmakuUrl = resolveApiUrl(`/api/proxy-subtitle?url=${encodeURIComponent(sub.url)}&lang=danmaku&type=danmaku`);
+                  const subKey = `sub-danmaku-${index}`;
                   return (
                     <div
                       key={index}
@@ -441,17 +761,34 @@ export const DownloadForm: React.FC<DownloadFormProps> = ({ onSelectVideoForEdit
                       </div>
 
                       <div className="flex items-center space-x-2 flex-shrink-0">
-                        <a
-                          href={srtDanmakuUrl}
-                          target="_blank"
-                          rel="noreferrer"
-                          download={`danmaku_${sub.lang || 'comments'}.srt`}
-                          className="bg-amber-600 hover:bg-amber-500 text-slate-950 font-bold px-2.5 py-1.5 rounded-lg text-[11px] transition flex items-center space-x-1 shadow cursor-pointer"
-                          title="Tự động chuyển đổi XML sang chuẩn phụ đề SRT"
-                        >
-                          <Download className="w-3 h-3" />
-                          <span>Xuất SRT</span>
-                        </a>
+                        {isNativeAndroid ? (
+                          <button
+                            type="button"
+                            disabled={Boolean(activeTaskKey)}
+                            onClick={() => handleNativeSubtitleDownload(sub, subKey)}
+                            className="bg-amber-600 hover:bg-amber-500 disabled:opacity-50 text-slate-950 font-bold px-2.5 py-1.5 rounded-lg text-[11px] transition flex items-center space-x-1 shadow cursor-pointer"
+                            title="Tự động chuyển đổi XML sang chuẩn phụ đề SRT"
+                          >
+                            {activeTaskKey === subKey ? (
+                              <Loader2 className="w-3 h-3 animate-spin" />
+                            ) : (
+                              <Download className="w-3 h-3" />
+                            )}
+                            <span>Xuất SRT</span>
+                          </button>
+                        ) : (
+                          <a
+                            href={srtDanmakuUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                            download={`danmaku_${sub.lang || 'comments'}.srt`}
+                            className="bg-amber-600 hover:bg-amber-500 text-slate-950 font-bold px-2.5 py-1.5 rounded-lg text-[11px] transition flex items-center space-x-1 shadow cursor-pointer"
+                            title="Tự động chuyển đổi XML sang chuẩn phụ đề SRT"
+                          >
+                            <Download className="w-3 h-3" />
+                            <span>Xuất SRT</span>
+                          </a>
+                        )}
 
                         <a
                           href={sub.downloadUrl || sub.url}

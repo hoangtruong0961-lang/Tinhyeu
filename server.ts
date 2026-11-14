@@ -976,43 +976,59 @@ async function startServer() {
     // Dynamic Remote URLs & filenames based on requested model variant (small vs tiny)
     let remoteUrl = config.remoteUrl;
     let fallbackUrls = config.fallbackUrls || [];
+    const normalizedVariant = variant === 'tiny' ? 'tiny' : 'small';
+    let cacheFilename = config.filename;
     const variantFilenames: string[] = [];
 
     if (type === 'det') {
-      const hfModel = variant === 'tiny' ? 'PP-OCRv6_tiny_det_onnx' : 'PP-OCRv6_small_det_onnx';
+      const hfModel = normalizedVariant === 'tiny' ? 'PP-OCRv6_tiny_det_onnx' : 'PP-OCRv6_small_det_onnx';
       remoteUrl = `https://huggingface.co/PaddlePaddle/${hfModel}/resolve/main/inference.onnx?download=true`;
       fallbackUrls = [
         `https://huggingface.co/PaddlePaddle/${hfModel}/resolve/main/inference.onnx?download=true`,
         `https://huggingface.co/PaddlePaddle/${hfModel}/raw/main/inference.onnx`,
       ];
-      if (variant === 'tiny') {
-        variantFilenames.push('det_tiny.onnx', 'PaddleOCRv6-tiny-det.onnx', 'det.onnx');
+      cacheFilename = `det_${normalizedVariant}.onnx`;
+      if (normalizedVariant === 'tiny') {
+        variantFilenames.push('det_tiny.onnx', 'PaddleOCRv6-tiny-det.onnx');
       } else {
         variantFilenames.push('det_small.onnx', 'PP-OCRv6_small_det.onnx', 'det.onnx');
       }
     } else if (type === 'rec') {
-      const hfModel = variant === 'tiny' ? 'PP-OCRv6_tiny_rec_onnx' : 'PP-OCRv6_small_rec_onnx';
+      const hfModel = normalizedVariant === 'tiny' ? 'PP-OCRv6_tiny_rec_onnx' : 'PP-OCRv6_small_rec_onnx';
       remoteUrl = `https://huggingface.co/PaddlePaddle/${hfModel}/resolve/main/inference.onnx?download=true`;
       fallbackUrls = [
         `https://huggingface.co/PaddlePaddle/${hfModel}/resolve/main/inference.onnx?download=true`,
         `https://huggingface.co/PaddlePaddle/${hfModel}/raw/main/inference.onnx`,
       ];
-      if (variant === 'tiny') {
-        variantFilenames.push('rec_tiny.onnx', 'PaddleOCRv6-tiny-rec.onnx', 'rec.onnx');
+      cacheFilename = `rec_${normalizedVariant}.onnx`;
+      if (normalizedVariant === 'tiny') {
+        variantFilenames.push('rec_tiny.onnx', 'PaddleOCRv6-tiny-rec.onnx');
       } else {
         variantFilenames.push('rec_small.onnx', 'PP-OCRv6_small_rec.onnx', 'rec.onnx');
       }
     } else {
-      if (variant === 'tiny') {
+      if (normalizedVariant === 'tiny') {
         remoteUrl = 'https://raw.githubusercontent.com/PT-Perkasa-Pilar-Utama/ppu-paddle-ocr-models/main/recognition/ppocrv6_tiny_dict.txt';
         fallbackUrls = ['https://raw.githubusercontent.com/PT-Perkasa-Pilar-Utama/ppu-paddle-ocr-models/main/recognition/ppocrv6_tiny_dict.txt'];
+        cacheFilename = 'ppocrv6_tiny_dict.txt';
         variantFilenames.push('ppocrv6_tiny_dict.txt', 'dict_tiny.txt');
       } else {
         remoteUrl = 'https://raw.githubusercontent.com/PT-Perkasa-Pilar-Utama/ppu-paddle-ocr-models/main/recognition/ppocrv6_dict.txt';
         fallbackUrls = ['https://raw.githubusercontent.com/PT-Perkasa-Pilar-Utama/ppu-paddle-ocr-models/main/recognition/ppocrv6_dict.txt'];
+        cacheFilename = 'ppocrv6_dict.txt';
         variantFilenames.push('ppocrv6_dict.txt', 'dict.txt');
       }
     }
+
+    const isSizeMatchingVariant = (bytes: number): boolean => {
+      if (type === 'dict') return bytes >= config.minSize;
+      if (normalizedVariant === 'small') {
+        return type === 'det' ? bytes > 5000000 : bytes > 10000000;
+      }
+      return type === 'det'
+        ? (bytes > 500000 && bytes < 5000000)
+        : (bytes > 1000000 && bytes < 10000000);
+    };
 
     const candidatePaths: string[] = [];
     for (const fn of variantFilenames) {
@@ -1030,7 +1046,7 @@ async function startServer() {
     for (const p of candidatePaths) {
       if (fs.existsSync(p)) {
         const stat = fs.statSync(p);
-        if (stat.size >= (variant === 'small' && type !== 'dict' ? 5000000 : config.minSize)) {
+        if (isSizeMatchingVariant(stat.size)) {
           foundPath = p;
           break;
         }
@@ -1047,27 +1063,27 @@ async function startServer() {
       return res.sendFile(path.resolve(foundPath));
     }
 
-    // If not found locally, fetch from remote CDN and stream while caching
+    // If not found locally, fetch from remote CDN and stream while caching under variant-specific filename
     const urlsToTry = [remoteUrl, ...fallbackUrls];
     for (const url of urlsToTry) {
       try {
-        console.log(`[PaddleOCR Model Server] Downloading ${config.filename} from ${url}...`);
+        console.log(`[PaddleOCR Model Server] Downloading ${cacheFilename} from ${url}...`);
         const remoteRes = await fetch(url);
         if (!remoteRes.ok) {
           continue;
         }
 
         const buffer = Buffer.from(await remoteRes.arrayBuffer());
-        if (buffer.length < config.minSize) {
+        if (!isSizeMatchingVariant(buffer.length)) {
           continue;
         }
 
-        // Cache to public and temp directories
+        // Cache to public and temp directories using variant-specific filename
         try {
           const publicDir = path.join(process.cwd(), 'public');
           fs.mkdirSync(publicDir, { recursive: true });
-          fs.writeFileSync(path.join(publicDir, config.filename), buffer);
-          fs.writeFileSync(path.join(process.cwd(), config.filename), buffer);
+          fs.writeFileSync(path.join(publicDir, cacheFilename), buffer);
+          fs.writeFileSync(path.join(os.tmpdir(), cacheFilename), buffer);
         } catch (_) {}
 
         res.setHeader('Content-Type', config.contentType);
@@ -1076,10 +1092,10 @@ async function startServer() {
         res.setHeader('Access-Control-Allow-Origin', '*');
         return res.send(buffer);
       } catch (err: any) {
-        console.warn(`[PaddleOCR Model Server Warning for ${config.filename}]`, err?.message || err);
+        console.warn(`[PaddleOCR Model Server Warning for ${cacheFilename}]`, err?.message || err);
       }
     }
-    res.status(500).send(`Error downloading PaddleOCR model ${config.filename}: Failed from all sources`);
+    res.status(500).send(`Error downloading PaddleOCR model ${cacheFilename}: Failed from all sources`);
   };
 
   app.get('/api/paddle-models/:type', handlePaddleModelRequest);
@@ -1389,7 +1405,7 @@ async function startServer() {
   // 2. Single Frame OCR & Translation
   app.post('/api/ocr-extract', async (req, res) => {
     try {
-      const { image, timestamp, targetLang = 'Tiếng Việt', model = 'gemini-3.6-flash', customContext } = req.body;
+      const { image, timestamp, targetLang = 'Tiếng Việt', sourceLang = 'auto', model = 'gemini-3.6-flash', customContext } = req.body;
 
       if (!image) {
         res.status(400).json({ error: 'Missing image data' });
@@ -1400,9 +1416,13 @@ async function startServer() {
 
       // Remove data URL prefix if present
       const cleanBase64 = image.replace(/^data:image\/(png|jpeg|jpg|webp);base64,/, '');
+      const sourceLangHint = sourceLang && sourceLang !== 'auto'
+        ? `Expected subtitle source language: ${sourceLang}. Prioritize accurate recognition for this script.`
+        : 'Auto-detect the exact subtitle source language.';
 
       const prompt = `You are a high-precision video OCR and subtitle translator.
 Your job is to examine this cropped region of a video frame and extract any visible text/subtitle.
+${sourceLangHint}
 ${customContext ? `Context about the video content: ${customContext}` : ''}
 
 Target translation language: ${targetLang}.
@@ -1469,7 +1489,7 @@ Instructions:
   // 3. Multi-Frame Batch OCR & Subtitle Synchronizer
   app.post('/api/ocr-batch-frames', async (req, res) => {
     try {
-      const { frames, targetLang = 'Tiếng Việt', model = 'gemini-3.6-flash', ocrEngine = 'gemini_vision', customContext } = req.body;
+      const { frames, targetLang = 'Tiếng Việt', sourceLang = 'auto', model = 'gemini-3.6-flash', ocrEngine = 'gemini_vision', customContext } = req.body;
 
       if (!frames || !Array.isArray(frames) || frames.length === 0) {
         res.status(400).json({ error: 'Missing or invalid frames array' });
@@ -1478,14 +1498,18 @@ Instructions:
 
       // Gemini Vision Multimodal AI Engine
       const { ai, selectedModel } = getAiClientAndModel(req.body);
+      const sourceLangHint = sourceLang && sourceLang !== 'auto'
+        ? `Expected subtitle source language: ${sourceLang}. Focus OCR character recognition strictly on this language script.`
+        : 'Auto-detect the exact subtitle source language.';
 
       const batchPrompt = `You are a high-precision, strict OCR engine for video subtitles.
 You are given a sequence of ${frames.length} cropped video frame snapshots captured chronologically.
 Frame timestamps: ${frames.map((f: any) => f.timestamp.toFixed(2) + 's').join(', ')}.
+${sourceLangHint}
 ${customContext ? `Video context / topic: ${customContext}` : ''}
 
 STRICT CHARACTER FIDELITY & OCR INSTRUCTIONS:
-1. Carefully inspect EVERY single frame snapshot from Frame 1 to Frame ${frames.length}. Transcribe the EXACT printed/burned subtitle text verbatim (Chinese, English, Vietnamese, Japanese, etc.).
+1. Carefully inspect EVERY single frame snapshot from Frame 1 to Frame ${frames.length}. Transcribe the EXACT printed/burned subtitle text verbatim (Chinese, English, Vietnamese, Japanese, Korean, etc.).
 2. ACCURACY REQUIREMENT:
    - For Chinese text (Simplified / Traditional): Preserve exact CJK characters. DO NOT confuse similar Chinese characters (e.g. 已/己/巳, 治/冶, 未/末, 日/目, 视/祝). DO NOT hallucinate or guess characters that are not on screen.
    - For English/Vietnamese text: Preserve exact spelling, accent marks, and punctuation.
@@ -1624,16 +1648,11 @@ STRICT CHARACTER FIDELITY & OCR INSTRUCTIONS:
   // 4a. Context Synchronization Expert - Extract Global Movie Context & Entity Glossary
   app.post('/api/extract-global-context', async (req, res) => {
     try {
-      const { subtitles, targetLang = 'Tiếng Việt', customContext = '' } = req.body;
+      const { subtitles, targetLang = 'Tiếng Việt', customContext = '', existingGlossary = [] } = req.body;
 
       if (!subtitles || !Array.isArray(subtitles) || subtitles.length === 0) {
         res.status(400).json({ success: false, error: 'Missing subtitles array' });
         return;
-      }
-
-      let { ai, selectedModel } = getAiClientAndModel(req.body);
-      if (selectedModel === 'GEMINI_WEB') {
-        selectedModel = 'gemini-2.5-flash';
       }
 
       // Compact representation of subtitle dialogue lines for rapid script scanning
@@ -1643,77 +1662,133 @@ STRICT CHARACTER FIDELITY & OCR INSTRUCTIONS:
         return `[#${idx + 1} | ${start}s] ${text}`;
       }).filter((line: string) => !line.endsWith('] '));
 
-      // In case of very large transcripts, ensure we include full breadth or a dense representative sample
-      const fullScriptSample = scriptLines.length > 500
-        ? scriptLines.slice(0, 500).join('\n') + `\n... [and ${scriptLines.length - 500} more dialogue lines]`
-        : scriptLines.join('\n');
+      // Stratified full-script sampling for long videos so characters/places from middle & ending are never missed
+      let fullScriptSample = '';
+      if (scriptLines.length > 480) {
+        const headCount = 160;
+        const tailCount = 160;
+        const middleTarget = 160;
+        const head = scriptLines.slice(0, headCount);
+        const tail = scriptLines.slice(scriptLines.length - tailCount);
+        const middlePool = scriptLines.slice(headCount, scriptLines.length - tailCount);
+        const middle: string[] = [];
+        if (middlePool.length > 0) {
+          const step = middlePool.length / middleTarget;
+          for (let i = 0; i < middleTarget; i++) {
+            const pick = middlePool[Math.min(middlePool.length - 1, Math.floor(i * step))];
+            if (pick) middle.push(pick);
+          }
+        }
+        fullScriptSample = [
+          ...head,
+          `... [SAMPLED MIDDLE SECTION across ${middlePool.length} lines] ...`,
+          ...middle,
+          `... [FINAL ACT / ENDING] ...`,
+          ...tail,
+        ].join('\n');
+      } else {
+        fullScriptSample = scriptLines.join('\n');
+      }
 
       const userNotes = customContext.trim()
         ? `\nADDITIONAL USER-PROVIDED CONTEXT / GUIDANCE:\n${customContext.trim()}\n`
         : '';
 
+      const existingGlossaryNote = Array.isArray(existingGlossary) && existingGlossary.length > 0
+        ? `\nPRE-EXISTING GLOSSARY (keep or refine these established terms):\n${existingGlossary.slice(0, 60).map((g: any) => `- "${g.original}" -> "${g.translated}" (${g.type || 'term'})`).join('\n')}\n`
+        : '';
+
       const prompt = `You are a "context synchronization expert" - a master film script analyst, director of translation, and subtitle localization specialist for translating content into ${targetLang}.
 
 YOUR MISSION:
-Read through the following complete video subtitle script from beginning to end to understand the overall narrative arc, world setting, character relationships, dramatic conflicts, and dialogue tone.
+Read through the following video subtitle script from beginning to end to understand the overall narrative arc, world setting, character relationships, dramatic conflicts, and dialogue tone.
 From this full-script overview, extract a synchronized global context and terminology database that will be used as the single source of truth across all subsequent translation batches.
 
 EXTRACT AND RETURN THE FOLLOWING INFORMATION IN STRICT JSON FORMAT:
 1. "movieGenre": The primary and secondary genre of the video (e.g., "Cổ trang / Kiếm hiệp / Tiên hiệp", "Hiện đại / Đô thị / Tổng tài / Công sở", "Học đường / Thanh xuân", "Gia đình / Tình cảm", "Hành động / Tội phạm / Trinh thám", "Hài hước", "Kinh dị / Giật gân", "Khoa học viễn tưởng", "Anime / Hoạt hình", "Vlog / Phỏng vấn / Tài liệu", etc.).
 2. "eraAndSetting": Detailed era and setting description (e.g., "Thời nhà Tống, giang hồ võ lâm môn phái", "Seoul / Bắc Kinh hiện đại, công ty công nghệ", "Trường trung học, thanh xuân học đường").
-3. "characterPronounGuide": Specific guidelines for Vietnamese pronouns and address forms tailored to this genre and character dynamics:
+3. "characterPronounGuide": Specific guidelines for ${targetLang} pronouns and address forms tailored to this genre and character dynamics:
    - For Cổ trang/Kiếm hiệp: Specify forms like "ta / ngươi / huynh / muội / tỷ / đệ / sư phụ / đồ nhi / bản tọa / tiểu thư / công tử / vương gia...".
    - For Hiện đại: Specify forms like "tôi / anh / em / cậu / tớ / mày / tao / sếp / chú / bác..." based on age, hierarchy, and intimacy.
-   - MANDATORY DIRECTIVE: Explicitly emphasize that the translator MUST NEVER mechanically translate the same source pronoun (e.g. "你/我" in Chinese or "you/I" in English) into the same generic Vietnamese word for all characters. Pronouns must shift dynamically based on relationships, hierarchy, and emotion in each scene.
+   - MANDATORY DIRECTIVE: Explicitly emphasize that the translator MUST NEVER mechanically translate the same source pronoun (e.g. "你/我" in Chinese or "you/I" in English) into the same generic word for all characters. Pronouns must shift dynamically based on relationships, hierarchy, and emotion in each scene.
 4. "summary": A concise 2-3 sentence overview of the video's plot, core premise, and tone.
-5. "knownEntityGlossary": Array of all identified character names, locations, organizations/factions/sects, martial arts techniques, and key specialized terms with their standardized, authentic ${targetLang} translations (dịch trước chuẩn xác toàn bộ nhân vật, địa danh, thế lực, bang phái, phủ đệ):
-   - "original": Original term/name in source language (e.g., "张无忌", "光明顶", "苏老爷", "孙宗耀")
-   - "translated": Official, standard translation in ${targetLang} (e.g., "Trương Vô Kỵ", "Quang Minh Đỉnh", "Tô lão gia", "Tôn Tông Diệu")
+5. "knownEntityGlossary": Array of all identified character names, locations, organizations/factions/sects, martial arts techniques, and key specialized terms with their standardized, authentic ${targetLang} translations:
+   - "original": Original term/name in source language
+   - "translated": Official, standard translation in ${targetLang}
    - "type": "character" | "location" | "organization" | "term" | "other"
-   - "description": Brief context or role (e.g., "Nhân vật chính, gia chủ Tô phủ")${userNotes}
+   - "description": Brief context or role${userNotes}${existingGlossaryNote}
 
-FULL SUBTITLE SCRIPT:
+SUBTITLE SCRIPT:
 ${fullScriptSample}`;
 
-      const isProxyMode = (req.body.apiMode === 'proxy');
-      const genConfig: any = {
-        responseMimeType: 'application/json',
-      };
+      let responseText = '{}';
+      const apiMode = req.body.apiMode || 'direct';
 
-      if (!isProxyMode) {
-        genConfig.responseSchema = {
-          type: Type.OBJECT,
-          properties: {
-            movieGenre: { type: Type.STRING, description: 'Primary genre of the movie/video' },
-            eraAndSetting: { type: Type.STRING, description: 'Era and world setting' },
-            characterPronounGuide: { type: Type.STRING, description: 'Vietnamese address forms and dynamic pronoun rules' },
-            summary: { type: Type.STRING, description: 'Brief summary of the video plot' },
-            knownEntityGlossary: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  original: { type: Type.STRING, description: 'Original name/term in source language' },
-                  translated: { type: Type.STRING, description: 'Standardized translation in target language' },
-                  type: { type: Type.STRING, description: 'character | location | organization | term | other' },
-                  description: { type: Type.STRING, description: 'Role or explanation' },
+      if (apiMode === 'groq') {
+        const groqApiKey = req.body.groqApiKey || req.body.apiKey || process.env.GROQ_API_KEY;
+        const groqModel = req.body.groqModel || 'llama-3.3-70b-versatile';
+        console.log(`[Extract Global Context] Analyzing ${subtitles.length} subtitle lines with Groq (${groqModel})...`);
+        responseText = await translateWithGroq(prompt, {
+          apiKey: groqApiKey,
+          model: groqModel,
+          responseFormatJson: true,
+        });
+      } else if (apiMode === 'gemini_web' && req.body.geminiWebCookie) {
+        const session = await validateAndExtractGeminiWebSession(req.body.geminiWebCookie.trim());
+        if (!session.valid || !session.snlm0e) {
+          throw new Error(session.error || 'Phiên Google Account Gemini Web đã hết hạn hoặc không hợp lệ.');
+        }
+        console.log(`[Extract Global Context] Analyzing ${subtitles.length} subtitle lines with Gemini Web RPC...`);
+        const rpcRes = await executeGeminiWebPrompt(prompt, session);
+        if (!rpcRes.success || !rpcRes.text) {
+          throw new Error(rpcRes.error || 'Lỗi nhận dữ liệu từ Google Gemini Web RPC.');
+        }
+        responseText = rpcRes.text.trim();
+      } else {
+        let { ai, selectedModel } = getAiClientAndModel(req.body);
+        if (selectedModel === 'GEMINI_WEB') {
+          selectedModel = 'gemini-2.5-flash';
+        }
+        const isProxyMode = (apiMode === 'proxy');
+        const genConfig: any = {
+          responseMimeType: 'application/json',
+        };
+
+        if (!isProxyMode) {
+          genConfig.responseSchema = {
+            type: Type.OBJECT,
+            properties: {
+              movieGenre: { type: Type.STRING, description: 'Primary genre of the movie/video' },
+              eraAndSetting: { type: Type.STRING, description: 'Era and world setting' },
+              characterPronounGuide: { type: Type.STRING, description: 'Address forms and dynamic pronoun rules' },
+              summary: { type: Type.STRING, description: 'Brief summary of the video plot' },
+              knownEntityGlossary: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    original: { type: Type.STRING, description: 'Original name/term in source language' },
+                    translated: { type: Type.STRING, description: 'Standardized translation in target language' },
+                    type: { type: Type.STRING, description: 'character | location | organization | term | other' },
+                    description: { type: Type.STRING, description: 'Role or explanation' },
+                  },
+                  required: ['original', 'translated', 'type'],
                 },
-                required: ['original', 'translated', 'type'],
               },
             },
-          },
-          required: ['movieGenre', 'characterPronounGuide', 'knownEntityGlossary'],
-        };
+            required: ['movieGenre', 'characterPronounGuide', 'knownEntityGlossary'],
+          };
+        }
+
+        console.log(`[Extract Global Context] Analyzing ${subtitles.length} subtitle lines with model: ${selectedModel}...`);
+        const response = await generateContentWithRetry(ai, {
+          model: selectedModel,
+          contents: prompt,
+          config: genConfig,
+        });
+        responseText = (response.text || '{}').trim();
       }
 
-      console.log(`[Extract Global Context] Analyzing ${subtitles.length} subtitle lines with model: ${selectedModel}...`);
-      const response = await generateContentWithRetry(ai, {
-        model: selectedModel,
-        contents: prompt,
-        config: genConfig,
-      });
-
-      let responseText = (response.text || '{}').trim();
       if (responseText.startsWith('```')) {
         responseText = responseText.replace(/^```[a-zA-Z]*\n?/, '').replace(/\n?```$/, '').trim();
       }
@@ -1722,20 +1797,39 @@ ${fullScriptSample}`;
       try {
         globalContext = JSON.parse(responseText);
       } catch (parseErr) {
-        console.error('[Extract Global Context] JSON Parse Error:', parseErr, responseText.slice(0, 200));
-        globalContext = {
-          movieGenre: 'Tự động',
-          eraAndSetting: 'Hiện đại / Tự nhiên',
-          characterPronounGuide: 'Xưng hô linh hoạt theo quan hệ nhân vật.',
-          summary: '',
-          knownEntityGlossary: [],
-        };
+        const objMatch = responseText.match(/\{[\s\S]*\}/);
+        if (objMatch) {
+          try {
+            globalContext = JSON.parse(objMatch[0]);
+          } catch (_) {
+            console.error('[Extract Global Context] JSON Parse Error:', parseErr, responseText.slice(0, 200));
+          }
+        }
       }
 
-      // Ensure fields exist
+      if (!globalContext || typeof globalContext !== 'object') {
+        globalContext = {};
+      }
       if (!globalContext.movieGenre) globalContext.movieGenre = 'Tự động';
-      if (!globalContext.characterPronounGuide) globalContext.characterPronounGuide = 'Xưng hô tự nhiên theo bối cảnh.';
+      if (!globalContext.eraAndSetting) globalContext.eraAndSetting = 'Hiện đại / Tự nhiên';
+      if (!globalContext.characterPronounGuide) globalContext.characterPronounGuide = 'Xưng hô linh hoạt theo quan hệ nhân vật.';
       if (!Array.isArray(globalContext.knownEntityGlossary)) globalContext.knownEntityGlossary = [];
+
+      // Merge any pre-existing glossary entries that weren't returned
+      if (Array.isArray(existingGlossary) && existingGlossary.length > 0) {
+        const seen = new Set(
+          globalContext.knownEntityGlossary
+            .map((g: any) => String(g?.original || '').toLowerCase().trim())
+            .filter(Boolean)
+        );
+        for (const eg of existingGlossary) {
+          const origKey = String(eg?.original || '').toLowerCase().trim();
+          if (origKey && eg?.translated && !seen.has(origKey)) {
+            globalContext.knownEntityGlossary.push(eg);
+            seen.add(origKey);
+          }
+        }
+      }
 
       console.log(`[Extract Global Context] Successfully extracted: Genre="${globalContext.movieGenre}", Entities=${globalContext.knownEntityGlossary.length}`);
 
@@ -1828,7 +1922,7 @@ ${fullScriptSample}`;
     return text.trim();
   }
 
-  // 4. Batch Subtitle Translator / Refiner (with Global Genre, Entity Glossary & Previous Context Chaining)
+  // 4. Batch Subtitle Translator / Refiner (with Global Genre, Entity Glossary, Prev/Next Context & Policy Controls)
   app.post('/api/translate-batch', async (req, res) => {
     try {
       const {
@@ -1839,9 +1933,12 @@ ${fullScriptSample}`;
         customContext,
         contextPrompt,
         optimizeForTts = false,
+        avoidTikTokPolicy = false,
         globalContext,
         knownEntityGlossary,
         previousContext,
+        nextContext,
+        bypassCache = false,
       } = req.body;
 
       if (!subtitles || !Array.isArray(subtitles)) {
@@ -1849,9 +1946,21 @@ ${fullScriptSample}`;
         return;
       }
 
-      let { ai, selectedModel } = getAiClientAndModel(req.body);
-      if (selectedModel === 'GEMINI_WEB') {
-        selectedModel = 'gemini-2.5-flash';
+      const apiMode = req.body.apiMode || 'direct';
+      let ai: any = null;
+      let selectedModel = model;
+
+      if (apiMode === 'groq') {
+        selectedModel = req.body.groqModel || 'llama-3.3-70b-versatile';
+      } else if (apiMode === 'gemini_web') {
+        selectedModel = 'GEMINI_WEB';
+      } else {
+        const clientRes = getAiClientAndModel(req.body);
+        ai = clientRes.ai;
+        selectedModel = clientRes.selectedModel;
+        if (selectedModel === 'GEMINI_WEB') {
+          selectedModel = 'gemini-2.5-flash';
+        }
       }
 
       // Build consolidated context string for caching & prompt building
@@ -1862,14 +1971,20 @@ ${fullScriptSample}`;
 
       const effectiveCustomContext = (customContext || contextPrompt || '').trim();
       const genreString = (globalContext?.movieGenre || '').trim();
-      const cacheContextSig = `${genreString}::${combinedGlossaryList.map(g => `${g.original}=${g.translated}`).join('|')}::${effectiveCustomContext}`;
+      const pronounGuideString = (globalContext?.characterPronounGuide || '').trim();
+      const prevSig = Array.isArray(previousContext) && previousContext.length > 0
+        ? previousContext.map((p: any) => `${p.originalText || ''}=>${p.translatedText || ''}`).join(';')
+        : '';
+      const cacheContextSig = `${genreString}::${pronounGuideString}::${combinedGlossaryList.map(g => `${g.original}=${g.translated}`).join('|')}::${effectiveCustomContext}::tts=${Boolean(optimizeForTts)}::tiktok=${Boolean(avoidTikTokPolicy)}::prev=${prevSig}`;
 
-      // Identify which items are already in cache
       const finalTranslations: { id: string; translatedText: string }[] = [];
       const uncachedSubtitles: any[] = [];
 
       for (const sub of subtitles) {
-        const cached = getCachedTranslation(sub.originalText, targetLang, selectedModel, cacheContextSig);
+        const origLen = String(sub.originalText || '').trim().length;
+        // Skip cache for ultra-short context-sensitive lines unless previousContext exactly matches, or when bypassCache is requested
+        const canUseCache = !bypassCache && (origLen >= 10 || prevSig.length > 0);
+        const cached = canUseCache ? getCachedTranslation(sub.originalText, targetLang, selectedModel, cacheContextSig) : null;
         if (cached) {
           finalTranslations.push({ id: sub.id, translatedText: cached });
         } else {
@@ -1877,23 +1992,29 @@ ${fullScriptSample}`;
         }
       }
 
-      // If there are any uncached items, send them to Gemini with deep context chaining
       if (uncachedSubtitles.length > 0) {
         const ttsInstruction = optimizeForTts
           ? `
 === CHỈ THỊ DỊCH THOẠI CHO THUYẾT MINH / LỒNG TIẾNG (DUBBING TIMING) ===
-1. ƯU TIÊN SỐ 1 LÀ TỰ NHIÊN & ĐẦY ĐỦ Ý: Câu thoại tiếng Việt phải tự nhiên, tròn vành rõ chữ, có đầu có đuôi, đúng tâm lý nhân vật và truyền tải trọn vẹn cảm xúc.
-2. TUYỆT ĐỐI KHÔNG cắt xén bừa bãi làm câu què, cộc lốc, vô lễ, khó hiểu hay mất đi các chi tiết quan trọng của câu thoại gốc.
-3. Diễn đạt súc tích khi cần thiết: Với những câu quá dài, hãy tìm cách diễn đạt bằng tiếng Việt cô đọng, gãy gọn, thanh thoát để người đọc/thuyết minh bắt kịp nhịp hình, nhưng VẪN PHẢI GIỮ ĐỦ 100% Ý NGHĨA.
-4. Giữ trọn ngữ khí và kính ngữ: Giữ đúng đại từ xưng hô và các trợ từ tình thái tự nhiên (ạ, nhé, chứ, hả...).`
+1. ƯU TIÊN CÂN BẰNG THỜI LƯỢNG ĐỌC ("targetDurationSec"): Câu dịch sang ${targetLang} phải khớp nhịp hình, tự nhiên, tròn vành rõ chữ, có đầu có đuôi, đúng tâm lý nhân vật.
+2. TUYỆT ĐỐI KHÔNG cắt xén bừa bãi làm câu què, cộc lốc, vô lễ, khó hiểu hay mất đi chi tiết quan trọng của câu thoại gốc.
+3. Diễn đạt cô đọng thông minh: Với những câu có targetDurationSec ngắn, hãy chọn từ ngữ ${targetLang} súc tích, gãy gọn (khoảng 2.5 - 3.3 từ/giây đối với tiếng Việt) nhưng VẪN GIỮ ĐỦ 100% Ý NGHĨA.
+4. Giữ trọn ngữ khí và kính ngữ: Giữ đúng đại từ xưng hô và các trợ từ tình thái tự nhiên.`
           : `
 === NGUYÊN TẮC DỊCH THUẬT: TỰ NHIÊN, MƯỢT MÀ, TRỌN VẸN 100% Ý NGHĨA PHIM ===
 1. GIỮ TRỌN VẸN Ý NGHĨA & CẢM XÚC: Dịch đầy đủ, chính xác, không lược bớt bất kỳ thông tin, chi tiết hay hàm ý nào của câu thoại gốc. TUYỆT ĐỐI KHÔNG tóm tắt hay cắt giảm câu chữ.
-2. KHẨU KHÍ ĐIỆN ẢNH TỰ NHIÊN: Lời thoại phải tự nhiên như người Việt giao tiếp hàng ngày ngoài đời thực, câu cú mượt mà, trôi chảy, đúng phong cách phim ảnh.
-3. TRỢ TỪ NGỮ KHÍ PHONG PHÚ: Giữ đầy đủ các trợ từ ngữ khí tự nhiên của tiếng Việt (như: nhé, nha, đấy, mà, chứ, sao, cơ, ạ, dạ, hả...) để câu thoại có hồn và truyền tải đúng cảm xúc nhân vật.
+2. KHẨU KHÍ ĐIỆN ẢNH TỰ NHIÊN: Lời thoại phải tự nhiên như người bản xứ giao tiếp hàng ngày ngoài đời thực, câu cú mượt mà, trôi chảy, đúng phong cách phim ảnh.
+3. TRỢ TỪ NGỮ KHÍ PHONG PHÚ: Giữ đầy đủ các trợ từ ngữ khí tự nhiên (như trong tiếng Việt: nhé, nha, đấy, mà, chứ, sao, cơ, ạ, dạ, hả...) để câu thoại có hồn và truyền tải đúng cảm xúc nhân vật.
 4. XƯNG HÔ LINH HOẠT THEO TÌNH HUỐNG: Đảm bảo vai vế xưng hô chuẩn xác theo mối quan hệ, tuổi tác và sắc thái tình cảm giữa các nhân vật.`;
 
-        // Format Global Genre & Pronoun Directives
+        const policyInstruction = avoidTikTokPolicy
+          ? `
+=== CHẾ ĐỘ LỌC CHÍNH SÁCH NỀN TẢNG (TIKTOK / SOCIAL SAFE) ===
+- Tránh các từ ngữ thô tục nặng nề, kích động bạo lực trực diện, máu me cực đoan hoặc từ cấm dễ bị quét vi phạm trên TikTok/YouTube/Douyin bằng cách chuyển sang cách nói ẩn dụ/nhẹ nhàng hơn nhưng vẫn giữ đúng ý và kịch tính của cảnh phim.`
+          : `
+=== CHẾ ĐỘ DỊCH NGUYÊN VĂN SÁT TÔNG GỐC ===
+- Giữ nguyên sắc thái chân thực, gai góc, khẩu khí hoặc lời thoại nặng của nhân vật sát nguyên tác, không tự ý làm dịu hay kiểm duyệt câu thoại.`;
+
         let globalGenreSection = '';
         if (globalContext && (globalContext.movieGenre || globalContext.characterPronounGuide)) {
           globalGenreSection = `
@@ -1903,10 +2024,9 @@ ${fullScriptSample}`;
 ${globalContext.summary ? `- Tóm tắt cốt truyện: ${globalContext.summary}` : ''}
 - QUY TẮC ĐẠI TỪ NHÂN XƯNG (PRONOUN DIRECTIVES):
   ${globalContext.characterPronounGuide || 'Xưng hô phù hợp với thể loại phim và quan hệ nhân vật.'}
-  ⚠️ ĐẶC BIỆT LƯU Ý: TUYỆT ĐỐI KHÔNG được máy móc dịch cùng 1 đại từ gốc (ví dụ "你/我" trong tiếng Trung hoặc "you/I" trong tiếng Anh) thành cùng 1 từ tiếng Việt cho mọi nhân vật. Phải linh hoạt thay đổi đại từ (anh/em, tôi/cô, ta/ngươi, huynh/muội, sư phụ/đồ nhi, sếp/em, chú/cháu, mày/tao...) dựa trên mối quan hệ, vị thế xã hội, tuổi tác, giới tính và cảm xúc trong từng câu thoại!`;
+  ⚠️ ĐẶC BIỆT LƯU Ý: TUYỆT ĐỐI KHÔNG được máy móc dịch cùng 1 đại từ gốc (ví dụ "你/我" trong tiếng Trung hoặc "you/I" trong tiếng Anh) thành cùng 1 từ cho mọi nhân vật. Phải linh hoạt thay đổi đại từ dựa trên mối quan hệ, vị thế xã hội, tuổi tác, giới tính và cảm xúc trong từng câu thoại!`;
         }
 
-        // Format Known Entity Glossary
         let glossarySection = '';
         if (combinedGlossaryList.length > 0) {
           const glossaryEntries = combinedGlossaryList
@@ -1914,11 +2034,10 @@ ${globalContext.summary ? `- Tóm tắt cốt truyện: ${globalContext.summary}
             .join('\n');
           glossarySection = `
 === 2. KNOWN ENTITY GLOSSARY (BẮT BUỘC DỊCH ĐÚNG Y HỆT, KHÔNG ĐỔI) ===
-Bạn BẮT BUỘC phải dịch đúng 100% các tên nhân vật, địa danh, môn phái và thuật ngữ theo bảng chuẩn hóa sau. TUYỆT ĐỐI KHÔNG tự ý thay đổi cách phiên âm hoặc cách dịch giữa các batch:
+Bạn BẮT BUỘC phải dịch đúng 100% các tên nhân vật, địa danh, môn phái và thuật ngữ theo bảng chuẩn hóa sau (và tuân thủ trường "requiredEntities" nếu được đính kèm trong từng câu):
 ${glossaryEntries}`;
         }
 
-        // Format Previous Context Chaining
         let previousContextSection = '';
         if (Array.isArray(previousContext) && previousContext.length > 0) {
           const prevLines = previousContext
@@ -1926,16 +2045,23 @@ ${glossaryEntries}`;
             .join('\n');
           previousContextSection = `
 === 3. PREVIOUS CONTEXT (NGỮ CẢNH BATCH TRƯỚC - CHỈ THAM KHẢO, KHÔNG DỊCH LẠI) ===
-Dưới đây là các câu thoại liền trước để bạn nắm bắt mạch đối thoại, cảm xúc và xưng hô nhất quán:
-${prevLines}
-(Ghi chú: Các câu trên chỉ dùng để hiểu ngữ cảnh tiếp nối, KHÔNG đưa vào kết quả dịch output).`;
+${prevLines}`;
         }
 
-        // User Custom Context
+        let nextContextSection = '';
+        if (Array.isArray(nextContext) && nextContext.length > 0) {
+          const nextLines = nextContext
+            .map((n: any) => `[Câu sau] Gốc: "${n.originalText || ''}"`)
+            .join('\n');
+          nextContextSection = `
+=== 4. NEXT CONTEXT (CÂU NỐI TIẾP SAU BATCH NÀY - CHỈ ĐỂ HIỂU MẠCH CÂU VẮT DÒNG, KHÔNG DỊCH LẠI) ===
+${nextLines}`;
+        }
+
         let userNotesSection = '';
         if (effectiveCustomContext) {
           userNotesSection = `
-=== 4. GHI CHÚ BỔ SUNG TỪ NGƯỜI DÙNG ===
+=== 5. GHI CHÚ BỔ SUNG TỪ NGƯỜI DÙNG ===
 ${effectiveCustomContext}`;
         }
 
@@ -1949,35 +2075,43 @@ ${effectiveCustomContext}`;
 
         await Promise.all(
           chunks.map(async (chunk) => {
+            const payloadItems = chunk.map((s: any) => {
+              const item: any = {
+                id: s.id,
+                originalText: s.originalText,
+              };
+              if (optimizeForTts) {
+                const durSec = Math.max(0.5, ((s.endTime || 0) - (s.startTime || 0)) || 2.0);
+                item.targetDurationSec = Number(durSec.toFixed(1));
+              }
+              if (Array.isArray(s.syncedEntities) && s.syncedEntities.length > 0) {
+                item.requiredEntities = s.syncedEntities;
+              }
+              return item;
+            });
+
             const prompt = `You are a professional video translator, film dialog localizer, and context continuity expert.
-Translate the following list of subtitles into ${targetLang}.${globalGenreSection}${glossarySection}${previousContextSection}${userNotesSection}${ttsInstruction}
+Translate the following list of subtitles into ${targetLang}.${globalGenreSection}${glossarySection}${previousContextSection}${nextContextSection}${userNotesSection}${ttsInstruction}${policyInstruction}
 
 MANDATORY OUTPUT CONSTRAINTS (QUY TẮC BẮT BUỘC):
-1. "translatedText" must contain ONLY the spoken dialogue sentence in ${targetLang}.
-2. TUYỆT ĐỐI KHÔNG ghi chú thích, tính toán số ký tự, giải thích, "拼写错误", "(OK)", "chars", "Limit", "Correction", "平衡", hay ID vào trường "translatedText".
-3. TUYỆT ĐỐI KHÔNG lặp lại câu 2 lần hoặc ghép nối các câu trùng lặp.
-4. Output strictly a JSON object matching the required structure: {"translations": [{"id": string, "translatedText": string}]}.
+1. Return a translation for EVERY single "id" in the input list — NEVER omit or merge items.
+2. "translatedText" must contain ONLY the spoken dialogue sentence in ${targetLang}.
+3. TUYỆT ĐỐI KHÔNG ghi chú thích, tính toán số ký tự, giải thích, "拼写错误", "(OK)", "chars", "Limit", "Correction", "平衡", hay ID vào trường "translatedText".
+4. TUYỆT ĐỐI KHÔNG lặp lại câu 2 lần hoặc ghép nối các câu trùng lặp.
+5. Output strictly a JSON object matching:
+{
+  "translations": [{"id": string, "translatedText": string}],
+  "newEntities": [{"original": string, "translated": string, "type": "character" | "location" | "organization" | "term"}]
+}
+(Only include "newEntities" if you encounter new proper names/terms NOT already listed in KNOWN ENTITY GLOSSARY).
 
-=== SUBTITLES TO TRANSLATE (DỊCH DANH SÁCH NÀY) ===
-${JSON.stringify(chunk.map((s: any) => {
-  if (optimizeForTts) {
-    const durSec = Math.max(0.5, (s.endTime - s.startTime) || 2.0);
-    return {
-      id: s.id,
-      originalText: s.originalText,
-      targetDurationSec: Number(durSec.toFixed(1)),
-    };
-  }
-  return {
-    id: s.id,
-    originalText: s.originalText,
-  };
-}))}`;
+=== SUBTITLES TO TRANSLATE (DỊCH ĐẦY ĐỦ TẤT CẢ CÁC ID NÀY) ===
+${JSON.stringify(payloadItems)}`;
 
             try {
               let responseText = '';
 
-              if (req.body.apiMode === 'groq') {
+              if (apiMode === 'groq') {
                 const groqApiKey = req.body.groqApiKey || req.body.apiKey || process.env.GROQ_API_KEY;
                 const groqModel = req.body.groqModel || 'llama-3.3-70b-versatile';
                 responseText = await translateWithGroq(prompt, {
@@ -1985,7 +2119,7 @@ ${JSON.stringify(chunk.map((s: any) => {
                   model: groqModel,
                   responseFormatJson: true,
                 });
-              } else if (req.body.apiMode === 'gemini_web' && req.body.geminiWebCookie) {
+              } else if (apiMode === 'gemini_web' && req.body.geminiWebCookie) {
                 const session = await validateAndExtractGeminiWebSession(req.body.geminiWebCookie.trim());
                 if (!session.valid || !session.snlm0e) {
                   throw new Error(session.error || 'Phiên Google Account Gemini Web đã hết hạn hoặc không hợp lệ.');
@@ -1996,7 +2130,7 @@ ${JSON.stringify(chunk.map((s: any) => {
                 }
                 responseText = rpcRes.text.trim();
               } else {
-                const isProxyMode = (req.body.apiMode === 'proxy');
+                const isProxyMode = (apiMode === 'proxy');
                 const genConfig: any = {
                   responseMimeType: 'application/json',
                 };
@@ -2047,12 +2181,20 @@ ${JSON.stringify(chunk.map((s: any) => {
                 responseText = responseText.replace(/^```[a-zA-Z]*\n?/, '').replace(/\n?```$/, '').trim();
               }
 
-              let parsedResponse: any;
+              let parsedResponse: any = null;
               try {
                 parsedResponse = JSON.parse(responseText);
-              } catch (parseErr) {
-                console.warn('[Translate Batch] Direct JSON parse failed, trying array fallback:', parseErr);
-                parsedResponse = [];
+              } catch {
+                const objMatch = responseText.match(/\{[\s\S]*\}/);
+                const arrMatch = responseText.match(/\[\s*\{[\s\S]*\}\s*\]/);
+                const rawCandidate = objMatch ? objMatch[0] : (arrMatch ? arrMatch[0] : '');
+                if (rawCandidate) {
+                  try {
+                    parsedResponse = JSON.parse(rawCandidate);
+                  } catch (parseErr) {
+                    console.warn('[Translate Batch] Regex JSON parse failed:', parseErr);
+                  }
+                }
               }
 
               const newTranslations = Array.isArray(parsedResponse)
@@ -2063,22 +2205,35 @@ ${JSON.stringify(chunk.map((s: any) => {
                 newlyDiscoveredEntities.push(...parsedResponse.newEntities);
               }
 
-              // Map, sanitize and save each newly translated item to cache
-              if (Array.isArray(newTranslations)) {
+              if (Array.isArray(newTranslations) && newTranslations.length > 0) {
+                const matchedIds = new Set<string>();
                 newTranslations.forEach((nt: any) => {
-                  const originalSub = chunk.find((s) => s.id === nt.id);
-                  if (originalSub) {
-                    const durSec = Math.max(0.5, (originalSub.endTime - originalSub.startTime) || 2.0);
-                    const maxLen = Math.max(14, Math.floor(durSec * 16));
-                    const cleanText = cleanTranslatedSubtitleText(nt.translatedText || '');
-                    
-                    if (cleanText && cleanText.length > maxLen * 1.5) {
-                      console.warn(`[Sync Validation] Block ${originalSub.id} duration (${durSec.toFixed(1)}s) might be tight for translated length (${cleanText.length} chars vs target maxLength ${maxLen})`);
+                  const ntId = nt?.id !== undefined ? String(nt.id).trim() : '';
+                  const originalSub = chunk.find((s) => String(s.id).trim() === ntId);
+                  if (originalSub && !matchedIds.has(originalSub.id)) {
+                    matchedIds.add(originalSub.id);
+                    const cleanText = cleanTranslatedSubtitleText(nt.translatedText || nt.translation || '');
+                    if (cleanText) {
+                      setCachedTranslation(originalSub.originalText, targetLang, selectedModel, cleanText, cacheContextSig);
+                      finalTranslations.push({ id: originalSub.id, translatedText: cleanText });
                     }
-                    setCachedTranslation(originalSub.originalText, targetLang, selectedModel, cleanText, cacheContextSig);
-                    finalTranslations.push({ id: originalSub.id, translatedText: cleanText });
                   }
                 });
+
+                // Positional fallback if LLM preserved exact count/order but reformatted IDs
+                if (matchedIds.size < chunk.length && newTranslations.length === chunk.length) {
+                  chunk.forEach((originalSub, idx) => {
+                    if (!matchedIds.has(originalSub.id)) {
+                      const candidate = newTranslations[idx];
+                      const cleanText = cleanTranslatedSubtitleText(candidate?.translatedText || candidate?.translation || '');
+                      if (cleanText) {
+                        matchedIds.add(originalSub.id);
+                        setCachedTranslation(originalSub.originalText, targetLang, selectedModel, cleanText, cacheContextSig);
+                        finalTranslations.push({ id: originalSub.id, translatedText: cleanText });
+                      }
+                    }
+                  });
+                }
               }
             } catch (chunkErr) {
               console.warn(`[Translate Batch] Chunk failed:`, chunkErr);
@@ -2110,11 +2265,11 @@ ${JSON.stringify(chunk.map((s: any) => {
     }
   });
 
-  // 4b-1. Step 3 (Request 1): AI Subtitle Overload Screener (AI evaluates speech tempo and screens overloaded blocks)
+  // 4b-1. Step 3 (Request 1): AI Subtitle Overload Screener (Language-aware pre-filter + AI screening)
   app.post('/api/screen-tts-overload', async (req, res) => {
     try {
       const {
-        subtitles, // Array<{ id: string | number, text?: string, translatedText?: string, originalText?: string, duration?: number, startTime?: number, endTime?: number }>
+        subtitles,
         targetLang = 'Tiếng Việt',
       } = req.body;
 
@@ -2123,60 +2278,92 @@ ${JSON.stringify(chunk.map((s: any) => {
         return;
       }
 
-      let { ai, selectedModel } = getAiClientAndModel(req.body);
-      if (selectedModel === 'GEMINI_WEB') {
-        selectedModel = 'gemini-2.5-flash';
+      const lowerLang = String(targetLang || '').toLowerCase();
+      const isCjkOrThai = /trung|zh|chinese|nhật|ja|japanese|hàn|ko|korean|thái|th|thai/i.test(lowerLang);
+      const isEnglishOrLatin = /english|tiếng anh|en|pháp|french|fr/i.test(lowerLang);
+
+      // Mathematical pre-filter so we only ask AI about candidates approaching or exceeding comfortable speech tempo
+      const candidateItems: any[] = [];
+      for (const s of subtitles) {
+        const durSec = Math.max(0.3, Number(s.duration || ((s.endTime || 0) - (s.startTime || 0))) || 1.5);
+        const text = String(s.text || s.translatedText || s.originalText || '').trim();
+        if (!text) continue;
+
+        const cleanUnitStr = text.replace(/[\s.,!?;:'"()\-–—~…]+/g, '');
+        const wordCount = text.split(/\s+/).filter(Boolean).length;
+        const unitCount = isCjkOrThai ? cleanUnitStr.length : wordCount;
+        const maxComfortablePerSec = isCjkOrThai ? 4.5 : (isEnglishOrLatin ? 2.8 : 3.3);
+        const comfortableMaxUnits = Math.max(isCjkOrThai ? 4 : 3, durSec * maxComfortablePerSec);
+
+        // Send only candidates at >= 92% of comfortable limit to save API calls & avoid over-truncation
+        if (unitCount > comfortableMaxUnits * 0.92) {
+          candidateItems.push({
+            id: s.id,
+            text,
+            durationSec: Number(durSec.toFixed(2)),
+            unitCount,
+            recommendedMaxUnits: Math.max(isCjkOrThai ? 3 : 2, Math.floor(durSec * maxComfortablePerSec * 0.9)),
+          });
+        }
       }
 
-      // Format input for screening
-      const inputFormatted = subtitles.map((s: any) => {
-        const durSec = Math.max(0.3, Number(s.duration || (s.endTime - s.startTime)) || 1.5);
-        const text = String(s.text || s.translatedText || s.originalText || '').trim();
-        const wordCount = text.split(/\s+/).filter(Boolean).length;
-        return {
-          id: s.id,
-          text: text,
-          durationSec: Number(durSec.toFixed(2)),
-          wordCount: wordCount,
-        };
-      });
+      if (candidateItems.length === 0) {
+        console.log(`[Screen TTS Overload] Mathematical check passed 100% (${subtitles.length} blocks comfortably paced). Skipping AI screening call.`);
+        res.json({ success: true, overloadedItems: [] });
+        return;
+      }
+
+      const apiMode = req.body.apiMode || 'direct';
+      let ai: any = null;
+      let selectedModel = req.body.model || 'gemini-2.5-flash';
+      if (apiMode !== 'groq' && apiMode !== 'gemini_web') {
+        const clientRes = getAiClientAndModel(req.body);
+        ai = clientRes.ai;
+        selectedModel = clientRes.selectedModel;
+        if (selectedModel === 'GEMINI_WEB') selectedModel = 'gemini-2.5-flash';
+      }
 
       const BATCH_SIZE = 40;
       const chunks: any[][] = [];
-      for (let i = 0; i < inputFormatted.length; i += BATCH_SIZE) {
-        chunks.push(inputFormatted.slice(i, i + BATCH_SIZE));
+      for (let i = 0; i < candidateItems.length; i += BATCH_SIZE) {
+        chunks.push(candidateItems.slice(i, i + BATCH_SIZE));
       }
 
       const allOverloaded: { id: string | number; text: string; duration: number; reason: string; targetWords?: number }[] = [];
+      const tempoRule = isCjkOrThai
+        ? `Natural ${targetLang} voiceover tempo is approx 4.0 to 4.5 characters/syllables per second.`
+        : (isEnglishOrLatin
+          ? `Natural ${targetLang} voiceover tempo is approx 2.5 to 3.0 words per second.`
+          : `Natural ${targetLang} voiceover tempo is approx 2.8 to 3.4 words/syllables per second.`);
 
       for (const chunk of chunks) {
-        const prompt = `You are a professional film voiceover director, dubbing supervisor, and subtitle timing editor for Vietnamese Text-To-Speech (TTS).
-Analyze the following subtitle blocks and their display durations in seconds ("durationSec").
-Identify ONLY the subtitle blocks whose dialogue is genuinely OVERLOADED for Vietnamese voiceover — meaning there are too many words/syllables to be spoken naturally, clearly, and comfortably within its durationSec without rushing, clipping, or unnatural speedups.
+        const prompt = `You are a professional film voiceover director, dubbing supervisor, and subtitle timing editor for ${targetLang} Text-To-Speech (TTS).
+Analyze the following pre-screened candidate subtitle blocks and their display durations in seconds ("durationSec").
+Identify ONLY the subtitle blocks whose dialogue is genuinely OVERLOADED for ${targetLang} voiceover — meaning there are too many words/syllables to be spoken clearly and naturally within its durationSec without rushing, clipping, or unnatural speedups.
 
 CRITERIA:
-- Natural Vietnamese voiceover tempo is approx 2.5 to 3.5 words per second.
-- A block of 1.0s with 7-8 words is heavily overloaded.
-- A block of 2.5s with 6-7 words is NOT overloaded.
-- Do NOT flag sentences that can be comfortably spoken within the durationSec.
+- ${tempoRule}
+- Do NOT flag sentences that can be comfortably spoken within durationSec.
 
 For each genuinely overloaded block, return its "id", a brief "reason" in Vietnamese, and recommended "targetWords".
-Return strictly a JSON array:
-[
-  {
-    "id": 1,
-    "reason": "Thời lượng 1.2s quá ngắn cho câu 8 từ, nhịp đọc bị dồn",
-    "targetWords": 4
-  }
-]
-If NO subtitles are overloaded, return strictly: [].
+Return strictly a JSON object or array:
+{"overloadedItems": [{"id": "...", "reason": "...", "targetWords": 5}]}
+If NO subtitles are overloaded, return: {"overloadedItems": []}.
 
-Input Subtitles:
+Candidate Subtitles:
 ${JSON.stringify(chunk, null, 2)}`;
 
         let responseText = '';
 
-        if (req.body.apiMode === 'gemini_web' && req.body.geminiWebCookie) {
+        if (apiMode === 'groq') {
+          const groqApiKey = req.body.groqApiKey || req.body.apiKey || process.env.GROQ_API_KEY;
+          const groqModel = req.body.groqModel || 'llama-3.3-70b-versatile';
+          responseText = await translateWithGroq(prompt, {
+            apiKey: groqApiKey,
+            model: groqModel,
+            responseFormatJson: true,
+          });
+        } else if (apiMode === 'gemini_web' && req.body.geminiWebCookie) {
           const session = await validateAndExtractGeminiWebSession(req.body.geminiWebCookie.trim());
           if (!session.valid || !session.snlm0e) {
             throw new Error(session.error || 'Phiên Google Account Gemini Web đã hết hạn.');
@@ -2187,7 +2374,7 @@ ${JSON.stringify(chunk, null, 2)}`;
           }
           responseText = rpcRes.text.trim();
         } else {
-          const isProxyMode = (req.body.apiMode === 'proxy');
+          const isProxyMode = (apiMode === 'proxy');
           const genConfig: any = {
             responseMimeType: 'application/json',
           };
@@ -2207,7 +2394,7 @@ ${JSON.stringify(chunk, null, 2)}`;
             };
           }
 
-          console.log(`[Screen TTS Overload] AI screening ${chunk.length} subtitle blocks for TTS pacing with ${selectedModel}...`);
+          console.log(`[Screen TTS Overload] AI screening ${chunk.length} candidate subtitle blocks for TTS pacing with ${selectedModel}...`);
           const response = await generateContentWithRetry(ai, {
             model: selectedModel,
             contents: prompt,
@@ -2220,29 +2407,31 @@ ${JSON.stringify(chunk, null, 2)}`;
           responseText = responseText.replace(/^```[a-zA-Z]*\n?/, '').replace(/\n?```$/, '').trim();
         }
 
-        let parsed: any[] = [];
+        let parsed: any = [];
         try {
           parsed = JSON.parse(responseText);
         } catch {
-          const match = responseText.match(/\[[\s\S]*\]/);
+          const match = responseText.match(/(\[[\s\S]*\]|\{[\s\S]*\})/);
           if (match) {
             try { parsed = JSON.parse(match[0]); } catch (_) {}
           }
         }
 
-        if (Array.isArray(parsed)) {
-          for (const item of parsed) {
-            if (item && item.id !== undefined) {
-              const originalItem = chunk.find((c: any) => String(c.id) === String(item.id));
-              if (originalItem) {
-                allOverloaded.push({
-                  id: originalItem.id,
-                  text: originalItem.text,
-                  duration: originalItem.durationSec,
-                  reason: item.reason || 'Quá tải thời lượng đọc TTS',
-                  targetWords: item.targetWords,
-                });
-              }
+        const list = Array.isArray(parsed)
+          ? parsed
+          : (Array.isArray(parsed?.overloadedItems) ? parsed.overloadedItems : []);
+
+        for (const item of list) {
+          if (item && item.id !== undefined) {
+            const originalItem = chunk.find((c: any) => String(c.id) === String(item.id));
+            if (originalItem) {
+              allOverloaded.push({
+                id: originalItem.id,
+                text: originalItem.text,
+                duration: originalItem.durationSec,
+                reason: item.reason || 'Quá tải thời lượng đọc TTS',
+                targetWords: item.targetWords || originalItem.recommendedMaxUnits,
+              });
             }
           }
         }
@@ -2261,12 +2450,14 @@ ${JSON.stringify(chunk, null, 2)}`;
     }
   });
 
-  // 4b-2. Step 3 (Request 2): AI Subtitle Overload Optimizer (Targeted rewriting for screened overloaded lines)
+  // 4b-2. Step 3 (Request 2): AI Subtitle Overload Optimizer (With Context, Glossary & Pronoun Preservation)
   app.post('/api/optimize-tts-overload', async (req, res) => {
     try {
       const {
-        overloadedBlocks, // Array<{ id: string | number, text: string, duration: string | number, reason?: string, targetWords?: number }>
+        overloadedBlocks,
         targetLang = 'Tiếng Việt',
+        globalContext,
+        knownEntityGlossary,
       } = req.body;
 
       if (!overloadedBlocks || !Array.isArray(overloadedBlocks) || overloadedBlocks.length === 0) {
@@ -2274,12 +2465,28 @@ ${JSON.stringify(chunk, null, 2)}`;
         return;
       }
 
-      let { ai, selectedModel } = getAiClientAndModel(req.body);
-      if (selectedModel === 'GEMINI_WEB') {
-        selectedModel = 'gemini-2.5-flash';
+      const apiMode = req.body.apiMode || 'direct';
+      let ai: any = null;
+      let selectedModel = req.body.model || 'gemini-2.5-flash';
+      if (apiMode !== 'groq' && apiMode !== 'gemini_web') {
+        const clientRes = getAiClientAndModel(req.body);
+        ai = clientRes.ai;
+        selectedModel = clientRes.selectedModel;
+        if (selectedModel === 'GEMINI_WEB') selectedModel = 'gemini-2.5-flash';
       }
 
-      // Chunk into batches of 25 to ensure reliable output and no token cutoffs
+      let contextSection = '';
+      if (globalContext && (globalContext.movieGenre || globalContext.characterPronounGuide)) {
+        contextSection += `\n=== NGỮ CẢNH PHIM & XƯNG HÔ BẮT BUỘC ===\n- Thể loại: ${globalContext.movieGenre || 'Tự động'}\n- Quy tắc xưng hô: ${globalContext.characterPronounGuide || 'Giữ nguyên như câu gốc'}`;
+      }
+      if (Array.isArray(knownEntityGlossary) && knownEntityGlossary.length > 0) {
+        const entries = knownEntityGlossary
+          .slice(0, 80)
+          .map((g: any) => `"${g.original}" -> "${g.translated}"`)
+          .join(', ');
+        contextSection += `\n- Tên riêng/thuật ngữ chuẩn (KHÔNG ĐƯỢC ĐỔI): ${entries}`;
+      }
+
       const BATCH_SIZE = 25;
       const chunks: any[][] = [];
       for (let i = 0; i < overloadedBlocks.length; i += BATCH_SIZE) {
@@ -2289,35 +2496,41 @@ ${JSON.stringify(chunk, null, 2)}`;
       const allOptimized: { id: string | number; text: string }[] = [];
 
       for (const chunk of chunks) {
-        const inputFormatted = chunk.map((b: any) => {
-          let durStr = String(b.duration || '1.5');
-          durStr = durStr.replace('.', ',');
-          return {
-            id: b.id,
-            text: String(b.text || ''),
-            durationSec: durStr,
-            issue: b.reason || 'Quá dài so với thời lượng',
-            targetWords: b.targetWords,
-          };
-        });
+        const inputFormatted = chunk.map((b: any) => ({
+          id: b.id,
+          text: String(b.text || ''),
+          durationSec: Number(b.duration || 1.5),
+          issue: b.reason || 'Quá dài so với thời lượng',
+          targetWords: b.targetWords,
+          ...(b.prevText ? { prevLineContext: b.prevText } : {}),
+          ...(b.nextText ? { nextLineContext: b.nextText } : {}),
+        }));
 
-        const prompt = `You are a master dialogue localizer and voiceover adapter for Vietnamese film dubbing and Text-To-Speech (TTS).
-The following subtitle blocks were screened by the voiceover director as OVERLOADED for their display duration.
-Rewrite and optimize the "text" of each block following these professional voiceover dubbing rules:
+        const prompt = `You are a master dialogue localizer and voiceover adapter for ${targetLang} film dubbing and Text-To-Speech (TTS).
+The following subtitle blocks were screened as OVERLOADED for their display duration.${contextSection}
+Rewrite and optimize ONLY the "text" of each block in ${targetLang} following these professional voiceover dubbing rules:
 
-1. RÚT GỌN TỰ NHIÊN, CÔ ĐỌNG: Viết lại câu thoại ngắn gọn, súc tích, gãy gọn, giàu cảm xúc để giọng đọc TTS phát âm thoải mái, tự nhiên trong đúng thời lượng hiển thị (durationSec).
-2. GIỮ NGUYÊN 100% Ý NGHĨA & CẢM XÚC: Không thêm thắt điều bịa đặt, không làm biến đổi nghĩa gốc hay làm câu cộc lốc, vô nghĩa.
-3. TUYỆT ĐỐI BẢO LƯU ĐẠI TỪ XƯNG HÔ (PRONOUNS): Giữ nguyên quan hệ xưng hô của nhân vật (chú/cháu, anh/em, tôi/cô, ta/ngươi, sếp/em...) y như câu gốc.
+1. RÚT GỌN TỰ NHIÊN, CÔ ĐỌNG: Viết lại câu thoại ngắn gọn, súc tích, gãy gọn, giàu cảm xúc để giọng đọc TTS phát âm thoải mái trong đúng durationSec (tham khảo prevLineContext/nextLineContext để giữ mạch tự nhiên).
+2. GIỮ NGUYÊN 100% Ý NGHĨA, TÊN RIÊNG & CẢM XÚC: Không thêm thắt điều bịa đặt, không làm biến đổi nghĩa gốc hay làm câu cộc lốc, vô nghĩa.
+3. TUYỆT ĐỐI BẢO LƯU ĐẠI TỪ XƯNG HÔ (PRONOUNS): Giữ nguyên quan hệ xưng hô của nhân vật y như câu gốc và bảng quy tắc xưng hô.
 4. KHÔNG DÙNG DẤU NGOẶC KÉP, KHÔNG CHÚ THÍCH: Chỉ trả về duy nhất lời thoại lồng tiếng hoàn chỉnh.
 
-Format: [{"id": 1, "text": "câu thoại ngắn gọn đã tối ưu"}]
+Format strictly JSON: {"optimizedBlocks": [{"id": "...", "text": "câu thoại ngắn gọn đã tối ưu"}]}
 
 Input Blocks to Optimize:
 ${JSON.stringify(inputFormatted, null, 2)}`;
 
         let responseText = '';
 
-        if (req.body.apiMode === 'gemini_web' && req.body.geminiWebCookie) {
+        if (apiMode === 'groq') {
+          const groqApiKey = req.body.groqApiKey || req.body.apiKey || process.env.GROQ_API_KEY;
+          const groqModel = req.body.groqModel || 'llama-3.3-70b-versatile';
+          responseText = await translateWithGroq(prompt, {
+            apiKey: groqApiKey,
+            model: groqModel,
+            responseFormatJson: true,
+          });
+        } else if (apiMode === 'gemini_web' && req.body.geminiWebCookie) {
           const session = await validateAndExtractGeminiWebSession(req.body.geminiWebCookie.trim());
           if (!session.valid || !session.snlm0e) {
             throw new Error(session.error || 'Phiên Google Account Gemini Web đã hết hạn hoặc không hợp lệ.');
@@ -2328,7 +2541,7 @@ ${JSON.stringify(inputFormatted, null, 2)}`;
           }
           responseText = rpcRes.text.trim();
         } else {
-          const isProxyMode = (req.body.apiMode === 'proxy');
+          const isProxyMode = (apiMode === 'proxy');
           const genConfig: any = {
             responseMimeType: 'application/json',
           };
@@ -2360,23 +2573,24 @@ ${JSON.stringify(inputFormatted, null, 2)}`;
           responseText = responseText.replace(/^```[a-zA-Z]*\n?/, '').replace(/\n?```$/, '').trim();
         }
 
-        let parsed: any[] = [];
+        let parsed: any = [];
         try {
           parsed = JSON.parse(responseText);
         } catch (e) {
-          console.warn('[Optimize TTS Overload] JSON parse failed, trying regex match:', e);
-          const match = responseText.match(/\[[\s\S]*\]/);
+          const match = responseText.match(/(\[[\s\S]*\]|\{[\s\S]*\})/);
           if (match) {
-            try {
-              parsed = JSON.parse(match[0]);
-            } catch (_) {}
+            try { parsed = JSON.parse(match[0]); } catch (_) {}
           }
         }
 
-        if (Array.isArray(parsed)) {
-          for (const item of parsed) {
-            if (item && item.id !== undefined && item.text) {
-              const cleaned = cleanTranslatedSubtitleText(String(item.text));
+        const list = Array.isArray(parsed)
+          ? parsed
+          : (Array.isArray(parsed?.optimizedBlocks) ? parsed.optimizedBlocks : []);
+
+        for (const item of list) {
+          if (item && item.id !== undefined && item.text) {
+            const cleaned = cleanTranslatedSubtitleText(String(item.text));
+            if (cleaned) {
               allOptimized.push({
                 id: item.id,
                 text: cleaned,
@@ -2409,25 +2623,58 @@ ${JSON.stringify(inputFormatted, null, 2)}`;
         return;
       }
 
-      const isGroqMode = (req.body.apiMode === 'groq');
+      const apiMode = req.body.apiMode || 'direct';
+      const isGroqMode = apiMode === 'groq';
+      const isGeminiWebMode = apiMode === 'gemini_web' && Boolean(req.body.geminiWebCookie?.trim());
       const groqApiKey = req.body.groqApiKey || req.body.apiKey || process.env.GROQ_API_KEY;
       const groqModel = req.body.groqModel || 'llama-3.3-70b-versatile';
 
       let ai: any = null;
       let selectedModel = model;
+      let geminiWebSession: any = null;
 
-      if (!isGroqMode) {
+      if (isGeminiWebMode) {
+        geminiWebSession = await validateAndExtractGeminiWebSession(req.body.geminiWebCookie.trim());
+        if (!geminiWebSession.valid || !geminiWebSession.snlm0e) {
+          throw new Error(geminiWebSession.error || 'Phiên Google Account Gemini Web đã hết hạn hoặc không hợp lệ.');
+        }
+      } else if (!isGroqMode) {
         const clientRes = getAiClientAndModel(req.body);
         ai = clientRes.ai;
         selectedModel = clientRes.selectedModel;
       }
 
+      const attachInheritedMetadata = (parsedItems: any[], rawChunkSubs: any[]) => {
+        if (!Array.isArray(parsedItems)) return [];
+        return parsedItems.map((item: any) => {
+          const sT = typeof item?.startTime === 'number' ? item.startTime : 0;
+          const eT = typeof item?.endTime === 'number' ? item.endTime : sT + 1.0;
+          let bestMatch: any = null;
+          let bestOverlap = -1;
+          for (const raw of rawChunkSubs) {
+            const rawStart = typeof raw.startTime === 'number' ? raw.startTime : 0;
+            const rawEnd = typeof raw.endTime === 'number' ? raw.endTime : rawStart + 1.0;
+            const overlap = Math.min(eT, rawEnd) - Math.max(sT, rawStart);
+            if (overlap > bestOverlap) {
+              bestOverlap = overlap;
+              bestMatch = raw;
+            }
+          }
+          return {
+            ...item,
+            sourceLang: item?.sourceLang || bestMatch?.sourceLang,
+            boundingBox: item?.boundingBox || bestMatch?.boundingBox,
+          };
+        });
+      };
+
       const processDedupChunk = async (chunkSubs: any[]) => {
-        // Strip unused fields (base64 image, ROI boxes, internal IDs) to create a ultra-compact JSON payload for AI
+        // Strip unused fields (base64 image, ROI boxes, internal IDs) to create an ultra-compact JSON payload for AI
         const compactChunk = chunkSubs.map((s: any) => ({
           startTime: typeof s.startTime === 'number' ? Number(s.startTime.toFixed(2)) : 0,
           endTime: typeof s.endTime === 'number' ? Number(s.endTime.toFixed(2)) : 0,
           originalText: String(s.originalText || s.text || '').trim(),
+          ...(s.sourceLang ? { sourceLang: s.sourceLang } : {}),
         }));
 
         const prompt = `You are GeminiSubtitleRefiner, an expert AI video subtitle post-processor.
@@ -2456,6 +2703,26 @@ YOUR 4 STRICT WORKFLOW MANDATES:
 Raw Subtitles Input:
 ${JSON.stringify(compactChunk)}`;
 
+        if (isGeminiWebMode) {
+          const webPrompt = `${prompt}\n\nCRITICAL: Return ONLY a valid JSON array starting with [ and ending with ]. Do not include markdown code block syntax.`;
+          const rpcRes = await executeGeminiWebPrompt(webPrompt, geminiWebSession);
+          if (!rpcRes.success || !rpcRes.text) {
+            throw new Error(rpcRes.error || 'Lỗi nhận dữ liệu từ Google Gemini Web RPC.');
+          }
+          let cleanJson = rpcRes.text.trim();
+          if (cleanJson.startsWith('```')) {
+            cleanJson = cleanJson.replace(/^```[a-zA-Z]*\n?/, '').replace(/\n?```$/, '').trim();
+          }
+          let parsed: any = [];
+          try {
+            parsed = JSON.parse(cleanJson);
+          } catch {
+            const arrMatch = cleanJson.match(/\[\s*\{[\s\S]*\}\s*\]/);
+            if (arrMatch) parsed = JSON.parse(arrMatch[0]);
+          }
+          return attachInheritedMetadata(Array.isArray(parsed) ? parsed : [], chunkSubs);
+        }
+
         if (isGroqMode) {
           const groqPrompt = `${prompt}\n\nCRITICAL: Return ONLY a valid JSON array starting with [ and ending with ]. Do not include markdown code block syntax.`;
           const responseText = await translateWithGroq(groqPrompt, {
@@ -2475,10 +2742,10 @@ ${JSON.stringify(compactChunk)}`;
             console.error('[Groq Deduplicate Subtitles] JSON Parse Error:', cleanJson);
             throw new Error(`Groq AI returned non-JSON text: ${cleanJson.slice(0, 150)}`);
           }
-          return Array.isArray(parsed) ? parsed : [];
+          return attachInheritedMetadata(Array.isArray(parsed) ? parsed : [], chunkSubs);
         }
 
-        const isProxyMode = (req.body.apiMode === 'proxy');
+        const isProxyMode = (apiMode === 'proxy');
         const genConfig: any = {
           responseMimeType: 'application/json',
         };
@@ -2521,7 +2788,7 @@ ${JSON.stringify(compactChunk)}`;
           console.error('[Deduplicate Subtitles] JSON Parse Error for response:', responseText);
           throw new Error(`Proxy AI returned non-JSON text: ${responseText.slice(0, 150)}`);
         }
-        return Array.isArray(parsed) ? parsed : [];
+        return attachInheritedMetadata(Array.isArray(parsed) ? parsed : [], chunkSubs);
       };
 
       const DEDUP_CHUNK_SIZE = 50;
@@ -2531,24 +2798,31 @@ ${JSON.stringify(compactChunk)}`;
       if (subtitles.length <= DEDUP_CHUNK_SIZE) {
         cleaned = await processDedupChunk(subtitles);
       } else {
-        console.log(`[Deduplicate Subtitles] Subtitle array size is ${subtitles.length}, processing in parallel chunks of ${DEDUP_CHUNK_SIZE}...`);
+        console.log(`[Deduplicate Subtitles] Subtitle array size is ${subtitles.length}, processing in concurrency-limited chunks of ${DEDUP_CHUNK_SIZE}...`);
         const chunks: any[][] = [];
         for (let i = 0; i < subtitles.length; i += DEDUP_CHUNK_SIZE) {
           chunks.push(subtitles.slice(i, i + DEDUP_CHUNK_SIZE));
         }
 
-        // Process all chunks concurrently in parallel
-        const chunkResults = await Promise.all(
-          chunks.map(async (chunk, idx) => {
+        const chunkResults: any[][] = new Array(chunks.length);
+        const MAX_CONCURRENCY = isGeminiWebMode ? 1 : Math.min(3, chunks.length);
+        let nextChunkIdx = 0;
+
+        const runWorker = async () => {
+          while (nextChunkIdx < chunks.length) {
+            const idx = nextChunkIdx++;
+            const chunk = chunks[idx];
             try {
-              return await processDedupChunk(chunk);
+              chunkResults[idx] = await processDedupChunk(chunk);
             } catch (chunkErr) {
               console.error(`[Deduplicate Subtitles] Chunk #${idx} (${chunk.length} items) FAILED:`, chunkErr);
               lastChunkError = chunkErr;
-              return chunk; // Fallback to raw OCR chunk on error
+              chunkResults[idx] = chunk; // Fallback to raw OCR chunk on error
             }
-          })
-        );
+          }
+        };
+
+        await Promise.all(Array.from({ length: MAX_CONCURRENCY }, () => runWorker()));
 
         for (const resChunk of chunkResults) {
           if (Array.isArray(resChunk)) {

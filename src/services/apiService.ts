@@ -1,8 +1,28 @@
 import axios from 'axios';
+import { Capacitor } from '@capacitor/core';
 import { GenDownloadResponse } from '../types';
-import { resolveApiUrl, isMobileCapacitor, getBackendBaseUrl } from '../utils/apiUrl';
+import { resolveApiUrl } from '../utils/apiUrl';
+import { YoutubeDLNative } from '../plugins/youtubeDLPlugin';
 
 export const fetchDownloadLinks = async (videoUrl: string): Promise<GenDownloadResponse> => {
+  if (Capacitor.isNativePlatform() && Capacitor.getPlatform() === 'android') {
+    try {
+      const nativeRes = await YoutubeDLNative.extractVideo({ url: videoUrl });
+      if (nativeRes && nativeRes.success) {
+        return nativeRes;
+      }
+      return {
+        success: false,
+        error: nativeRes?.error || 'yt-dlp trên thiết bị không trả về được dữ liệu video.'
+      };
+    } catch (nativeErr: any) {
+      return {
+        success: false,
+        error: nativeErr?.message || 'Lỗi yt-dlp native trên Android khi bóc tách liên kết.'
+      };
+    }
+  }
+
   try {
     const endpoint = resolveApiUrl('/api/download');
     const response = await axios.post<GenDownloadResponse>(endpoint, {
@@ -10,12 +30,6 @@ export const fetchDownloadLinks = async (videoUrl: string): Promise<GenDownloadR
     });
     return response.data;
   } catch (error: any) {
-    if (isMobileCapacitor() && !getBackendBaseUrl()) {
-      return {
-        success: false,
-        error: 'Trên app Android APK, vui lòng vào Cài Đặt (Config) và nhập link "Máy Chủ Backend (Render/Cloud)" để bóc tách video bằng yt-dlp.'
-      };
-    }
     return {
       success: false,
       error: error?.response?.data?.error || error?.message || 'Không thể kết nối đến máy chủ hoặc link không hợp lệ.'

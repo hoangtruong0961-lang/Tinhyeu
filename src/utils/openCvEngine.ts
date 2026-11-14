@@ -217,39 +217,72 @@ export function enhanceImageOpenCV(
 ): boolean {
   if (!isOpenCVLoaded() || width <= 0 || height <= 0) return false;
 
+  const toDelete: any[] = [];
   try {
     const cv = cvInstance;
     const imgData = ctx.getImageData(0, 0, width, height);
 
     const src = new cv.Mat(height, width, cv.CV_8UC4);
+    toDelete.push(src);
     src.data.set(imgData.data);
 
-    const gray = new cv.Mat();
-    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+    // Convert RGBA -> RGB -> Lab so CLAHE only enhances Luminance (L), preserving yellow/cyan/red subtitle colors
+    const rgb = new cv.Mat();
+    toDelete.push(rgb);
+    cv.cvtColor(src, rgb, cv.COLOR_RGBA2RGB);
 
-    // Apply CLAHE
+    const lab = new cv.Mat();
+    toDelete.push(lab);
+    cv.cvtColor(rgb, lab, cv.COLOR_RGB2Lab);
+
+    const labChannels = new cv.MatVector();
+    toDelete.push(labChannels);
+    cv.split(lab, labChannels);
+
+    const lChannel = labChannels.get(0);
+    toDelete.push(lChannel);
+
     const clahe = new cv.CLAHE(clipLimit, new cv.Size(tileGridSize, tileGridSize));
-    const claheMat = new cv.Mat();
-    clahe.apply(gray, claheMat);
+    toDelete.push(clahe);
+    const lClahe = new cv.Mat();
+    toDelete.push(lClahe);
+    clahe.apply(lChannel, lClahe);
 
-    // Convert back to RGBA
+    // Replace L channel and merge back
+    const mergedChannels = new cv.MatVector();
+    toDelete.push(mergedChannels);
+    const aChannel = labChannels.get(1);
+    const bChannel = labChannels.get(2);
+    toDelete.push(aChannel, bChannel);
+    mergedChannels.push_back(lClahe);
+    mergedChannels.push_back(aChannel);
+    mergedChannels.push_back(bChannel);
+
+    const mergedLab = new cv.Mat();
+    toDelete.push(mergedLab);
+    cv.merge(mergedChannels, mergedLab);
+
+    const enhancedRgb = new cv.Mat();
+    toDelete.push(enhancedRgb);
+    cv.cvtColor(mergedLab, enhancedRgb, cv.COLOR_Lab2RGB);
+
     const dst = new cv.Mat();
-    cv.cvtColor(claheMat, dst, cv.COLOR_GRAY2RGBA);
+    toDelete.push(dst);
+    cv.cvtColor(enhancedRgb, dst, cv.COLOR_RGB2RGBA);
 
     // Put enhanced image back to canvas
     const enhancedData = new ImageData(new Uint8ClampedArray(dst.data), width, height);
     ctx.putImageData(enhancedData, 0, 0);
 
-    // Memory cleanup
-    src.delete();
-    gray.delete();
-    claheMat.delete();
-    dst.delete();
-    clahe.delete();
-
     return true;
   } catch (err) {
     console.warn('[OpenCV.js enhanceImageOpenCV Exception]', err);
     return false;
+  } finally {
+    for (const mat of toDelete) {
+      try {
+        if (mat && typeof mat.delete === 'function') mat.delete();
+      } catch (_) {}
+    }
   }
 }

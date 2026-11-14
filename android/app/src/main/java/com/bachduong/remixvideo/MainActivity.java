@@ -15,6 +15,7 @@ public class MainActivity extends BridgeActivity {
         registerPlugin(GeminiWebViewPlugin.class);
         registerPlugin(FFmpegKitPlugin.class);
         registerPlugin(VieNeuPlugin.class);
+        registerPlugin(YoutubeDLPlugin.class);
         super.onCreate(savedInstanceState);
 
         try {

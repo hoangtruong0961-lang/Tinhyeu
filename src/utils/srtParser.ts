@@ -37,7 +37,8 @@ export function exportToASS(
   videoWidth: number = 1920,
   videoHeight: number = 1080
 ): string {
-  const fontName = styleConfig?.fontFamily || 'Arial';
+  const rawFont = (styleConfig?.fontFamily || 'Arial').split(',')[0].replace(/['"]/g, '').trim();
+  const fontName = rawFont || 'Arial';
   const fontSize = Math.round((styleConfig?.fontSize || 22) * (videoHeight / 540));
   const primaryColor = hexToAssColor(styleConfig?.fontColor || '#FFFFFF', 100);
   const outlineColor = hexToAssColor(styleConfig?.outlineColor || '#000000', 100);

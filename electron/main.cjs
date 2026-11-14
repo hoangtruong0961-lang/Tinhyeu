@@ -689,8 +689,10 @@ ipcMain.handle('ffmpeg:renderSubtitledVideo', async (event, payload) => {
     const hasQsv = encodersOutput.includes('h264_qsv');
     const hasVideotoolbox = encodersOutput.includes('h264_videotoolbox');
 
-    // Check if input video has an audio stream
+    // Check if input video has an audio stream and probe video dimensions
     let hasVideoAudio = true;
+    let srcWidth = 0;
+    let srcHeight = 0;
     try {
       const probeOut = execSync(`ffprobe -v error -select_streams a -show_entries stream=index -of csv=p=0 "${finalInputVideoPath}"`, {
         encoding: 'utf-8',
@@ -701,6 +703,41 @@ ipcMain.handle('ffmpeg:renderSubtitledVideo', async (event, payload) => {
     } catch (_) {
       hasVideoAudio = true;
     }
+    try {
+      const dimOut = execSync(`ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 "${finalInputVideoPath}"`, {
+        encoding: 'utf-8',
+        stdio: ['pipe', 'pipe', 'ignore'],
+        timeout: 3000
+      }).trim();
+      const parts = dimOut.split('x');
+      if (parts.length === 2) {
+        srcWidth = parseInt(parts[0], 10) || 0;
+        srcHeight = parseInt(parts[1], 10) || 0;
+      }
+    } catch (_) {}
+
+    const toEven = (v) => Math.max(2, Math.floor(v / 2) * 2);
+    const shortSideMap = { '4k': 2160, '2k': 1440, '1080p': 1080, '720p': 720, '480p': 480 };
+    let scaleWidth = options.targetWidth || 0;
+    let scaleHeight = options.targetHeight || 0;
+    if (options.resolution && options.resolution !== 'original' && shortSideMap[options.resolution] && srcWidth > 0 && srcHeight > 0) {
+      const shortSide = shortSideMap[options.resolution];
+      const aspect = srcWidth / srcHeight;
+      if (srcWidth >= srcHeight) {
+        scaleWidth = toEven(Math.round(shortSide * aspect));
+        scaleHeight = toEven(shortSide);
+      } else {
+        scaleWidth = toEven(shortSide);
+        scaleHeight = toEven(Math.round(shortSide / aspect));
+      }
+    } else if (scaleWidth > 0 && scaleHeight > 0) {
+      scaleWidth = toEven(scaleWidth);
+      scaleHeight = toEven(scaleHeight);
+    }
+
+    const outExt = (options.format || path.extname(outputPath).replace('.', '') || 'mp4').toLowerCase();
+    const isWebm = outExt === 'webm';
+    const isMovOrMp4 = outExt === 'mp4' || outExt === 'mov';
 
     const videoVolume = options.videoVolume ?? (voiceoverAudioPath ? 0.35 : 1.0);
     const ttsVolume = options.ttsVolume ?? 1.0;
@@ -718,6 +755,22 @@ ipcMain.handle('ffmpeg:renderSubtitledVideo', async (event, payload) => {
     const effKey = (options.videoAudioEffect || options.audioEffect || '').trim().toLowerCase();
     const effectFilter = options.audioFilter || AUDIO_EFFECT_FFMPEG_MAP[effKey] || '';
     const videoAudioChain = effectFilter ? `${effectFilter},volume=${videoVolume}` : `volume=${videoVolume}`;
+
+    // Build video filter chain cleanly (scale + fps + subtitles)
+    const videoFilters = [];
+    if (scaleWidth > 0 && scaleHeight > 0) {
+      videoFilters.push(`scale=${scaleWidth}:${scaleHeight}`);
+    } else {
+      videoFilters.push('scale=trunc(iw/2)*2:trunc(ih/2)*2');
+    }
+    if (options.fps && options.fps > 0) {
+      videoFilters.push(`fps=${options.fps}`);
+    }
+    if (subMode === 'hardsub' && subFilePath) {
+      const escapedSubPath = subFilePath.replace(/\\/g, '/').replace(/:/g, '\\:').replace(/'/g, "'\\''");
+      videoFilters.push(`subtitles='${escapedSubPath}'`);
+    }
+    const videoFilterChain = videoFilters.join(',');
 
     // Helper to construct FFmpeg argument list with strict input-first ordering
     const buildFfmpegArgs = (encoderType) => {
@@ -741,94 +794,89 @@ ipcMain.handle('ffmpeg:renderSubtitledVideo', async (event, payload) => {
         softsubInputIndex = currentInputIndex++;
       }
 
-      // Stream Mappings and Filtergraph
-      if (subMode === 'hardsub' && subFilePath) {
-        const escapedSubPath = subFilePath.replace(/\\/g, '/').replace(/:/g, '\\:').replace(/'/g, "'\\''");
-
-        if (voiceoverAudioPath) {
-          if (hasVideoAudio) {
-            args.push(
-              '-filter_complex',
-              `[0:v]subtitles='${escapedSubPath}'[vout];[0:a]${videoAudioChain}[a0];[${voiceoverInputIndex}:a]volume=${ttsVolume}[a1];[a0][a1]amix=inputs=2:duration=first:dropout_transition=2[aout]`,
-              '-map', '[vout]',
-              '-map', '[aout]'
-            );
-          } else {
-            args.push(
-              '-filter_complex',
-              `[0:v]subtitles='${escapedSubPath}'[vout];[${voiceoverInputIndex}:a]volume=${ttsVolume}[aout]`,
-              '-map', '[vout]',
-              '-map', '[aout]'
-            );
-          }
-        } else {
-          if (hasVideoAudio && (videoVolume !== 1.0 || effectFilter)) {
-            args.push(
-              '-filter_complex',
-              `[0:v]subtitles='${escapedSubPath}'[vout];[0:a]${videoAudioChain}[aout]`,
-              '-map', '[vout]',
-              '-map', '[aout]'
-            );
-          } else {
-            args.push(
-              '-filter_complex',
-              `[0:v]subtitles='${escapedSubPath}'[vout]`,
-              '-map', '[vout]',
-              '-map', '0:a?'
-            );
-          }
-        }
-      } else {
-        // Softsub or None
-        args.push('-map', '0:v:0');
-
-        if (voiceoverAudioPath) {
-          if (hasVideoAudio) {
-            args.push(
-              '-filter_complex',
-              `[0:a]${videoAudioChain}[a0];[${voiceoverInputIndex}:a]volume=${ttsVolume}[a1];[a0][a1]amix=inputs=2:duration=first:dropout_transition=2[aout]`,
-              '-map', '[aout]'
-            );
-          } else {
-            args.push(
-              '-filter_complex',
-              `[${voiceoverInputIndex}:a]volume=${ttsVolume}[aout]`,
-              '-map', '[aout]'
-            );
-          }
-        } else {
-          if (hasVideoAudio && (videoVolume !== 1.0 || effectFilter)) {
-            args.push(
-              '-filter_complex',
-              `[0:a]${videoAudioChain}[aout]`,
-              '-map', '[aout]'
-            );
-          } else {
-            args.push('-map', '0:a?');
-          }
-        }
-
-        // Map Softsub stream cleanly
-        if (subMode === 'softsub' && softsubInputIndex !== -1) {
-          args.push('-map', `${softsubInputIndex}:0`);
-          args.push('-c:s', 'mov_text', '-metadata:s:s:0', 'language=vie');
-        }
+      const filterParts = [];
+      if (videoFilterChain) {
+        filterParts.push(`[0:v]${videoFilterChain}[vout]`);
       }
 
+      let audioMap = '0:a?';
+      if (voiceoverAudioPath) {
+        if (hasVideoAudio && videoVolume > 0) {
+          filterParts.push(`[0:a]${videoAudioChain}[a0]`);
+          filterParts.push(`[${voiceoverInputIndex}:a]volume=${ttsVolume}[a1]`);
+          filterParts.push(`[a0][a1]amix=inputs=2:duration=first:dropout_transition=2[aout]`);
+        } else {
+          filterParts.push(`[${voiceoverInputIndex}:a]volume=${ttsVolume}[aout]`);
+        }
+        audioMap = '[aout]';
+      } else if (hasVideoAudio && (videoVolume !== 1.0 || effectFilter)) {
+        filterParts.push(`[0:a]${videoAudioChain}[aout]`);
+        audioMap = '[aout]';
+      }
+
+      if (filterParts.length > 0) {
+        args.push('-filter_complex', filterParts.join(';'));
+      }
+
+      args.push('-map', videoFilterChain ? '[vout]' : '0:v:0');
+      args.push('-map', audioMap);
+
+      if (subMode === 'softsub' && softsubInputIndex !== -1) {
+        args.push('-map', `${softsubInputIndex}:0`);
+        args.push('-c:s', outExt === 'mkv' ? 'srt' : 'mov_text', '-metadata:s:s:0', 'language=vie');
+      }
+
+      const targetBitrate = options.bitrate && options.bitrate > 0 ? Number(options.bitrate) : 0;
+
       // Video Encoder Selection
-      if (encoderType === 'nvenc') {
-        args.push('-c:v', 'h264_nvenc', '-preset', 'medium', '-cq', String(options.crf || 20), '-pix_fmt', 'yuv420p');
+      if (isWebm) {
+        args.push('-c:v', 'libvpx-vp9', '-deadline', 'good', '-cpu-used', '2', '-pix_fmt', 'yuv420p');
+        if (targetBitrate > 0) {
+          args.push('-b:v', String(targetBitrate));
+        } else {
+          args.push('-crf', String(options.crf || 30), '-b:v', '0');
+        }
+      } else if (encoderType === 'nvenc') {
+        args.push('-c:v', 'h264_nvenc', '-preset', 'medium', '-pix_fmt', 'yuv420p');
+        if (targetBitrate > 0) {
+          args.push('-b:v', String(targetBitrate));
+        } else {
+          args.push('-cq', String(options.crf || 20));
+        }
       } else if (encoderType === 'qsv') {
-        args.push('-c:v', 'h264_qsv', '-global_quality', String(options.crf || 20), '-pix_fmt', 'nv12');
+        args.push('-c:v', 'h264_qsv', '-pix_fmt', 'nv12');
+        if (targetBitrate > 0) {
+          args.push('-b:v', String(targetBitrate));
+        } else {
+          args.push('-global_quality', String(options.crf || 20));
+        }
       } else if (encoderType === 'videotoolbox') {
-        args.push('-c:v', 'h264_videotoolbox', '-q:v', '65', '-pix_fmt', 'yuv420p');
+        args.push('-c:v', 'h264_videotoolbox', '-pix_fmt', 'yuv420p');
+        if (targetBitrate > 0) {
+          args.push('-b:v', String(targetBitrate));
+        } else {
+          args.push('-q:v', '65');
+        }
       } else {
         // Safe CPU libx264
-        args.push('-c:v', 'libx264', '-preset', options.preset || 'fast', '-crf', String(options.crf || 20), '-pix_fmt', 'yuv420p');
+        args.push('-c:v', 'libx264', '-preset', options.preset || 'fast', '-pix_fmt', 'yuv420p');
+        if (targetBitrate > 0) {
+          args.push('-b:v', String(targetBitrate), '-maxrate', String(targetBitrate), '-bufsize', String(targetBitrate * 2));
+        } else {
+          args.push('-crf', String(options.crf || 20));
+        }
       }
 
       // Audio & Container Flags
-      args.push('-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart', outputPath);
+      if (isWebm) {
+        args.push('-c:a', 'libopus', '-b:a', '128k');
+      } else {
+        args.push('-c:a', 'aac', '-b:a', '192k');
+      }
+      if (isMovOrMp4) {
+        args.push('-movflags', '+faststart');
+      }
+      args.push(outputPath);
       return args;
     };
 

@@ -1,17 +1,14 @@
 /**
- * WebGPU & WebGL2 Hardware-Accelerated Video Rendering Engine
- * 
- * Provides ultra-fast GPU-accelerated video frame processing:
- * - Direct GPU texture upload and blitting
- * - High-speed multi-pass GPU Gaussian Blur for blur overlays (3-5x faster than CPU 2D Canvas)
- * - Auto-detects WebGPU -> WebGL2 -> WebGL1 with seamless fallback
+ * Hardware-Accelerated WebGL2/WebGL1 Frame Blit Engine
+ *
+ * Provides direct GPU texture upload and blitting onto canvas with automatic CPU fallback.
  */
 
 import { BlurOverlay } from '../types';
 
 export interface GpuEngineStatus {
   isSupported: boolean;
-  backend: 'webgpu' | 'webgl2' | 'webgl1' | 'software';
+  backend: 'webgl2' | 'webgl1' | 'software';
   rendererName: string;
   vendorName: string;
   maxTextureSize: number;
@@ -21,7 +18,6 @@ export interface GpuEngineStatus {
 class GpuShaderEngine {
   private glCanvas: HTMLCanvasElement | OffscreenCanvas | null = null;
   private gl: WebGL2RenderingContext | WebGLRenderingContext | null = null;
-  private isWebGPUAvailable: boolean = false;
   private engineStatus: GpuEngineStatus | null = null;
 
   // Shader program & buffer caches
@@ -44,11 +40,6 @@ class GpuShaderEngine {
     let vendorName = 'Generic';
     let maxTextureSize = 2048;
     let isSupported = false;
-
-    // Check WebGPU support
-    if (typeof navigator !== 'undefined' && (navigator as any).gpu) {
-      this.isWebGPUAvailable = true;
-    }
 
     // Check WebGL2 / WebGL1
     try {
@@ -97,7 +88,7 @@ class GpuShaderEngine {
     }
 
     const description = isSupported
-      ? `${this.isWebGPUAvailable ? 'WebGPU / ' : ''}${backend.toUpperCase()} (${rendererName})`
+      ? `${backend.toUpperCase()} (${rendererName})`
       : 'CPU Fallback (Hardware acceleration disabled)';
 
     this.engineStatus = {

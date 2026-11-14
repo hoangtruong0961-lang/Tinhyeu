@@ -9,7 +9,13 @@ export interface VideoMedia {
   directUrl?: string;
   size?: string;
   isAudioOnly?: boolean;
+  hasAudio?: boolean;
+  audioUrl?: string;
+  resolution?: string;
+  fps?: number;
   formatId?: string;
+  httpHeaders?: Record<string, string>;
+  audioHeaders?: Record<string, string>;
 }
 
 export interface SubtitleTrack {
@@ -22,6 +28,7 @@ export interface SubtitleTrack {
   isDanmaku?: boolean;
   author?: string;
   downloadUrl?: string;
+  httpHeaders?: Record<string, string>;
 }
 
 export interface GenDownloadResponse {
@@ -34,6 +41,7 @@ export interface GenDownloadResponse {
   views?: string;
   medias?: VideoMedia[];
   subtitles?: SubtitleTrack[];
+  httpHeaders?: Record<string, string>;
   error?: string;
 }
 
@@ -399,7 +407,7 @@ export interface VideoClip {
 
 export type CapCutTab = 'extract' | 'stt' | 'translate' | 'style' | 'audio' | 'subtitles' | 'filters' | 'config' | 'find_replace' | 'overlays' | 'text' | 'bgm' | 'phu_de' | 'am_thanh';
 
-export type ExportEngine = 'mediabunny' | 'ffmpeg_wasm' | 'ffmpeg_native' | 'ffmpeg_mobile' | 'mediarecorder';
+export type ExportEngine = 'mediabunny' | 'ffmpeg_native' | 'ffmpeg_mobile' | 'mediarecorder';
 export type ExportVideoFormat = 'mp4' | 'webm' | 'mov' | 'mkv';
 export type ExportResolution = 'original' | '4k' | '2k' | '1080p' | '720p' | '480p';
 export type ExportFrameRate = 'original' | 60 | 50 | 30 | 25 | 24;

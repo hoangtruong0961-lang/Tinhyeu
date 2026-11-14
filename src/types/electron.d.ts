@@ -41,6 +41,12 @@ export interface ElectronFfmpegRenderOptions {
   ttsVolume?: number;
   videoAudioEffect?: string;
   audioFilter?: string;
+  resolution?: 'original' | '4k' | '2k' | '1080p' | '720p' | '480p';
+  targetWidth?: number;
+  targetHeight?: number;
+  fps?: number;
+  bitrate?: number;
+  format?: 'mp4' | 'webm' | 'mov' | 'mkv';
 }
 
 export interface ElectronFfmpegRenderPayload {

@@ -39,10 +39,13 @@ import { storeMediaFileDB, getMediaFileUrlDB, cacheRemoteVideoToDB, hasMediaFile
 import { extractAudioFromVideoBlob, uploadFileInChunks } from '../utils/audioExporter';
 import { runClientSideLocalOcrBatch, StreamingOcrPool, hasSubtitleTextCandidate, applyBackgroundFilter } from '../utils/localPaddleOcrEngine';
 import { extractFramesWithWebCodecs, extractFramesParallelVideo, isWebCodecsSupported } from '../utils/webcodecsFrameExtractor';
+import { resolveApiUrl } from '../utils/apiUrl';
 import {
+  extractGlobalContextWithGeminiWeb,
   translateSubtitleChunkWithGeminiWeb,
   screenTtsOverloadWithGeminiWeb,
   optimizeTtsOverloadWithGeminiWeb,
+  deduplicateSubtitlesWithGeminiWeb,
 } from '../utils/geminiWebHelper';
 import { VideoPlayer } from './VideoPlayer';
 import { CapCutTimeline } from './CapCutTimeline';
@@ -479,18 +482,41 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
   const isNativeCapacitorApp = Capacitor.isNativePlatform();
 
   const [exportSettings, setExportSettings] = useState<ExportSettingsConfig>(() => {
+    const defaultEngine = isElectronApp ? 'ffmpeg_native' : (isNativeCapacitorApp ? 'ffmpeg_mobile' : 'mediabunny');
     try {
       const saved = localStorage.getItem('capcut_export_settings');
       if (saved) {
-        return JSON.parse(saved);
+        const parsed = JSON.parse(saved);
+        let engine = parsed.engine;
+        if (
+          !engine ||
+          engine === 'ffmpeg_wasm' ||
+          (engine === 'ffmpeg_mobile' && !isNativeCapacitorApp) ||
+          (engine === 'ffmpeg_native' && !isElectronApp)
+        ) {
+          engine = defaultEngine;
+        }
+        const format = engine === 'mediarecorder' && (parsed.format === 'mov' || parsed.format === 'mkv')
+          ? 'mp4'
+          : (parsed.format || 'mp4');
+        return {
+          engine,
+          format,
+          resolution: parsed.resolution || 'original',
+          frameRate: parsed.frameRate || 'original',
+          bitrate: parsed.bitrate || 'recommended',
+          gpuAcceleration: parsed.gpuAcceleration !== false,
+          videoAudioEffect: parsed.videoAudioEffect,
+        };
       }
     } catch {}
     return {
-      engine: isElectronApp ? 'ffmpeg_native' : (isNativeCapacitorApp ? 'ffmpeg_mobile' : 'mediabunny'),
+      engine: defaultEngine,
       format: 'mp4',
       resolution: 'original',
       frameRate: 'original',
       bitrate: 'recommended',
+      gpuAcceleration: true,
     };
   });
 
@@ -999,13 +1025,14 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
       ctx.drawImage(video, cropX, cropY, cropW, cropH, 0, 0, canvas.width, canvas.height);
       const croppedBase64 = canvas.toDataURL('image/jpeg', 0.92);
 
-      const res = await fetch('/api/ocr-extract', {
+      const res = await fetch(resolveApiUrl('/api/ocr-extract'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           image: croppedBase64,
           timestamp: currentTime,
           targetLang,
+          sourceLang: appSettings?.sourceLang || 'auto',
           model: selectedModel,
           apiMode: appSettings?.apiMode,
           apiKey: appSettings?.apiKey,
@@ -1189,13 +1216,152 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
     });
   };
 
+  const findBestMatchingBoundingBox = (
+    targetStart: number,
+    targetEnd: number,
+    rawList: SubtitleItem[],
+    fallbackRoi: RegionROI
+  ): RegionROI => {
+    let bestBox: RegionROI | undefined;
+    let bestOverlap = -1;
+    for (const r of rawList) {
+      const overlap = Math.min(targetEnd, r.endTime) - Math.max(targetStart, r.startTime);
+      if (overlap > bestOverlap && r.boundingBox) {
+        bestOverlap = overlap;
+        bestBox = r.boundingBox;
+      }
+    }
+    return bestBox || fallbackRoi;
+  };
+
+  const runAiDeduplicatePipeline = async (
+    rawList: SubtitleItem[],
+    fallbackRoi: RegionROI,
+    keepTranslatedText: boolean = false
+  ): Promise<{ subtitles: any[]; succeeded: boolean; error: string | null }> => {
+    if (!rawList || rawList.length === 0) {
+      return { subtitles: [], succeeded: false, error: null };
+    }
+
+    if (appSettings?.apiMode === 'gemini_web' && appSettings?.geminiWebCookie?.trim()) {
+      const webRes = await deduplicateSubtitlesWithGeminiWeb(
+        rawList.map((s) => ({
+          startTime: s.startTime,
+          endTime: s.endTime,
+          originalText: s.originalText,
+          sourceLang: s.sourceLang,
+          translatedText: keepTranslatedText ? s.translatedText : '',
+          boundingBox: s.boundingBox,
+        })),
+        {
+          cookie: appSettings.geminiWebCookie.trim(),
+          snlm0e: appSettings.geminiWebSessionToken,
+          targetLang,
+        }
+      );
+      if (webRes.success && webRes.subtitles.length > 0) {
+        return { subtitles: webRes.subtitles, succeeded: true, error: null };
+      }
+      return {
+        subtitles: [],
+        succeeded: false,
+        error: webRes.error || 'Gemini Web không trả về dữ liệu phụ đề OCR hợp lệ.',
+      };
+    }
+
+    const CLIENT_CHUNK_SIZE = 80;
+    const chunks: SubtitleItem[][] = [];
+    for (let i = 0; i < rawList.length; i += CLIENT_CHUNK_SIZE) {
+      chunks.push(rawList.slice(i, i + CLIENT_CHUNK_SIZE));
+    }
+
+    const combinedCleaned: any[] = [];
+    let anySucceeded = false;
+    let lastError: string | null = null;
+
+    for (let c = 0; c < chunks.length; c++) {
+      if (cancelScanRef.current) break;
+      const chunk = chunks[c];
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 90000);
+
+      try {
+        const dedupRes = await fetch(resolveApiUrl('/api/deduplicate-subtitles'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal: controller.signal,
+          body: JSON.stringify({
+            subtitles: chunk,
+            targetLang,
+            model: selectedModel,
+            apiMode: appSettings?.apiMode,
+            apiKey: appSettings?.apiKey,
+            groqApiKey: appSettings?.groqApiKey,
+            groqModel: appSettings?.groqModel,
+            geminiWebCookie: appSettings?.geminiWebCookie,
+            proxyUrl: appSettings?.proxyUrl,
+            proxyKey: appSettings?.proxyKey,
+            proxyTargetModel: appSettings?.proxyTargetModel,
+            customModelName: appSettings?.customModelName,
+            proxyNoApiKey: appSettings?.proxyNoApiKey,
+          }),
+        });
+
+        clearTimeout(timeoutId);
+
+        let dedupData: any = {};
+        try {
+          dedupData = await dedupRes.json();
+        } catch {
+          const rawText = await dedupRes.text().catch(() => '');
+          dedupData = { error: `Invalid JSON response: ${rawText.slice(0, 300)}` };
+        }
+
+        if (dedupRes.ok && dedupData.success && Array.isArray(dedupData.subtitles) && dedupData.subtitles.length > 0) {
+          anySucceeded = true;
+          for (const item of dedupData.subtitles) {
+            const sT = typeof item.startTime === 'number' ? item.startTime : 0;
+            const eT = typeof item.endTime === 'number' ? item.endTime : sT + 1.2;
+            combinedCleaned.push({
+              ...item,
+              startTime: sT,
+              endTime: eT,
+              boundingBox: item.boundingBox || findBestMatchingBoundingBox(sT, eT, chunk, fallbackRoi),
+            });
+          }
+        } else {
+          lastError = dedupData.message || dedupData.error || `HTTP ${dedupRes.status} ${dedupRes.statusText}`;
+          if (chunks.length > 1) {
+            combinedCleaned.push(...chunk);
+          }
+        }
+      } catch (dedupErr: any) {
+        clearTimeout(timeoutId);
+        lastError = dedupErr?.name === 'AbortError'
+          ? 'Quá thời gian chờ phản hồi AI (90s)'
+          : (dedupErr?.message || 'Không thể kết nối đến máy chủ AI');
+        if (chunks.length > 1) {
+          combinedCleaned.push(...chunk);
+        }
+      }
+    }
+
+    if (!anySucceeded) {
+      return { subtitles: [], succeeded: false, error: lastError };
+    }
+
+    combinedCleaned.sort((a, b) => (a.startTime || 0) - (b.startTime || 0));
+    return { subtitles: combinedCleaned, succeeded: true, error: lastError };
+  };
+
   // Full scan handler
   const handleStartFullScan = async (
     startT: number,
     endT: number,
     stepInterval: number,
     customContext: string,
-    speedUpMode: boolean = false
+    speedUpMode: boolean = false,
+    sourceLangOverride?: string
   ) => {
     cancelScanRef.current = false;
     const video = videoRef.current;
@@ -1203,6 +1369,12 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
 
     video.pause();
     const initialMainVideoTime = video.currentTime;
+
+    const effectiveSourceLang = sourceLangOverride || appSettings?.sourceLang || 'zh_cn';
+    const isPaddleUnsupportedScript = /^(vi|ja|ko|th|auto)/i.test(effectiveSourceLang);
+    const requestedLocalPaddle = appSettings?.ocrEngine === 'paddleocr';
+    const autoSwitchedToVision = requestedLocalPaddle && isPaddleUnsupportedScript;
+    const isLocalPaddle = requestedLocalPaddle && !autoSwitchedToVision;
 
     const timePoints: number[] = [];
     for (let t = startT; t <= endT; t += stepInterval) {
@@ -1216,16 +1388,17 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
       totalFrames,
       currentTime: startT,
       totalTime: endT - startT,
-      message: speedUpMode
+      message: autoSwitchedToVision
+        ? `🤖 Ngôn ngữ (${effectiveSourceLang}) cần Gemini Vision AI để đọc chuẩn — đang trích xuất khung hình...`
+        : speedUpMode
         ? '⚡ Đang khởi tạo bộ bóc tách 1 Sub = 1 Frame siêu tốc trên RAM...'
-        : '⚡ Đang khởi tạo 8 luồng GPU bóc tách video song song siêu tốc...',
+        : '⚡ Đang khởi tạo đa luồng GPU bóc tách video song song siêu tốc...',
       percentage: 0,
     });
 
     const frameBatches: { image: string; pixelData?: Uint8ClampedArray; width?: number; height?: number; timestamp: number }[][] = [];
     let currentBatch: { image: string; pixelData?: Uint8ClampedArray; width?: number; height?: number; timestamp: number }[] = [];
     let capturedFramesCount = 0;
-    let filteredNoTextCount = 0;
     const detectedTransitions: number[] = [];
 
     // Dynamic optimal batch size: 6-10 frames per batch for complete temporal video context
@@ -1236,9 +1409,7 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
     const effectiveBgFilterMode = appSettings?.bgFilterMode && appSettings.bgFilterMode !== 'none' ? appSettings.bgFilterMode : 'none';
     const effectiveBgFilterStrength = (effectiveBgFilterMode !== 'none' && appSettings?.bgFilterStrength) ? appSettings.bgFilterStrength : 0;
     const isAdaptiveSampling = appSettings?.adaptiveSampling !== false;
-    console.log('[OCR-Config] Image Filter Mode:', effectiveBgFilterMode, 'Strength:', effectiveBgFilterStrength, '| Adaptive Frame Sampling:', isAdaptiveSampling ? 'ON' : 'OFF', '| Speed Up (1 Sub/Frame):', speedUpMode ? 'ON' : 'OFF');
-
-    const isLocalPaddle = appSettings?.ocrEngine === 'paddleocr';
+    console.log('[OCR-Config] Engine:', isLocalPaddle ? 'paddleocr' : 'gemini_vision', '| SourceLang:', effectiveSourceLang, '| Filter:', effectiveBgFilterMode, effectiveBgFilterStrength, '| Adaptive:', isAdaptiveSampling, '| SpeedUp:', speedUpMode);
 
     // Initialize Streaming OCR Worker Pool for local PaddleOCR to process frames concurrently during video extraction
     let streamingOcrPool: StreamingOcrPool | null = null;
@@ -1248,9 +1419,19 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
         stepInterval,
         transitionTimestamps: detectedTransitions,
         minConfidence: appSettings?.confidenceThreshold ?? 0.70,
-        sourceLang: 'zh',
+        sourceLang: effectiveSourceLang,
         targetLang,
         speedUpMode,
+        paddleModelVariant: appSettings?.paddleOcrModelVariant || 'small',
+        ocrConfig: {
+          detDbBoxThresh: appSettings?.detDbBoxThresh,
+          detDbThresh: appSettings?.detDbThresh,
+          detLimitSideLen: appSettings?.detLimitSideLen,
+          maxTextLength: appSettings?.maxTextLength,
+          dropScore: appSettings?.dropScore,
+          paddleOcrLang: appSettings?.paddleOcrLang,
+          cls: appSettings?.cls,
+        },
         onProgress: (msg) => {
           const activeWorkers = streamingOcrPool ? streamingOcrPool.getBusyWorkersCount() : 0;
           const totalWorkers = streamingOcrPool ? streamingOcrPool.getPoolSize() : 0;
@@ -1279,112 +1460,153 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
       await streamingOcrPool.init();
     }
 
-    // True WebCodecs VideoDecoder Extractor with Frame-Diffing transition detection
-    await extractFramesWithWebCodecs({
-      videoUrl: videoSourceUrl,
-      crossOrigin: video.crossOrigin,
-      startT,
-      endT,
-      stepInterval,
-      roi,
-      bgFilterMode: effectiveBgFilterMode,
-      bgFilterStrength: effectiveBgFilterStrength,
-      adaptiveSampling: appSettings?.adaptiveSampling ?? true,
-      speedUpMode,
-      shouldCancel: () => cancelScanRef.current,
-      isLocalPaddle,
-      onProgress: (current, total, msg) => {
-        const activeWorkers = streamingOcrPool ? streamingOcrPool.getBusyWorkersCount() : 0;
-        const totalWorkers = streamingOcrPool ? streamingOcrPool.getPoolSize() : 0;
-        const cpuUsage = totalWorkers > 0 ? Math.round((activeWorkers / totalWorkers) * 100) : 0;
-
-        const nowMs = performance.now();
-        const cutoff = nowMs - 2000;
-        while (recentFrameTimes.length > 0 && recentFrameTimes[0] < cutoff) {
-          recentFrameTimes.shift();
+    // Build multi-clip scan segments covering [startT, endT] across all timeline clips
+    const scanSegments: { url: string; localStart: number; localEnd: number; globalOffset: number }[] = [];
+    if (clips && clips.length > 1) {
+      for (let i = 0; i < clips.length; i++) {
+        const clipStart = clipStartTimes[i] || 0;
+        const clipDur = clips[i].duration || 0;
+        const clipEnd = clipStart + clipDur;
+        const overlapStart = Math.max(startT, clipStart);
+        const overlapEnd = Math.min(endT, clipEnd);
+        if (overlapEnd > overlapStart + 0.05) {
+          scanSegments.push({
+            url: clips[i].url,
+            localStart: overlapStart - clipStart,
+            localEnd: overlapEnd - clipStart,
+            globalOffset: clipStart,
+          });
         }
-        const windowDurationSec = recentFrameTimes.length > 1
-          ? (recentFrameTimes[recentFrameTimes.length - 1] - recentFrameTimes[0]) / 1000
-          : 2;
-        const currentFps = windowDurationSec > 0.05 ? (recentFrameTimes.length / windowDurationSec) : 0;
+      }
+    }
+    if (scanSegments.length === 0) {
+      scanSegments.push({
+        url: videoSourceUrl,
+        localStart: startT,
+        localEnd: endT,
+        globalOffset: 0,
+      });
+    }
 
-        setScanProgress((prev) => ({
-          ...prev,
-          currentFrame: current,
-          totalFrames: Math.max(prev.totalFrames, total, current),
-          message: streamingOcrPool && streamingOcrPool.latestProgressMessage
-            ? streamingOcrPool.latestProgressMessage
-            : msg,
-          fps: Math.round(currentFps * 10) / 10,
-          cpuUsage,
-          activeWorkers,
-          totalWorkers,
-        }));
-      },
-      onFrameCaptured: (item) => {
-        capturedFramesCount++;
-        if (item.isTransitionFrame) {
-          detectedTransitions.push(item.timestamp);
-        }
+    for (let segIdx = 0; segIdx < scanSegments.length; segIdx++) {
+      if (cancelScanRef.current) break;
+      const seg = scanSegments[segIdx];
 
-        // Optimization: Skip heavy synchronous toDataURL('image/jpeg') Base64 encoding on main UI thread for Local PaddleOCR
-        const base64 = isLocalPaddle ? '' : (item.canvas ? item.canvas.toDataURL('image/jpeg', 0.88) : '');
-        const frameItem = {
-          image: base64 || '',
-          pixelData: item.pixelData,
-          width: item.width,
-          height: item.height,
-          timestamp: item.timestamp,
-          segStartTime: item.segStartTime,
-          segEndTime: item.segEndTime,
-        };
+      await extractFramesWithWebCodecs({
+        videoUrl: seg.url,
+        crossOrigin: video.crossOrigin,
+        startT: seg.localStart,
+        endT: seg.localEnd,
+        stepInterval,
+        roi,
+        bgFilterMode: effectiveBgFilterMode,
+        bgFilterStrength: effectiveBgFilterStrength,
+        adaptiveSampling: appSettings?.adaptiveSampling ?? true,
+        speedUpMode,
+        shouldCancel: () => cancelScanRef.current,
+        isLocalPaddle,
+        onProgress: (current, total, msg) => {
+          const activeWorkers = streamingOcrPool ? streamingOcrPool.getBusyWorkersCount() : 0;
+          const totalWorkers = streamingOcrPool ? streamingOcrPool.getPoolSize() : 0;
+          const cpuUsage = totalWorkers > 0 ? Math.round((activeWorkers / totalWorkers) * 100) : 0;
 
-        currentBatch.push(frameItem);
-        if (currentBatch.length >= targetBatchSize) {
-          frameBatches.push([...currentBatch]);
-          currentBatch = [];
-        }
+          const nowMs = performance.now();
+          const cutoff = nowMs - 2000;
+          while (recentFrameTimes.length > 0 && recentFrameTimes[0] < cutoff) {
+            recentFrameTimes.shift();
+          }
+          const windowDurationSec = recentFrameTimes.length > 1
+            ? (recentFrameTimes[recentFrameTimes.length - 1] - recentFrameTimes[0]) / 1000
+            : 2;
+          const currentFps = windowDurationSec > 0.05 ? (recentFrameTimes.length / windowDurationSec) : 0;
 
-        if (streamingOcrPool) {
-          // Push directly to concurrent ONNX WASM worker pipeline!
-          streamingOcrPool.pushFrame(frameItem);
-        }
+          setScanProgress((prev) => ({
+            ...prev,
+            currentFrame: capturedFramesCount + current,
+            totalFrames: Math.max(prev.totalFrames, capturedFramesCount + total, capturedFramesCount + current),
+            message: streamingOcrPool && streamingOcrPool.latestProgressMessage
+              ? streamingOcrPool.latestProgressMessage
+              : (scanSegments.length > 1 ? `[Clip ${segIdx + 1}/${scanSegments.length}] ${msg}` : msg),
+            fps: Math.round(currentFps * 10) / 10,
+            cpuUsage,
+            activeWorkers,
+            totalWorkers,
+          }));
+        },
+        onFrameCaptured: (item) => {
+          capturedFramesCount++;
+          const globalTimestamp = Number((item.timestamp + seg.globalOffset).toFixed(3));
+          const globalSegStart = typeof item.segStartTime === 'number'
+            ? Number((item.segStartTime + seg.globalOffset).toFixed(3))
+            : undefined;
+          const globalSegEnd = typeof item.segEndTime === 'number'
+            ? Number((item.segEndTime + seg.globalOffset).toFixed(3))
+            : undefined;
 
-        const scanDuration = Math.max(0.1, endT - startT);
-        const timeProgress = Math.min(1.0, Math.max(0.0, (item.timestamp - startT) / scanDuration));
-        const scanPercentage = Math.min(60, Math.max(1, Math.round(timeProgress * 60)));
+          if (item.isTransitionFrame) {
+            detectedTransitions.push(globalTimestamp);
+          }
 
-        const nowMs = performance.now();
-        recentFrameTimes.push(nowMs);
-        const cutoff = nowMs - 2000;
-        while (recentFrameTimes.length > 0 && recentFrameTimes[0] < cutoff) {
-          recentFrameTimes.shift();
-        }
-        const windowDurationSec = recentFrameTimes.length > 1
-          ? (recentFrameTimes[recentFrameTimes.length - 1] - recentFrameTimes[0]) / 1000
-          : 2;
-        const currentFps = windowDurationSec > 0.05 ? (recentFrameTimes.length / windowDurationSec) : 0;
+          // Optimization: Skip heavy synchronous toDataURL('image/jpeg') Base64 encoding on main UI thread for Local PaddleOCR
+          const base64 = isLocalPaddle ? '' : (item.canvas ? item.canvas.toDataURL('image/jpeg', 0.88) : '');
+          const frameItem = {
+            image: base64 || '',
+            pixelData: item.pixelData,
+            width: item.width,
+            height: item.height,
+            timestamp: globalTimestamp,
+            isTransitionFrame: item.isTransitionFrame,
+            segStartTime: globalSegStart,
+            segEndTime: globalSegEnd,
+          };
 
-        const activeWorkers = streamingOcrPool ? streamingOcrPool.getBusyWorkersCount() : 0;
-        const totalWorkers = streamingOcrPool ? streamingOcrPool.getPoolSize() : 0;
-        const cpuUsage = totalWorkers > 0 ? Math.round((activeWorkers / totalWorkers) * 100) : 0;
+          if (streamingOcrPool) {
+            // Stream directly to ONNX worker pipeline without keeping duplicate pixelData arrays in frameBatches RAM!
+            streamingOcrPool.pushFrame(frameItem);
+          } else {
+            currentBatch.push(frameItem);
+            if (currentBatch.length >= targetBatchSize) {
+              frameBatches.push([...currentBatch]);
+              currentBatch = [];
+            }
+          }
 
-        setScanProgress((prev) => ({
-          ...prev,
-          currentFrame: capturedFramesCount,
-          totalFrames: Math.max(prev.totalFrames, capturedFramesCount),
-          currentTime: item.timestamp,
-          percentage: scanPercentage,
-          fps: Math.round(currentFps * 10) / 10,
-          cpuUsage,
-          activeWorkers,
-          totalWorkers,
-          message: streamingOcrPool && streamingOcrPool.latestProgressMessage
-            ? streamingOcrPool.latestProgressMessage
-            : `⚡ [Song song WebCodecs + 8 Luồng PaddleOCR] (${Math.round(timeProgress * 100)}% | ${item.timestamp.toFixed(1)}s/${endT.toFixed(1)}s)...`,
-        }));
-      },
-    });
+          const scanDuration = Math.max(0.1, endT - startT);
+          const timeProgress = Math.min(1.0, Math.max(0.0, (globalTimestamp - startT) / scanDuration));
+          const scanPercentage = Math.min(60, Math.max(1, Math.round(timeProgress * 60)));
+
+          const nowMs = performance.now();
+          recentFrameTimes.push(nowMs);
+          const cutoff = nowMs - 2000;
+          while (recentFrameTimes.length > 0 && recentFrameTimes[0] < cutoff) {
+            recentFrameTimes.shift();
+          }
+          const windowDurationSec = recentFrameTimes.length > 1
+            ? (recentFrameTimes[recentFrameTimes.length - 1] - recentFrameTimes[0]) / 1000
+            : 2;
+          const currentFps = windowDurationSec > 0.05 ? (recentFrameTimes.length / windowDurationSec) : 0;
+
+          const activeWorkers = streamingOcrPool ? streamingOcrPool.getBusyWorkersCount() : 0;
+          const totalWorkers = streamingOcrPool ? streamingOcrPool.getPoolSize() : 0;
+          const cpuUsage = totalWorkers > 0 ? Math.round((activeWorkers / totalWorkers) * 100) : 0;
+
+          setScanProgress((prev) => ({
+            ...prev,
+            currentFrame: capturedFramesCount,
+            totalFrames: Math.max(prev.totalFrames, capturedFramesCount),
+            currentTime: globalTimestamp,
+            percentage: scanPercentage,
+            fps: Math.round(currentFps * 10) / 10,
+            cpuUsage,
+            activeWorkers,
+            totalWorkers,
+            message: streamingOcrPool && streamingOcrPool.latestProgressMessage
+              ? streamingOcrPool.latestProgressMessage
+              : `⚡ [Song song WebCodecs + ${isLocalPaddle ? 'PaddleOCR' : 'Gemini Vision'}] (${Math.round(timeProgress * 100)}% | ${globalTimestamp.toFixed(1)}s/${endT.toFixed(1)}s)...`,
+          }));
+        },
+      });
+    }
 
     if (currentBatch.length > 0) {
       frameBatches.push([...currentBatch]);
@@ -1401,11 +1623,17 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
     }
 
     if (cancelScanRef.current) {
+      if (streamingOcrPool) {
+        try { await streamingOcrPool.finish(detectedTransitions); } catch {}
+      }
       setScanProgress((prev) => ({ ...prev, status: 'idle', message: 'Đã hủy' }));
       return;
     }
 
     if (capturedFramesCount === 0) {
+      if (streamingOcrPool) {
+        try { await streamingOcrPool.finish(detectedTransitions); } catch {}
+      }
       setScanProgress({
         status: 'completed',
         currentFrame: totalFrames,
@@ -1420,7 +1648,7 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
 
     const engineName = isLocalPaddle
       ? 'PP-OCRv6 WebAssembly (ONNX Web)'
-      : 'Gemini Cloud AI';
+      : 'Gemini Cloud AI Vision';
 
     setScanProgress((prev) => ({
       ...prev,
@@ -1449,7 +1677,7 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
               endTime: res.endTime,
               originalText: res.originalText.trim(),
               translatedText: '',
-              sourceLang: res.sourceLang || 'zh',
+              sourceLang: res.sourceLang || effectiveSourceLang || 'zh',
               boundingBox: roi,
               confidence: res.confidence,
             });
@@ -1460,8 +1688,8 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
       }
     }
 
-    // Fallback: If streaming pool returned 0 items or wasn't initialized, run client-side batch OCR engine!
-    if (isLocalPaddle && newSubtitles.length === 0) {
+    // Fallback: If streaming pool returned 0 items when not already emptied by streaming, run client-side batch OCR engine
+    if (isLocalPaddle && newSubtitles.length === 0 && frameBatches.length > 0) {
       const allFrames = frameBatches.flat();
       try {
         const localResults = await runClientSideLocalOcrBatch(
@@ -1472,8 +1700,9 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
           stepInterval,
           detectedTransitions,
           appSettings?.confidenceThreshold ?? 0.70,
-          'zh',
-          targetLang
+          effectiveSourceLang,
+          targetLang,
+          appSettings?.paddleOcrModelVariant || 'small'
         );
 
         localResults.forEach((res, idx) => {
@@ -1484,7 +1713,7 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
               endTime: res.endTime,
               originalText: res.originalText.trim(),
               translatedText: '',
-              sourceLang: res.sourceLang || 'PP-OCRv6 Wasm Local',
+              sourceLang: res.sourceLang || effectiveSourceLang || 'PP-OCRv6 Wasm Local',
               boundingBox: roi,
               confidence: res.confidence,
             });
@@ -1499,12 +1728,13 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
         if (cancelScanRef.current) break;
 
         try {
-          const res = await fetch('/api/ocr-batch-frames', {
+          const res = await fetch(resolveApiUrl('/api/ocr-batch-frames'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-              frames: frameBatches[b],
+              frames: frameBatches[b].map(({ image, timestamp }) => ({ image, timestamp })),
               targetLang,
+              sourceLang: effectiveSourceLang,
               model: selectedModel,
               ocrEngine: 'gemini_vision',
               customContext,
@@ -1560,7 +1790,7 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
                   endTime: Number(rawEnd.toFixed(2)),
                   originalText: s.originalText.trim(),
                   translatedText: '', // OCR ra phụ đề gốc
-                  sourceLang: s.sourceLang,
+                  sourceLang: s.sourceLang || effectiveSourceLang,
                   boundingBox: subBox || roi,
                 });
               }
@@ -1596,75 +1826,26 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
         ...prev,
         status: 'translating',
         percentage: 92,
-        message: `🤖 Bước cuối: AI (${selectedModel}) đang sửa lỗi chính tả & lọc trùng ${newSubtitles.length} phụ đề...`,
+        message: `🤖 Bước cuối: AI (${appSettings?.apiMode === 'gemini_web' ? 'Gemini Web' : selectedModel}) đang sửa lỗi chính tả & lọc trùng ${newSubtitles.length} phụ đề...`,
       }));
 
-      try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 90000); // 90s safety timeout for Render deployment & large subtitle lists
-
-        const dedupRes = await fetch('/api/deduplicate-subtitles', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          signal: controller.signal,
-          body: JSON.stringify({
-            subtitles: newSubtitles,
-            targetLang,
-            model: selectedModel,
-            apiMode: appSettings?.apiMode,
-            apiKey: appSettings?.apiKey,
-            groqApiKey: appSettings?.groqApiKey,
-            groqModel: appSettings?.groqModel,
-            proxyUrl: appSettings?.proxyUrl,
-            proxyKey: appSettings?.proxyKey,
-            proxyTargetModel: appSettings?.proxyTargetModel,
-            customModelName: appSettings?.customModelName,
-            proxyNoApiKey: appSettings?.proxyNoApiKey,
-          }),
-        });
-
-        clearTimeout(timeoutId);
-
-        let dedupData: any = {};
-        try {
-          dedupData = await dedupRes.json();
-        } catch (jsonParseErr) {
-          const rawText = await dedupRes.text().catch(() => '');
-          dedupData = { error: `Invalid JSON response: ${rawText.slice(0, 300)}` };
-        }
-
-        if (dedupRes.ok && dedupData.success && Array.isArray(dedupData.subtitles) && dedupData.subtitles.length > 0) {
-          finalSubtitles = dedupData.subtitles.map((s: any, idx: number) => ({
-            id: `ai-clean-${idx}-${Date.now()}`,
-            startTime: typeof s.startTime === 'number' ? s.startTime : 0,
-            endTime: typeof s.endTime === 'number' ? s.endTime : (s.startTime || 0) + 1.2,
-            originalText: String(s.originalText || '').trim(),
-            translatedText: '', // Phụ đề gốc đã được AI sửa lỗi chính tả & làm sạch, giữ nguyên chưa dịch
-            sourceLang: s.sourceLang,
-            boundingBox: roi,
-          }));
-          aiRefineSucceeded = true;
-          console.log(`[AI Refine] Succeeded! Refined into ${finalSubtitles.length} clean subtitles.`);
-        } else {
-          aiRefineError = dedupData.message || dedupData.error || `HTTP ${dedupRes.status} ${dedupRes.statusText}`;
-          console.error('[AI Refine Error - F12 DevTools]', {
-            status: dedupRes.status,
-            statusText: dedupRes.statusText,
-            apiMode: appSettings?.apiMode,
-            proxyUrl: appSettings?.proxyUrl,
-            proxyTargetModel: appSettings?.proxyTargetModel,
-            model: selectedModel,
-            errorMessage: aiRefineError,
-            rawResponse: dedupData,
-          });
-        }
-      } catch (dedupErr: any) {
-        if (dedupErr.name === 'AbortError') {
-          aiRefineError = 'Quá thời gian chờ phản hồi AI (90s)';
-          console.error('[AI Refine Timeout - F12 DevTools] Request timed out after 90s:', dedupErr);
-        } else {
-          aiRefineError = dedupErr?.message || 'Không thể kết nối đến máy chủ AI';
-          console.error('[AI Refine Network/Execution Exception - F12 DevTools]', dedupErr);
+      const refineResult = await runAiDeduplicatePipeline(newSubtitles, roi, false);
+      if (refineResult.succeeded && refineResult.subtitles.length > 0) {
+        finalSubtitles = refineResult.subtitles.map((s: any, idx: number) => ({
+          id: `ai-clean-${idx}-${Date.now()}`,
+          startTime: typeof s.startTime === 'number' ? s.startTime : 0,
+          endTime: typeof s.endTime === 'number' ? s.endTime : (s.startTime || 0) + 1.2,
+          originalText: String(s.originalText || '').trim(),
+          translatedText: '',
+          sourceLang: s.sourceLang || effectiveSourceLang,
+          boundingBox: s.boundingBox || roi,
+        }));
+        aiRefineSucceeded = true;
+        console.log(`[AI Refine] Succeeded! Refined into ${finalSubtitles.length} clean subtitles.`);
+      } else {
+        aiRefineError = refineResult.error;
+        if (aiRefineError) {
+          console.error('[AI Refine Error]', aiRefineError);
         }
       }
     }
@@ -1681,19 +1862,24 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
 
     let completionMessage = '';
     if (finalSubtitles.length > 0) {
+      const usedEngineLabel = isLocalPaddle ? 'PaddleOCR Cục bộ' : 'Gemini Vision AI';
       if (appSettings?.autoAiRefine !== false) {
         if (aiRefineSucceeded) {
           completionMessage = `✨ Hoàn thành! AI đã bóc tách & tinh lọc thành công ${finalSubtitles.length} phụ đề chuẩn.`;
         } else if (aiRefineError) {
-          completionMessage = `Đã bóc tách được ${finalSubtitles.length} phụ đề bằng PaddleOCR. ⚠️ Bước AI Lọc trùng bị bỏ qua do: ${aiRefineError} (Vui lòng kiểm tra API Key trong Cài đặt hoặc biến GEMINI_API_KEY trên Render).`;
+          completionMessage = `Đã bóc tách được ${finalSubtitles.length} phụ đề bằng ${usedEngineLabel}. ⚠️ Bước AI Lọc trùng bị bỏ qua do: ${aiRefineError} (Vui lòng kiểm tra API Key hoặc phiên đăng nhập trong Cài đặt).`;
         } else {
           completionMessage = `Đã hoàn thành! Đã bóc tách thành công ${finalSubtitles.length} phụ đề.`;
         }
       } else {
-        completionMessage = `Đã hoàn thành! Đã bóc tách ${finalSubtitles.length} phụ đề bằng PaddleOCR Cục bộ (0 tốn Quota).`;
+        completionMessage = isLocalPaddle
+          ? `Đã hoàn thành! Đã bóc tách ${finalSubtitles.length} phụ đề bằng PaddleOCR Cục bộ (0 tốn Quota).`
+          : `Đã hoàn thành! Đã bóc tách ${finalSubtitles.length} phụ đề bằng Gemini Vision AI.`;
       }
     } else if (lastApiError) {
-      completionMessage = lastApiError;
+      completionMessage = autoSwitchedToVision
+        ? `Ngôn ngữ ${effectiveSourceLang} sử dụng Gemini Vision AI nhưng gặp lỗi: ${lastApiError}`
+        : lastApiError;
     } else {
       completionMessage = `AI không tìm thấy chữ trong vùng quét OCR (${capturedFramesCount} khung hình). Bạn hãy điều chỉnh/mở rộng khung quét OCR màu xanh đè trọn vùng chữ phụ đề trên video và quét lại.`;
     }
@@ -1928,30 +2114,9 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
     if (subtitles.length === 0) return;
     setIsTranslatingBatch(true);
     try {
-      const res = await fetch('/api/deduplicate-subtitles', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          subtitles,
-          targetLang,
-          model: selectedModel,
-          apiMode: appSettings?.apiMode,
-          apiKey: appSettings?.apiKey,
-          proxyUrl: appSettings?.proxyUrl,
-          proxyKey: appSettings?.proxyKey,
-          proxyTargetModel: appSettings?.proxyTargetModel,
-          customModelName: appSettings?.customModelName,
-          proxyNoApiKey: appSettings?.proxyNoApiKey,
-        }),
-      });
-
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        throw new Error(data.message || data.error || `HTTP Error ${res.status}`);
-      }
-
-      if (data.success && Array.isArray(data.subtitles) && data.subtitles.length > 0) {
-        const cleanedSubs: SubtitleItem[] = data.subtitles.map((s: any, idx: number) => ({
+      const refineResult = await runAiDeduplicatePipeline(subtitles, roi, true);
+      if (refineResult.succeeded && refineResult.subtitles.length > 0) {
+        const cleanedSubs: SubtitleItem[] = refineResult.subtitles.map((s: any, idx: number) => ({
           id: `ai-clean-${idx}-${Date.now()}`,
           startTime: typeof s.startTime === 'number' ? s.startTime : 0,
           endTime: typeof s.endTime === 'number' ? s.endTime : (s.startTime || 0) + 1.2,
@@ -1964,7 +2129,7 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
         setSubtitles(normalizeSubtitles(cleanedSubs));
         alert(`✨ AI đã hoàn thành sàng lọc phụ đề:\n- Sửa lỗi chính tả OCR\n- Loại bỏ rác & thủy ấn\n- Gộp câu lặp trùng, còn lại ${cleanedSubs.length} phụ đề.`);
       } else {
-        alert(data.error || 'AI không trả về dữ liệu phụ đề hợp lệ.');
+        alert(refineResult.error || 'AI không trả về dữ liệu phụ đề hợp lệ.');
       }
     } catch (err: any) {
       console.error('AI deduplicate error:', err);
@@ -1976,8 +2141,9 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
 
   const handleReTranslateAll = async (
     overrideModel?: GeminiModelOption,
-    optimizeForTts: boolean = false,
-    customCtx?: string
+    optimizeForTts: boolean = true,
+    customCtx?: string,
+    avoidTikTokPolicy: boolean = false
   ) => {
     if (subtitles.length === 0) return;
     const effectiveContext = customCtx !== undefined ? customCtx : customContext;
@@ -1985,15 +2151,24 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
       setCustomContext(customCtx);
     }
 
+    const chosenModel = overrideModel || selectedModel;
+    const effectiveApiMode =
+      chosenModel === 'GEMINI_WEB'
+        ? 'gemini_web'
+        : (appSettings?.apiMode === 'gemini_web' && overrideModel && overrideModel !== 'GEMINI_WEB'
+          ? 'direct'
+          : (appSettings?.apiMode || 'direct'));
+    const effectiveModel = chosenModel === 'GEMINI_WEB' ? 'gemini-2.5-flash' : chosenModel;
+
     setIsTranslatingBatch(true);
-    
+
     try {
       // =========================================================================
       // BƯỚC 1: ĐỒNG BỘ VÀ RÀ SOÁT NGỮ CẢNH TOÀN CỤC TRƯỚC KHI DỊCH
-      // Trích xuất ngữ cảnh, thể loại, đại từ, và đồng bộ nhân vật, địa danh, thế lực...
       // =========================================================================
-      setTranslationProgressMsg('🧠 Bước 1/3: Rà soát ngữ cảnh & đồng bộ dịch trước nhân vật, địa danh, thế lực...');
-      console.log(`[handleReTranslateAll] Stage 1: Extracting global context from ${subtitles.length} subtitles...`);
+      const totalSteps = optimizeForTts ? 3 : 2;
+      setTranslationProgressMsg(`🧠 Bước 1/${totalSteps}: Rà soát ngữ cảnh & đồng bộ dịch trước nhân vật, địa danh, thế lực...`);
+      console.log(`[handleReTranslateAll] Stage 1: Extracting global context (${effectiveApiMode}/${effectiveModel}) from ${subtitles.length} subtitles...`);
 
       let activeGlobalContext: GlobalMovieContext = globalContext || {
         movieGenre: 'Tự động',
@@ -2004,15 +2179,133 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
       };
 
       try {
-        const ctxRes = await fetch('/api/extract-global-context', {
+        if (effectiveApiMode === 'gemini_web') {
+          const webCtx = await extractGlobalContextWithGeminiWeb(subtitles, targetLang, {
+            cookie: appSettings?.geminiWebCookie || '',
+            snlm0e: appSettings?.geminiWebSessionToken,
+            customContext: effectiveContext,
+            existingGlossary: globalContext?.knownEntityGlossary || [],
+          });
+          if (webCtx.success && webCtx.globalContext) {
+            const normalized = normalizeGlobalContext(webCtx.globalContext);
+            if (normalized) {
+              activeGlobalContext = normalized;
+              setGlobalContext(activeGlobalContext);
+            }
+          }
+        } else {
+          const ctxRes = await fetch(resolveApiUrl('/api/extract-global-context'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              subtitles,
+              targetLang,
+              model: effectiveModel,
+              customContext: effectiveContext,
+              existingGlossary: globalContext?.knownEntityGlossary || [],
+              apiMode: effectiveApiMode,
+              apiKey: appSettings?.apiKey,
+              groqApiKey: appSettings?.groqApiKey,
+              groqModel: appSettings?.groqModel,
+              geminiWebCookie: appSettings?.geminiWebCookie,
+              proxyUrl: appSettings?.proxyUrl,
+              proxyKey: appSettings?.proxyKey,
+              proxyTargetModel: appSettings?.proxyTargetModel,
+              customModelName: appSettings?.customModelName,
+              proxyNoApiKey: appSettings?.proxyNoApiKey,
+            }),
+          });
+
+          const rawCtxText = await ctxRes.text().catch(() => '');
+          let ctxData: any = {};
+          try {
+            ctxData = JSON.parse(rawCtxText);
+          } catch {
+            console.warn('[handleReTranslateAll] Global context parse warning:', rawCtxText.slice(0, 100));
+          }
+
+          if (ctxRes.ok && ctxData.success && ctxData.globalContext) {
+            const normalized = normalizeGlobalContext(ctxData.globalContext);
+            if (normalized) {
+              activeGlobalContext = normalized;
+              setGlobalContext(activeGlobalContext);
+              console.log('[handleReTranslateAll] Stage 1 Global Context Extracted:', activeGlobalContext);
+            }
+          }
+        }
+      } catch (ctxErr) {
+        console.warn('[handleReTranslateAll] Global context extraction fallback:', ctxErr);
+      }
+
+      // =========================================================================
+      // BƯỚC 2: DỊCH CHÍNH TOÀN BỘ PHỤ ĐỀ (Prev + Next Context + Glossary + Policy)
+      // =========================================================================
+      const chunkSize = 20;
+      const totalSubtitles = subtitles.length;
+      const chunks: SubtitleItem[][] = [];
+
+      for (let i = 0; i < totalSubtitles; i += chunkSize) {
+        chunks.push(subtitles.slice(i, i + chunkSize));
+      }
+
+      const totalChunks = chunks.length;
+      console.log(`[handleReTranslateAll] Stage 2: Translating ${totalSubtitles} subtitles in ${totalChunks} batches (optimizeForTts=${optimizeForTts}, avoidTikTokPolicy=${avoidTikTokPolicy})...`);
+
+      let runningGlossary: GlossaryEntity[] = [...(activeGlobalContext.knownEntityGlossary || [])];
+      let previousContextBuffer: { id: string; originalText: string; translatedText: string }[] = [];
+      const accumulatedTranslationsMap = new Map<string, string>();
+
+      const runBatchTranslateCall = async (
+        itemsWithEntities: any[],
+        prevCtx: any[],
+        nextCtx: any[],
+        bypassCache: boolean = false
+      ): Promise<{ translations: { id: string; translatedText: string }[]; newEntities: any[] }> => {
+        if (effectiveApiMode === 'gemini_web') {
+          const directWebResult = await translateSubtitleChunkWithGeminiWeb(
+            itemsWithEntities,
+            targetLang,
+            {
+              cookie: appSettings?.geminiWebCookie || '',
+              snlm0e: appSettings?.geminiWebSessionToken,
+              globalContext: activeGlobalContext,
+              glossary: runningGlossary,
+              previousContext: prevCtx,
+              nextContext: nextCtx,
+              customContext: effectiveContext,
+              optimizeForTts,
+              avoidTikTokPolicy,
+            }
+          );
+          if (directWebResult.success && Array.isArray(directWebResult.translations) && directWebResult.translations.length > 0) {
+            return {
+              translations: directWebResult.translations,
+              newEntities: directWebResult.newEntities || [],
+            };
+          }
+          throw new Error(directWebResult.error || 'Gemini Web không trả về bản dịch hợp lệ.');
+        }
+
+        const res = await fetch(resolveApiUrl('/api/translate-batch'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            subtitles,
+            subtitles: itemsWithEntities,
             targetLang,
-            model: overrideModel || selectedModel,
+            model: effectiveModel,
+            optimizeForTts,
+            avoidTikTokPolicy,
             customContext: effectiveContext,
-            apiMode: appSettings?.apiMode,
+            globalContext: activeGlobalContext,
+            knownEntityGlossary: runningGlossary,
+            previousContext: prevCtx,
+            nextContext: nextCtx,
+            bypassCache,
+            apiMode: effectiveApiMode,
+            groqApiKey: appSettings?.groqApiKey,
+            groqModel: appSettings?.groqModel,
+            groqSttModel: appSettings?.groqSttModel,
+            geminiWebCookie: appSettings?.geminiWebCookie,
             apiKey: appSettings?.apiKey,
             proxyUrl: appSettings?.proxyUrl,
             proxyKey: appSettings?.proxyKey,
@@ -2022,65 +2315,49 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
           }),
         });
 
-        const rawCtxText = await ctxRes.text().catch(() => '');
-        let ctxData: any = {};
+        const rawText = await res.text().catch(() => '');
+        let data: any = {};
         try {
-          ctxData = JSON.parse(rawCtxText);
+          data = JSON.parse(rawText);
         } catch {
-          console.warn('[handleReTranslateAll] Global context parse warning:', rawCtxText.slice(0, 100));
+          throw new Error(`HTTP ${res.status}: Phản hồi dịch không hợp lệ (${rawText.slice(0, 100)})`);
         }
 
-        if (ctxRes.ok && ctxData.success && ctxData.globalContext) {
-          const normalized = normalizeGlobalContext(ctxData.globalContext);
-          if (normalized) {
-            activeGlobalContext = normalized;
-            setGlobalContext(activeGlobalContext);
-            console.log('[handleReTranslateAll] Stage 1 Global Context Extracted:', activeGlobalContext);
-          }
+        if (!res.ok || !data.success || !Array.isArray(data.translations)) {
+          throw new Error(data.message || data.error || `HTTP ${res.status}`);
         }
-      } catch (ctxErr) {
-        console.warn('[handleReTranslateAll] Global context extraction fallback:', ctxErr);
-      }
-
-      // =========================================================================
-      // BƯỚC 2: DỊCH CHÍNH TOÀN BỘ PHỤ ĐỀ — ÁP DỤNG NGAY CÁC THỰC THỂ ĐÃ ĐỒNG BỘ
-      // Dịch mượt mà, đầy đủ 100% ngữ nghĩa & cảm xúc điện ảnh, không cắt xén
-      // =========================================================================
-      const chunkSize = 20;
-      const totalSubtitles = subtitles.length;
-      const chunks: SubtitleItem[][] = [];
-      
-      for (let i = 0; i < totalSubtitles; i += chunkSize) {
-        chunks.push(subtitles.slice(i, i + chunkSize));
-      }
-      
-      const totalChunks = chunks.length;
-      console.log(`[handleReTranslateAll] Stage 2: Translating ${totalSubtitles} subtitles in ${totalChunks} chained batches (Genre: "${activeGlobalContext.movieGenre}")...`);
-
-      let runningGlossary: GlossaryEntity[] = [...(activeGlobalContext.knownEntityGlossary || [])];
-      let previousContextBuffer: { id: string; originalText: string; translatedText: string }[] = [];
-      const accumulatedTranslationsMap = new Map<string, string>();
+        return {
+          translations: data.translations,
+          newEntities: data.newEntities || [],
+        };
+      };
 
       for (let chunkIdx = 0; chunkIdx < totalChunks; chunkIdx++) {
         const currentChunk = chunks[chunkIdx];
+        const nextChunkLookahead = (chunks[chunkIdx + 1] || []).slice(0, 2).map((s) => ({
+          id: s.id,
+          originalText: s.originalText,
+        }));
         const genreBadge = activeGlobalContext.movieGenre && activeGlobalContext.movieGenre !== 'Tự động'
           ? `[${activeGlobalContext.movieGenre}] `
           : '';
         const pct = Math.round((chunkIdx / totalChunks) * 100);
-        setTranslationProgressMsg(`🎬 Bước 2/3: Đang dịch kịch bản chính nhóm ${chunkIdx + 1}/${totalChunks} ${genreBadge}(${pct}%)...`);
+        setTranslationProgressMsg(`🎬 Bước 2/${totalSteps}: Đang dịch nhóm ${chunkIdx + 1}/${totalChunks} ${genreBadge}(${pct}%)...`);
 
-        // Gắn trước các thực thể nhân vật / địa danh / thế lực đã đồng bộ vào chunk
-        const currentChunkWithEntities = currentChunk.map((sub) => {
-          const matched = runningGlossary.filter(
-            (g) => g.original && sub.originalText && sub.originalText.toLowerCase().includes(g.original.toLowerCase())
-          );
-          return {
-            ...sub,
-            ...(matched.length > 0
-              ? { syncedEntities: matched.map((m) => `${m.original} -> ${m.translated}`) }
-              : {}),
-          };
-        });
+        const attachEntities = (items: SubtitleItem[]) =>
+          items.map((sub) => {
+            const matched = runningGlossary.filter(
+              (g) => g.original && sub.originalText && sub.originalText.toLowerCase().includes(g.original.toLowerCase())
+            );
+            return {
+              ...sub,
+              ...(matched.length > 0
+                ? { syncedEntities: matched.map((m) => `${m.original} -> ${m.translated}`) }
+                : {}),
+            };
+          });
+
+        const currentChunkWithEntities = attachEntities(currentChunk);
 
         let success = false;
         let attempt = 0;
@@ -2089,144 +2366,66 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
 
         while (attempt <= maxRetries && !success) {
           try {
-            let data: any = null;
-
-            // Direct execution for Gemini Web mode when on Android APK or as direct method
-            if (appSettings?.apiMode === 'gemini_web') {
-              try {
-                const directWebResult = await translateSubtitleChunkWithGeminiWeb(
-                  currentChunkWithEntities,
-                  targetLang,
-                  {
-                    cookie: appSettings.geminiWebCookie || '',
-                    snlm0e: appSettings.geminiWebSessionToken,
-                    globalContext: activeGlobalContext,
-                    glossary: runningGlossary,
-                    previousContext: previousContextBuffer,
-                    customContext: effectiveContext,
-                    optimizeForTts: false,
-                  }
-                );
-                if (directWebResult.success && Array.isArray(directWebResult.translations) && directWebResult.translations.length > 0) {
-                  data = {
-                    success: true,
-                    translations: directWebResult.translations,
-                    newEntities: directWebResult.newEntities || [],
-                  };
-                }
-              } catch (_) {}
-            }
-
-            if (!data) {
-              const res = await fetch('/api/translate-batch', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  subtitles: currentChunkWithEntities,
-                  targetLang,
-                  model: overrideModel || selectedModel,
-                  optimizeForTts: false,
-                  customContext: effectiveContext,
-                  globalContext: activeGlobalContext,
-                  knownEntityGlossary: runningGlossary,
-                  previousContext: previousContextBuffer,
-                  apiMode: appSettings?.apiMode,
-                  groqApiKey: appSettings?.groqApiKey,
-                  groqModel: appSettings?.groqModel,
-                  groqSttModel: appSettings?.groqSttModel,
-                  geminiWebCookie: appSettings?.geminiWebCookie,
-                  apiKey: appSettings?.apiKey,
-                  proxyUrl: appSettings?.proxyUrl,
-                  proxyKey: appSettings?.proxyKey,
-                  proxyTargetModel: appSettings?.proxyTargetModel,
-                  customModelName: appSettings?.customModelName,
-                  proxyNoApiKey: appSettings?.proxyNoApiKey,
-                }),
-              });
-
-              const rawText = await res.text().catch(() => '');
-              try {
-                data = JSON.parse(rawText);
-              } catch {
-                if (appSettings?.apiMode === 'gemini_web') {
-                  const fallbackWebResult = await translateSubtitleChunkWithGeminiWeb(
-                    currentChunkWithEntities,
-                    targetLang,
-                    {
-                      cookie: appSettings.geminiWebCookie || '',
-                      snlm0e: appSettings.geminiWebSessionToken,
-                      globalContext: activeGlobalContext,
-                      glossary: runningGlossary,
-                      previousContext: previousContextBuffer,
-                      customContext: effectiveContext,
-                      optimizeForTts: false,
-                    }
-                  );
-                  if (fallbackWebResult.success && Array.isArray(fallbackWebResult.translations)) {
-                    data = {
-                      success: true,
-                      translations: fallbackWebResult.translations,
-                      newEntities: fallbackWebResult.newEntities || [],
-                    };
-                  } else {
-                    throw new Error(fallbackWebResult.error || `HTTP ${res.status}`);
-                  }
-                } else {
-                  throw new Error(`HTTP ${res.status}: Phản hồi dịch không hợp lệ (${rawText.slice(0, 100)})`);
-                }
+            const data = await runBatchTranslateCall(currentChunkWithEntities, previousContextBuffer, nextChunkLookahead, false);
+            const chunkTranslationsMap = new Map<string, string>();
+            data.translations.forEach((t: any) => {
+              const clean = cleanTranslatedSubtitleText(t.translatedText || '');
+              if (t.id !== undefined && clean) {
+                chunkTranslationsMap.set(String(t.id), clean);
+                accumulatedTranslationsMap.set(String(t.id), clean);
               }
+            });
 
-              if (!res.ok || !data.success) {
-                throw new Error(data.message || data.error || `HTTP ${res.status}`);
-              }
-            }
-
-            if (Array.isArray(data.translations)) {
-              const chunkTranslationsMap = new Map<string, string>();
-              data.translations.forEach((t: any) => {
-                const clean = cleanTranslatedSubtitleText(t.translatedText || '');
-                chunkTranslationsMap.set(t.id, clean);
-                accumulatedTranslationsMap.set(t.id, clean);
-              });
-
-              // Cập nhật phụ đề trên giao diện ngay lập tức
-              setSubtitles((prev) =>
-                prev.map((s) => {
-                  if (chunkTranslationsMap.has(s.id)) {
-                    const cleanText = cleanTranslatedSubtitleText(chunkTranslationsMap.get(s.id)!);
-                    return { ...s, translatedText: cleanText };
-                  }
-                  return s;
-                })
-              );
-
-              // Cập nhật từ điển thực thể nếu batch mới tìm thấy thực thể mới
-              if (Array.isArray(data.newEntities) && data.newEntities.length > 0) {
-                const existingKeys = new Set(runningGlossary.map((g) => g.original.toLowerCase().trim()));
-                data.newEntities.forEach((ne: any) => {
-                  if (ne.original && ne.translated && !existingKeys.has(ne.original.toLowerCase().trim())) {
-                    runningGlossary.push({
-                      original: ne.original,
-                      translated: ne.translated,
-                      type: ne.type || 'term',
-                      description: ne.description || '',
-                    });
-                    existingKeys.add(ne.original.toLowerCase().trim());
+            // Missing-ID automatic micro-retry so AI never silently drops subtitles
+            const missingSubs = currentChunk.filter((s) => !chunkTranslationsMap.has(String(s.id)));
+            if (missingSubs.length > 0 && missingSubs.length < currentChunk.length) {
+              try {
+                console.warn(`[handleReTranslateAll] Chunk ${chunkIdx + 1} dropped ${missingSubs.length} IDs, running recovery pass...`);
+                const recovery = await runBatchTranslateCall(attachEntities(missingSubs), previousContextBuffer, nextChunkLookahead, true);
+                recovery.translations.forEach((t: any) => {
+                  const clean = cleanTranslatedSubtitleText(t.translatedText || '');
+                  if (t.id !== undefined && clean) {
+                    chunkTranslationsMap.set(String(t.id), clean);
+                    accumulatedTranslationsMap.set(String(t.id), clean);
                   }
                 });
+              } catch (recErr) {
+                console.warn('[handleReTranslateAll] Missing-ID recovery warning:', recErr);
               }
-
-              // Lưu 3 câu cuối của batch này làm PREVIOUS CONTEXT cho batch sau
-              previousContextBuffer = currentChunk.slice(-3).map((sub) => ({
-                id: sub.id,
-                originalText: sub.originalText,
-                translatedText: chunkTranslationsMap.get(sub.id) || '',
-              }));
-
-              success = true;
-            } else {
-              throw new Error('Định dạng dữ liệu dịch trả về không hợp lệ.');
             }
+
+            setSubtitles((prev) =>
+              prev.map((s) => {
+                const key = String(s.id);
+                if (chunkTranslationsMap.has(key)) {
+                  return { ...s, translatedText: chunkTranslationsMap.get(key)! };
+                }
+                return s;
+              })
+            );
+
+            if (Array.isArray(data.newEntities) && data.newEntities.length > 0) {
+              const existingKeys = new Set(runningGlossary.map((g) => g.original.toLowerCase().trim()));
+              data.newEntities.forEach((ne: any) => {
+                if (ne.original && ne.translated && !existingKeys.has(ne.original.toLowerCase().trim())) {
+                  runningGlossary.push({
+                    original: ne.original,
+                    translated: ne.translated,
+                    type: ne.type || 'term',
+                    description: ne.description || '',
+                  });
+                  existingKeys.add(ne.original.toLowerCase().trim());
+                }
+              });
+            }
+
+            previousContextBuffer = currentChunk.slice(-3).map((sub) => ({
+              id: sub.id,
+              originalText: sub.originalText,
+              translatedText: chunkTranslationsMap.get(String(sub.id)) || '',
+            }));
+
+            success = true;
           } catch (err: any) {
             attempt++;
             lastError = err;
@@ -2243,142 +2442,152 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
       }
 
       // =========================================================================
-      // BƯỚC 3: AI SÀNG LỌC & TỐI ƯU TTS (QUY TRÌNH 2 LƯỢT AI THỰC CHẤT)
-      // Lượt 1 (Request 1): AI rà soát & sàng lọc các block phụ đề quá tải thời lượng phát âm.
-      // Lượt 2 (Request 2): Gửi một request nữa cho AI để tối ưu & viết lại cô đọng, tự nhiên các block đó.
+      // BƯỚC 3: RÀ SOÁT & TỐI ƯU TTS (CHỈ CHẠY KHI optimizeForTts = TRUE)
       // =========================================================================
-      setTranslationProgressMsg('⚡ Bước 3/3 (Lượt 1/2): AI đang rà soát & sàng lọc các câu phụ đề quá tải thời lượng phát âm...');
-      console.log(`[handleReTranslateAll] Stage 3 - Request 1: AI screening ${subtitles.length} subtitles for TTS overload...`);
-
-      const subtitlesToScreen = subtitles.map((s) => {
-        const transText = accumulatedTranslationsMap.get(s.id) ?? s.translatedText ?? s.originalText ?? '';
-        const durSec = Math.max(0.4, ((s.endTime || 0) - (s.startTime || 0)) || 1.5);
-        return {
-          id: s.id,
-          text: (transText || '').trim(),
-          duration: durSec,
-          durationSec: Number(durSec.toFixed(2)),
-          startTime: s.startTime,
-          endTime: s.endTime,
-        };
-      });
-
-      let screenedOverloaded: { id: string | number; text: string; duration: number | string; reason?: string; targetWords?: number }[] = [];
-
-      // Lượt 1: Gửi Request cho AI sàng lọc
-      if (appSettings?.apiMode === 'gemini_web') {
-        try {
-          const webScreen = await screenTtsOverloadWithGeminiWeb(subtitlesToScreen, {
-            cookie: appSettings.geminiWebCookie || '',
-            snlm0e: appSettings.geminiWebSessionToken,
-          });
-          if (webScreen.success && Array.isArray(webScreen.overloadedItems)) {
-            screenedOverloaded = webScreen.overloadedItems;
-          }
-        } catch (screenErr) {
-          console.warn('[Stage 3 - Request 1] Gemini Web screening error:', screenErr);
-        }
-      }
-
-      if (screenedOverloaded.length === 0 && appSettings?.apiMode !== 'gemini_web') {
-        try {
-          const screenRes = await fetch('/api/screen-tts-overload', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              subtitles: subtitlesToScreen,
-              targetLang,
-              model: overrideModel || selectedModel,
-              apiMode: appSettings?.apiMode,
-              geminiWebCookie: appSettings?.geminiWebCookie,
-              apiKey: appSettings?.apiKey,
-              proxyUrl: appSettings?.proxyUrl,
-              proxyKey: appSettings?.proxyKey,
-              proxyTargetModel: appSettings?.proxyTargetModel,
-              customModelName: appSettings?.customModelName,
-              proxyNoApiKey: appSettings?.proxyNoApiKey,
-            }),
-          });
-          if (screenRes.ok) {
-            const screenData = await screenRes.json().catch(() => null);
-            if (screenData?.success && Array.isArray(screenData.overloadedItems)) {
-              screenedOverloaded = screenData.overloadedItems;
-            }
-          }
-        } catch (screenErr) {
-          console.warn('[Stage 3 - Request 1] Server screening error:', screenErr);
-        }
-      }
-
+      let screenedOverloaded: { id: string | number; text: string; duration: number | string; reason?: string; targetWords?: number; prevText?: string; nextText?: string }[] = [];
       let optimizedCount = 0;
 
-      // Lượt 2: Gửi tiếp một Request nữa cho AI để tối ưu lại các câu phụ đề quá tải vừa sàng lọc
-      if (screenedOverloaded.length > 0) {
-        setTranslationProgressMsg(`⚡ Bước 3/3 (Lượt 2/2): Đã phát hiện ${screenedOverloaded.length} câu quá tải. AI đang viết lại súc tích, tự nhiên...`);
-        console.log(`[handleReTranslateAll] Stage 3 - Request 2: Sending second request to AI to optimize ${screenedOverloaded.length} overloaded subtitle blocks...`);
+      if (optimizeForTts) {
+        setTranslationProgressMsg('⚡ Bước 3/3 (Lượt 1/2): Đang rà soát các câu phụ đề quá tải thời lượng đọc TTS...');
+        console.log(`[handleReTranslateAll] Stage 3 - Screening ${subtitles.length} subtitles for TTS overload...`);
 
-        let optData: any = null;
-        if (appSettings?.apiMode === 'gemini_web') {
+        const subtitlesToScreen = subtitles.map((s) => {
+          const transText = accumulatedTranslationsMap.get(String(s.id)) ?? s.translatedText ?? s.originalText ?? '';
+          const durSec = Math.max(0.4, ((s.endTime || 0) - (s.startTime || 0)) || 1.5);
+          return {
+            id: s.id,
+            text: (transText || '').trim(),
+            duration: durSec,
+            durationSec: Number(durSec.toFixed(2)),
+            startTime: s.startTime,
+            endTime: s.endTime,
+          };
+        });
+
+        if (effectiveApiMode === 'gemini_web') {
           try {
-            const webOpt = await optimizeTtsOverloadWithGeminiWeb(screenedOverloaded, {
-              cookie: appSettings.geminiWebCookie || '',
-              snlm0e: appSettings.geminiWebSessionToken,
-            });
-            if (webOpt.success && Array.isArray(webOpt.optimizedBlocks) && webOpt.optimizedBlocks.length > 0) {
-              optData = { success: true, optimizedBlocks: webOpt.optimizedBlocks };
-            }
-          } catch (optErr) {
-            console.warn('[Stage 3 - Request 2] Gemini Web optimization error:', optErr);
-          }
-        }
-
-        if (!optData) {
-          const optRes = await fetch('/api/optimize-tts-overload', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              overloadedBlocks: screenedOverloaded,
+            const webScreen = await screenTtsOverloadWithGeminiWeb(subtitlesToScreen, {
+              cookie: appSettings?.geminiWebCookie || '',
+              snlm0e: appSettings?.geminiWebSessionToken,
               targetLang,
-              model: overrideModel || selectedModel,
-              apiMode: appSettings?.apiMode,
-              geminiWebCookie: appSettings?.geminiWebCookie,
-              apiKey: appSettings?.apiKey,
-              proxyUrl: appSettings?.proxyUrl,
-              proxyKey: appSettings?.proxyKey,
-              proxyTargetModel: appSettings?.proxyTargetModel,
-              customModelName: appSettings?.customModelName,
-              proxyNoApiKey: appSettings?.proxyNoApiKey,
-            }),
-          });
-
-          if (optRes.ok) {
-            optData = await optRes.json().catch(() => null);
+            });
+            if (webScreen.success && Array.isArray(webScreen.overloadedItems)) {
+              screenedOverloaded = webScreen.overloadedItems;
+            }
+          } catch (screenErr) {
+            console.warn('[Stage 3 - Request 1] Gemini Web screening error:', screenErr);
+          }
+        } else {
+          try {
+            const screenRes = await fetch(resolveApiUrl('/api/screen-tts-overload'), {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                subtitles: subtitlesToScreen,
+                targetLang,
+                model: effectiveModel,
+                apiMode: effectiveApiMode,
+                groqApiKey: appSettings?.groqApiKey,
+                groqModel: appSettings?.groqModel,
+                geminiWebCookie: appSettings?.geminiWebCookie,
+                apiKey: appSettings?.apiKey,
+                proxyUrl: appSettings?.proxyUrl,
+                proxyKey: appSettings?.proxyKey,
+                proxyTargetModel: appSettings?.proxyTargetModel,
+                customModelName: appSettings?.customModelName,
+                proxyNoApiKey: appSettings?.proxyNoApiKey,
+              }),
+            });
+            if (screenRes.ok) {
+              const screenData = await screenRes.json().catch(() => null);
+              if (screenData?.success && Array.isArray(screenData.overloadedItems)) {
+                screenedOverloaded = screenData.overloadedItems;
+              }
+            }
+          } catch (screenErr) {
+            console.warn('[Stage 3 - Request 1] Server screening error:', screenErr);
           }
         }
 
-        if (optData && Array.isArray(optData.optimizedBlocks) && optData.optimizedBlocks.length > 0) {
-          const optMap = new Map<string, string>();
-          optData.optimizedBlocks.forEach((item: any) => {
-            if (item.id !== undefined && item.text) {
-              const clean = cleanTranslatedSubtitleText(String(item.text));
-              optMap.set(String(item.id), clean);
-            }
+        // Attach neighbor context (prevText / nextText) before rewriting so pronouns stay accurate
+        if (screenedOverloaded.length > 0) {
+          const enrichedOverloaded = screenedOverloaded.map((item) => {
+            const idx = subtitlesToScreen.findIndex((x) => String(x.id) === String(item.id));
+            return {
+              ...item,
+              prevText: idx > 0 ? subtitlesToScreen[idx - 1].text : undefined,
+              nextText: idx >= 0 && idx < subtitlesToScreen.length - 1 ? subtitlesToScreen[idx + 1].text : undefined,
+            };
           });
 
-          optimizedCount = optMap.size;
-          setSubtitles((prev) =>
-            prev.map((s) => {
-              const sId = String(s.id);
-              if (optMap.has(sId)) {
-                return { ...s, translatedText: optMap.get(sId)! };
+          setTranslationProgressMsg(`⚡ Bước 3/3 (Lượt 2/2): Phát hiện ${enrichedOverloaded.length} câu quá tải. Đang viết lại cô đọng giữ nguyên xưng hô...`);
+          let optData: any = null;
+          if (effectiveApiMode === 'gemini_web') {
+            try {
+              const webOpt = await optimizeTtsOverloadWithGeminiWeb(enrichedOverloaded, {
+                cookie: appSettings?.geminiWebCookie || '',
+                snlm0e: appSettings?.geminiWebSessionToken,
+                targetLang,
+                globalContext: activeGlobalContext,
+                glossary: runningGlossary,
+              });
+              if (webOpt.success && Array.isArray(webOpt.optimizedBlocks) && webOpt.optimizedBlocks.length > 0) {
+                optData = { success: true, optimizedBlocks: webOpt.optimizedBlocks };
               }
-              return s;
-            })
-          );
+            } catch (optErr) {
+              console.warn('[Stage 3 - Request 2] Gemini Web optimization error:', optErr);
+            }
+          } else {
+            const optRes = await fetch(resolveApiUrl('/api/optimize-tts-overload'), {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                overloadedBlocks: enrichedOverloaded,
+                targetLang,
+                model: effectiveModel,
+                globalContext: activeGlobalContext,
+                knownEntityGlossary: runningGlossary,
+                apiMode: effectiveApiMode,
+                groqApiKey: appSettings?.groqApiKey,
+                groqModel: appSettings?.groqModel,
+                geminiWebCookie: appSettings?.geminiWebCookie,
+                apiKey: appSettings?.apiKey,
+                proxyUrl: appSettings?.proxyUrl,
+                proxyKey: appSettings?.proxyKey,
+                proxyTargetModel: appSettings?.proxyTargetModel,
+                customModelName: appSettings?.customModelName,
+                proxyNoApiKey: appSettings?.proxyNoApiKey,
+              }),
+            });
+
+            if (optRes.ok) {
+              optData = await optRes.json().catch(() => null);
+            }
+          }
+
+          if (optData && Array.isArray(optData.optimizedBlocks) && optData.optimizedBlocks.length > 0) {
+            const optMap = new Map<string, string>();
+            optData.optimizedBlocks.forEach((item: any) => {
+              if (item.id !== undefined && item.text) {
+                const clean = cleanTranslatedSubtitleText(String(item.text));
+                if (clean) optMap.set(String(item.id), clean);
+              }
+            });
+
+            optimizedCount = optMap.size;
+            setSubtitles((prev) =>
+              prev.map((s) => {
+                const sId = String(s.id);
+                if (optMap.has(sId)) {
+                  return { ...s, translatedText: optMap.get(sId)! };
+                }
+                return s;
+              })
+            );
+          }
         }
       }
 
-      // Cập nhật lại từ điển thực thể hoàn chỉnh vào project context
       setGlobalContext((prev) => ({
         ...(prev || activeGlobalContext),
         knownEntityGlossary: runningGlossary,
@@ -2386,22 +2595,23 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
 
       setTranslationProgressMsg('');
       const entityCount = runningGlossary.length;
-      alert(
-        `✨ Hoàn tất quy trình dịch & tối ưu TTS 3 bước thành công!\n` +
-        `1️⃣ Bước 1 (Ngữ cảnh): Đồng bộ & áp dụng ${entityCount} nhân vật, địa danh, thế lực.\n` +
-        `2️⃣ Bước 2 (Dịch chính): Đã dịch full ${totalSubtitles} câu chuẩn cảm xúc & nghĩa gốc.\n` +
-        `3️⃣ Bước 3 (Rà soát & Tối ưu TTS 2 lượt AI):\n` +
-        `   • Lượt 1 (Sàng lọc AI): ${
-          screenedOverloaded.length > 0
-            ? `AI đã rà soát toàn bộ và phát hiện ${screenedOverloaded.length} câu quá tải thời lượng phát âm.`
-            : `AI đã rà soát toàn bộ và xác nhận 100% câu đều khớp chuẩn thời lượng phát âm!`
-        }\n` +
-        `   • Lượt 2 (Tối ưu AI): ${
-          optimizedCount > 0
-            ? `Đã gửi request riêng để AI viết lại thành công ${optimizedCount} câu súc tích, tự nhiên, bảo toàn 100% cảm xúc và xưng hô!`
-            : `Không cần rút gọn thêm.`
-        }`
-      );
+      const summaryLines = [
+        `✨ Hoàn tất dịch thuật ${optimizeForTts ? '& tối ưu TTS ' : ''}thành công!`,
+        `1️⃣ Ngữ cảnh toàn cục: Đồng bộ ${entityCount} thực thể (nhân vật, địa danh, thuật ngữ).`,
+        `2️⃣ Dịch chính (${avoidTikTokPolicy ? 'Lọc nhạy cảm TikTok' : 'Nguyên văn sát nghĩa'}): Đã dịch ${totalSubtitles} câu nối mạch trước–sau.`,
+      ];
+      if (optimizeForTts) {
+        summaryLines.push(
+          `3️⃣ Tối ưu TTS: ${
+            screenedOverloaded.length > 0
+              ? `Phát hiện ${screenedOverloaded.length} câu dài, đã viết lại cô đọng ${optimizedCount} câu giữ nguyên xưng hô.`
+              : `100% câu đạt chuẩn tốc độ đọc TTS.`
+          }`
+        );
+      } else {
+        summaryLines.push(`3️⃣ Tối ưu TTS: Đã tắt theo tùy chọn — giữ nguyên 100% bản dịch đầy đủ.`);
+      }
+      alert(summaryLines.join('\n'));
     } catch (e: any) {
       console.error(e);
       alert('Quá trình dịch bị gián đoạn:\n' + (e?.message || 'Lỗi hệ thống'));
@@ -2413,21 +2623,28 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
 
   /**
    * Chạy riêng Bước 3: Rà soát & Tối ưu các block phụ đề quá tải thời lượng cho TTS qua 2 lượt AI
-   * Lượt 1: Cho AI sàng lọc phụ đề quá tải
-   * Lượt 2: Gửi một request nữa cho AI để tối ưu lại các câu đó
    */
   const handleOptimizeTtsOverload = async (overrideModel?: GeminiModelOption) => {
     if (subtitles.length === 0) return;
+    const chosenModel = overrideModel || selectedModel;
+    const effectiveApiMode =
+      chosenModel === 'GEMINI_WEB'
+        ? 'gemini_web'
+        : (appSettings?.apiMode === 'gemini_web' && overrideModel && overrideModel !== 'GEMINI_WEB'
+          ? 'direct'
+          : (appSettings?.apiMode || 'direct'));
+    const effectiveModel = chosenModel === 'GEMINI_WEB' ? 'gemini-2.5-flash' : chosenModel;
+
     setIsTranslatingBatch(true);
     try {
-      setTranslationProgressMsg('⚡ Bước 3 (Lượt 1/2): AI đang rà soát & sàng lọc các câu phụ đề quá tải thời lượng đọc...');
+      setTranslationProgressMsg('⚡ Bước 3 (Lượt 1/2): Đang rà soát & sàng lọc các câu phụ đề quá tải thời lượng đọc...');
 
       const subtitlesToScreen = subtitles.map((s) => {
         const durSec = Math.max(0.4, ((s.endTime || 0) - (s.startTime || 0)) || 1.5);
         const text = (s.translatedText || s.originalText || '').trim();
         return {
           id: s.id,
-          text: text,
+          text,
           duration: durSec,
           durationSec: Number(durSec.toFixed(2)),
           startTime: s.startTime,
@@ -2435,14 +2652,14 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
         };
       });
 
-      let screenedOverloaded: { id: string | number; text: string; duration: number | string; reason?: string; targetWords?: number }[] = [];
+      let screenedOverloaded: { id: string | number; text: string; duration: number | string; reason?: string; targetWords?: number; prevText?: string; nextText?: string }[] = [];
 
-      // Lượt 1: AI sàng lọc
-      if (appSettings?.apiMode === 'gemini_web') {
+      if (effectiveApiMode === 'gemini_web') {
         try {
           const webScreen = await screenTtsOverloadWithGeminiWeb(subtitlesToScreen, {
-            cookie: appSettings.geminiWebCookie || '',
-            snlm0e: appSettings.geminiWebSessionToken,
+            cookie: appSettings?.geminiWebCookie || '',
+            snlm0e: appSettings?.geminiWebSessionToken,
+            targetLang,
           });
           if (webScreen.success && Array.isArray(webScreen.overloadedItems)) {
             screenedOverloaded = webScreen.overloadedItems;
@@ -2450,18 +2667,18 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
         } catch (screenErr) {
           console.warn('[handleOptimizeTtsOverload] Gemini Web screening error:', screenErr);
         }
-      }
-
-      if (screenedOverloaded.length === 0 && appSettings?.apiMode !== 'gemini_web') {
+      } else {
         try {
-          const screenRes = await fetch('/api/screen-tts-overload', {
+          const screenRes = await fetch(resolveApiUrl('/api/screen-tts-overload'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               subtitles: subtitlesToScreen,
               targetLang,
-              model: overrideModel || selectedModel,
-              apiMode: appSettings?.apiMode,
+              model: effectiveModel,
+              apiMode: effectiveApiMode,
+              groqApiKey: appSettings?.groqApiKey,
+              groqModel: appSettings?.groqModel,
               geminiWebCookie: appSettings?.geminiWebCookie,
               apiKey: appSettings?.apiKey,
               proxyUrl: appSettings?.proxyUrl,
@@ -2484,37 +2701,49 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
 
       if (screenedOverloaded.length === 0) {
         alert(
-          '✅ AI ĐÃ SÀNG LỌC TOÀN BỘ PHỤ ĐỀ!\n\n' +
-          `AI đã rà soát toàn bộ ${subtitles.length} câu thoại và xác nhận:\n` +
-          'Tất cả các câu đều khớp chuẩn thời lượng đọc tự nhiên (không có câu nào bị quá tải). Sẵn sàng tạo audio lồng tiếng hoàn hảo!'
+          '✅ ĐÃ RÀ SOÁT TOÀN BỘ PHỤ ĐỀ!\n\n' +
+          `Tất cả ${subtitles.length} câu thoại đều khớp chuẩn tốc độ đọc tự nhiên (không có câu nào bị quá tải).`
         );
         return;
       }
 
-      // Lượt 2: Gửi một request nữa cho AI để tối ưu lại
-      setTranslationProgressMsg(`⚡ Bước 3 (Lượt 2/2): Đã phát hiện ${screenedOverloaded.length} câu quá tải. AI đang viết lại súc tích, tự nhiên...`);
+      const enrichedOverloaded = screenedOverloaded.map((item) => {
+        const idx = subtitlesToScreen.findIndex((x) => String(x.id) === String(item.id));
+        return {
+          ...item,
+          prevText: idx > 0 ? subtitlesToScreen[idx - 1].text : undefined,
+          nextText: idx >= 0 && idx < subtitlesToScreen.length - 1 ? subtitlesToScreen[idx + 1].text : undefined,
+        };
+      });
+
+      setTranslationProgressMsg(`⚡ Bước 3 (Lượt 2/2): Đã phát hiện ${enrichedOverloaded.length} câu quá tải. Đang viết lại cô đọng giữ nguyên xưng hô...`);
       let optData: any = null;
-      if (appSettings?.apiMode === 'gemini_web') {
+      if (effectiveApiMode === 'gemini_web') {
         try {
-          const webOpt = await optimizeTtsOverloadWithGeminiWeb(screenedOverloaded, {
-            cookie: appSettings.geminiWebCookie || '',
-            snlm0e: appSettings.geminiWebSessionToken,
+          const webOpt = await optimizeTtsOverloadWithGeminiWeb(enrichedOverloaded, {
+            cookie: appSettings?.geminiWebCookie || '',
+            snlm0e: appSettings?.geminiWebSessionToken,
+            targetLang,
+            globalContext,
+            glossary: globalContext?.knownEntityGlossary || [],
           });
           if (webOpt.success && Array.isArray(webOpt.optimizedBlocks) && webOpt.optimizedBlocks.length > 0) {
             optData = { success: true, optimizedBlocks: webOpt.optimizedBlocks };
           }
         } catch (_) {}
-      }
-
-      if (!optData) {
-        const optRes = await fetch('/api/optimize-tts-overload', {
+      } else {
+        const optRes = await fetch(resolveApiUrl('/api/optimize-tts-overload'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            overloadedBlocks: screenedOverloaded,
+            overloadedBlocks: enrichedOverloaded,
             targetLang,
-            model: overrideModel || selectedModel,
-            apiMode: appSettings?.apiMode,
+            model: effectiveModel,
+            globalContext,
+            knownEntityGlossary: globalContext?.knownEntityGlossary || [],
+            apiMode: effectiveApiMode,
+            groqApiKey: appSettings?.groqApiKey,
+            groqModel: appSettings?.groqModel,
             geminiWebCookie: appSettings?.geminiWebCookie,
             apiKey: appSettings?.apiKey,
             proxyUrl: appSettings?.proxyUrl,
@@ -2535,7 +2764,7 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
         optData.optimizedBlocks.forEach((item: any) => {
           if (item.id !== undefined && item.text) {
             const clean = cleanTranslatedSubtitleText(String(item.text));
-            optMap.set(String(item.id), clean);
+            if (clean) optMap.set(String(item.id), clean);
           }
         });
       }
@@ -2553,8 +2782,8 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
 
         alert(
           `✨ TỐI ƯU TTS 2 LƯỢT AI THÀNH CÔNG!\n\n` +
-          `• Lượt 1 (AI sàng lọc): Phát hiện ${screenedOverloaded.length} câu thoại quá dài so với thời lượng.\n` +
-          `• Lượt 2 (AI viết lại): Đã tối ưu súc tích ${optMap.size} câu, bảo toàn trọn vẹn ngữ nghĩa, cảm xúc và cách xưng hô của nhân vật!`
+          `• Lượt 1 (Sàng lọc): Phát hiện ${screenedOverloaded.length} câu thoại quá dài so với thời lượng.\n` +
+          `• Lượt 2 (Viết lại): Đã tối ưu súc tích ${optMap.size} câu, bảo toàn trọn vẹn ngữ nghĩa, tên riêng và xưng hô!`
         );
       } else {
         alert('Không nhận được bản tối ưu từ AI hoặc các câu đã ở mức tối ưu.');
@@ -4063,6 +4292,7 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
               onImportSubtitles={setSubtitles}
               videoUrl={videoUrl}
               videoDuration={videoDuration}
+              videoDimensions={videoDimensions}
               styleConfig={{ ...styleConfig, roi } as any}
               projectTitle={projectTitle}
               onGenerateAllAudio={handleGenerateAllAudio}
@@ -4075,6 +4305,7 @@ export const CapCutEditorView: React.FC<CapCutEditorViewProps> = ({
               logoOverlays={logoOverlays}
               textOverlays={textOverlays}
               exportSettings={exportSettings}
+              onUpdateExportSettings={handleUpdateExportSettings}
               onOpenExportSettings={() => setShowExportSettingsDropdown(true)}
               onExportProgress={setExportProgress}
             />

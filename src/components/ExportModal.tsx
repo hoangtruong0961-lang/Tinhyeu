@@ -31,11 +31,12 @@ import {
   AudioEffectType,
 } from '../types';
 import { exportToSRT, exportToASS } from '../utils/srtParser';
-import { generateVoiceoverWav } from '../utils/audioExporter';
+import { generateVoiceoverWav, generateVoiceoverAudioBuffer, audioBufferToWavBlob } from '../utils/audioExporter';
 import { renderVideoWithSubtitles, RenderProgress } from '../utils/videoRenderer';
-import { exportWithCapacitorFFmpeg } from '../utils/mobileFfmpegExporter';
+import { exportWithCapacitorFFmpeg, saveBlobToAndroidDownloads } from '../utils/mobileFfmpegExporter';
 import { nativeVideoEngine, NativeEngineInfo } from '../services/nativeVideoEngine';
 import { gpuShaderEngine, GpuEngineStatus } from '../utils/gpuShaderEngine';
+import { computeExportDimensions, getMimeTypeForFormat, normalizeExportFormat } from '../utils/exportResolution';
 import {
   exportCapCutDraftZip,
   exportPremiereProProjectZip,
@@ -50,6 +51,7 @@ interface ExportModalProps {
   onImportSubtitles?: (subtitles: SubtitleItem[]) => void;
   videoUrl?: string;
   videoDuration?: number;
+  videoDimensions?: { width: number; height: number } | null;
   styleConfig?: SubtitleStyleConfig;
   projectTitle?: string;
   onGenerateAllAudio?: () => Promise<void>;
@@ -73,6 +75,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
   subtitles,
   videoUrl = '',
   videoDuration = 0,
+  videoDimensions,
   styleConfig,
   projectTitle = 'video_export',
   ttsSpeed = 1.0,
@@ -146,17 +149,34 @@ export const ExportModal: React.FC<ExportModalProps> = ({
 
   if (!isOpen) return null;
 
-  // Resolved Export Configurations
-  const currentEngine = exportSettings?.engine || (isNativeCapacitor ? 'ffmpeg_mobile' : isElectron ? 'ffmpeg_native' : 'mediabunny');
-  const currentFormat = exportSettings?.format || 'mp4';
+  // Resolved Export Configurations (cleanly validated for current platform)
+  const rawEngine = exportSettings?.engine;
+  const currentEngine =
+    rawEngine === 'ffmpeg_mobile' && isNativeCapacitor
+      ? 'ffmpeg_mobile'
+      : rawEngine === 'ffmpeg_native' && isElectron
+      ? 'ffmpeg_native'
+      : rawEngine === 'mediarecorder' || rawEngine === 'mediabunny'
+      ? rawEngine
+      : isNativeCapacitor
+      ? 'ffmpeg_mobile'
+      : isElectron
+      ? 'ffmpeg_native'
+      : 'mediabunny';
+
+  const currentFormat = normalizeExportFormat(currentEngine, exportSettings?.format || 'mp4');
   const currentResolution = exportSettings?.resolution || 'original';
   const currentFrameRate = exportSettings?.frameRate || 'original';
   const currentBitrate = exportSettings?.bitrate || 'recommended';
+  const resolvedDims = computeExportDimensions(
+    currentResolution,
+    videoDimensions?.width,
+    videoDimensions?.height
+  );
 
   const engineDisplayNames: Record<string, string> = {
-    mediabunny: 'Mediabunny (WebCodecs GPU)',
-    ffmpeg_wasm: 'FFmpeg Wasm (WebAssembly)',
-    ffmpeg_native: 'FFmpeg Native (C/C++ Desktop GPU)',
+    mediabunny: 'Mediabunny (WebCodecs Hardware)',
+    ffmpeg_native: 'FFmpeg Native (Desktop GPU/CPU)',
     ffmpeg_mobile: 'FFmpeg Mobile (Android Native)',
     mediarecorder: 'MediaRecorder (HTML5 Fallback)',
   };
@@ -186,8 +206,12 @@ export const ExportModal: React.FC<ExportModalProps> = ({
         fps: currentFrameRate === 'original' ? 30 : Number(currentFrameRate),
         videoVolume,
       });
-      triggerFileDownload(zipBlob, `${exportFileName}_CapCut_Draft.zip`, 'application/zip');
-      setProjectExportSuccess('Đã xuất thành công gói dự án CapCut Draft (.zip)!');
+      const savedPath = await triggerFileDownload(zipBlob, `${exportFileName}_CapCut_Draft.zip`, 'application/zip');
+      setProjectExportSuccess(
+        savedPath
+          ? `Đã lưu gói CapCut Draft vào: ${savedPath}`
+          : 'Đã xuất thành công gói dự án CapCut Draft (.zip)!'
+      );
       setTimeout(() => setProjectExportSuccess(null), 6000);
     } catch (err: any) {
       console.error('CapCut export error:', err);
@@ -210,8 +234,12 @@ export const ExportModal: React.FC<ExportModalProps> = ({
         textOverlays,
         fps: currentFrameRate === 'original' ? 30 : Number(currentFrameRate),
       });
-      triggerFileDownload(zipBlob, `${exportFileName}_PremierePro_XML.zip`, 'application/zip');
-      setProjectExportSuccess('Đã xuất thành công gói sequence XML cho Adobe Premiere Pro & DaVinci Resolve!');
+      const savedPath = await triggerFileDownload(zipBlob, `${exportFileName}_PremierePro_XML.zip`, 'application/zip');
+      setProjectExportSuccess(
+        savedPath
+          ? `Đã lưu Premiere/DaVinci XML vào: ${savedPath}`
+          : 'Đã xuất thành công gói sequence XML cho Adobe Premiere Pro & DaVinci Resolve!'
+      );
       setTimeout(() => setProjectExportSuccess(null), 6000);
     } catch (err: any) {
       console.error('Premiere export error:', err);
@@ -236,8 +264,12 @@ export const ExportModal: React.FC<ExportModalProps> = ({
         textOverlays,
         fps: currentFrameRate === 'original' ? 30 : Number(currentFrameRate),
       });
-      triggerFileDownload(zipBlob, `${exportFileName}_Master_Project_Bundle.zip`, 'application/zip');
-      setProjectExportSuccess('Đã xuất thành công toàn bộ gói Master Archive (.zip)!');
+      const savedPath = await triggerFileDownload(zipBlob, `${exportFileName}_Master_Project_Bundle.zip`, 'application/zip');
+      setProjectExportSuccess(
+        savedPath
+          ? `Đã lưu Master Bundle vào: ${savedPath}`
+          : 'Đã xuất thành công toàn bộ gói Master Archive (.zip)!'
+      );
       setTimeout(() => setProjectExportSuccess(null), 6000);
     } catch (err: any) {
       console.error('Master bundle export error:', err);
@@ -248,25 +280,33 @@ export const ExportModal: React.FC<ExportModalProps> = ({
   };
 
   // 4. Download Standalone Subtitle Files
-  const handleDownloadSubtitleOnly = (format: 'srt' | 'ass' | 'vtt') => {
-    let content = '';
-    const mimeType = 'text/plain';
-    const ext = format;
+  const handleDownloadSubtitleOnly = async (format: 'srt' | 'ass' | 'vtt') => {
+    try {
+      let content = '';
+      const mimeType = format === 'srt' ? 'application/x-subrip' : 'text/plain';
+      const ext = format;
 
-    if (format === 'srt') {
-      content = exportToSRT(subtitles);
-    } else if (format === 'ass') {
-      content = exportToASS(subtitles, styleConfig || ({} as SubtitleStyleConfig));
-    } else if (format === 'vtt') {
-      const formatVttTime = (sec: number) => {
-        const d = new Date(sec * 1000);
-        return d.toISOString().substr(11, 12);
-      };
-      content = `WEBVTT\n\n` + subtitles.map((s, i) => `${i + 1}\n${formatVttTime(s.startTime)} --> ${formatVttTime(s.endTime)}\n${s.translatedText || s.originalText}\n`).join('\n');
+      if (format === 'srt') {
+        content = exportToSRT(subtitles);
+      } else if (format === 'ass') {
+        content = exportToASS(subtitles, styleConfig || ({} as SubtitleStyleConfig));
+      } else if (format === 'vtt') {
+        const formatVttTime = (sec: number) => {
+          const d = new Date(sec * 1000);
+          return d.toISOString().substr(11, 12);
+        };
+        content = `WEBVTT\n\n` + subtitles.map((s, i) => `${i + 1}\n${formatVttTime(s.startTime)} --> ${formatVttTime(s.endTime)}\n${s.translatedText || s.originalText}\n`).join('\n');
+      }
+
+      const blob = new Blob([content], { type: `${mimeType};charset=utf-8` });
+      const savedPath = await triggerFileDownload(blob, `${exportFileName}.${ext}`, mimeType);
+      if (savedPath) {
+        setProjectExportSuccess(`Đã lưu phụ đề .${ext.toUpperCase()} vào: ${savedPath}`);
+        setTimeout(() => setProjectExportSuccess(null), 6000);
+      }
+    } catch (err: any) {
+      alert(`Lỗi tải phụ đề .${format.toUpperCase()}: ${err?.message || err}`);
     }
-
-    const blob = new Blob([content], { type: `${mimeType};charset=utf-8` });
-    triggerFileDownload(blob, `${exportFileName}.${ext}`, mimeType);
   };
 
   // Main Video Export Process
@@ -288,34 +328,29 @@ export const ExportModal: React.FC<ExportModalProps> = ({
     });
 
     const cleanFileName = exportFileName.trim() || 'video_export';
-    let targetWidth: number | undefined;
-    let targetHeight: number | undefined;
-
-    if (currentResolution === '4k') {
-      targetWidth = 3840;
-      targetHeight = 2160;
-    } else if (currentResolution === '2k') {
-      targetWidth = 2560;
-      targetHeight = 1440;
-    } else if (currentResolution === '1080p') {
-      targetWidth = 1920;
-      targetHeight = 1080;
-    } else if (currentResolution === '720p') {
-      targetWidth = 1280;
-      targetHeight = 720;
-    } else if (currentResolution === '480p') {
-      targetWidth = 854;
-      targetHeight = 480;
-    }
-
+    const targetWidth = currentResolution === 'original' ? undefined : resolvedDims?.width;
+    const targetHeight = currentResolution === 'original' ? undefined : resolvedDims?.height;
     const targetFps = currentFrameRate === 'original' ? undefined : Number(currentFrameRate);
     const targetBitrate = currentBitrate === 'recommended' ? undefined : Number(currentBitrate);
+
+    const hasCanvasOnlyOverlays =
+      blurOverlays.length > 0 ||
+      logoOverlays.length > 0 ||
+      textOverlays.length > 0 ||
+      styleConfig?.orientation === 'vertical' ||
+      Boolean(styleConfig?.hasSecondaryOutline) ||
+      Boolean(styleConfig?.customUploadedFonts && styleConfig.customUploadedFonts.length > 0);
 
     try {
       window.electronAPI?.preventSleep?.();
 
-      if (currentEngine === 'ffmpeg_native' && isElectron && window.electronAPI?.renderSubtitledVideo) {
-        setExportStatus('Đang gọi FFmpeg C/C++ GPU Native...');
+      if (
+        currentEngine === 'ffmpeg_native' &&
+        isElectron &&
+        window.electronAPI?.renderSubtitledVideo &&
+        !hasCanvasOnlyOverlays
+      ) {
+        setExportStatus('Đang gọi FFmpeg C/C++ Native...');
         let unsubProgress: (() => void) | undefined;
         if (window.electronAPI?.onFfmpegRenderProgress) {
           unsubProgress = window.electronAPI.onFfmpegRenderProgress((p) => {
@@ -324,7 +359,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
               percentage: pct,
               currentTime: p.currentTime || (p.duration ? (pct / 100) * p.duration : 0),
               duration: p.duration || videoDuration || 1,
-              status: `FFmpeg Native GPU: ${p.timeStr || `${pct}%`} (${pct}%)`,
+              status: `FFmpeg Native: ${p.timeStr || `${pct}%`} (${pct}%)`,
             };
             setRenderProgress(progressData);
             onExportProgress?.(progressData);
@@ -333,10 +368,40 @@ export const ExportModal: React.FC<ExportModalProps> = ({
         }
 
         try {
-          const assContent = exportToASS(subtitles, styleConfig || ({} as SubtitleStyleConfig));
+          const assContent = exportToASS(
+            subtitles,
+            styleConfig || ({} as SubtitleStyleConfig),
+            'translated',
+            targetWidth || videoDimensions?.width || 1920,
+            targetHeight || videoDimensions?.height || 1080
+          );
+
+          let audioWavBase64: string | undefined;
+          if (mergeTtsAudioIntoVideo && subtitles.some((s) => s.audioUrl?.trim())) {
+            setExportStatus('Đang tổng hợp track âm thanh thuyết minh TTS...');
+            try {
+              const voiceRes = await generateVoiceoverAudioBuffer(
+                subtitles,
+                Math.max(1, videoDuration || 10),
+                ttsSpeed,
+                ttsPitch
+              );
+              const wavBlob = audioBufferToWavBlob(voiceRes.buffer);
+              const wavBytes = new Uint8Array(await wavBlob.arrayBuffer());
+              let bin = '';
+              for (let i = 0; i < wavBytes.length; i += 0x8000) {
+                bin += String.fromCharCode(...wavBytes.subarray(i, Math.min(i + 0x8000, wavBytes.length)));
+              }
+              audioWavBase64 = btoa(bin);
+            } catch (ttsErr) {
+              console.warn('[Electron FFmpeg] Could not synthesize TTS WAV:', ttsErr);
+            }
+          }
+
           const res = await window.electronAPI.renderSubtitledVideo({
             inputVideoPath: videoUrl,
             assContent,
+            audioWavBase64,
             outputPath: `${cleanFileName}.${currentFormat}`,
             videoDuration,
             options: {
@@ -344,6 +409,12 @@ export const ExportModal: React.FC<ExportModalProps> = ({
               subMode: 'hardsub',
               videoVolume,
               videoAudioEffect: videoAudioEffect || exportSettings?.videoAudioEffect,
+              resolution: currentResolution,
+              targetWidth,
+              targetHeight,
+              fps: targetFps,
+              bitrate: targetBitrate,
+              format: currentFormat,
             },
           });
 
@@ -356,8 +427,8 @@ export const ExportModal: React.FC<ExportModalProps> = ({
         } finally {
           unsubProgress?.();
         }
-      } else if (currentEngine === 'ffmpeg_mobile' || (isNativeCapacitor && !isElectron)) {
-        setExportStatus('Đang khởi chạy FFmpeg Mobile Engine...');
+      } else if (currentEngine === 'ffmpeg_mobile' && isNativeCapacitor && !isElectron) {
+        setExportStatus('Đang khởi chạy FFmpeg Mobile Native Engine...');
         const defaultStyle: SubtitleStyleConfig = styleConfig || {
           fontSize: 20,
           fontColor: '#ffffff',
@@ -378,6 +449,9 @@ export const ExportModal: React.FC<ExportModalProps> = ({
             onExportProgress?.(p);
           },
           {
+            fileName: cleanFileName,
+            format: currentFormat,
+            resolution: currentResolution,
             blurOverlays,
             logoOverlays,
             textOverlays,
@@ -389,23 +463,35 @@ export const ExportModal: React.FC<ExportModalProps> = ({
             videoDuration,
             width: targetWidth,
             height: targetHeight,
+            fps: targetFps,
             bitrate: targetBitrate,
+            gpuAcceleration: isGpuAccelerated,
           }
         );
 
-        const fileExt = currentFormat;
-        const url = URL.createObjectURL(mobileRes.blob);
-        const link = document.createElement('a');
-        link.href = url;
-        link.download = `${cleanFileName}.${fileExt}`;
-        document.body.appendChild(link);
-        link.click();
-        document.body.removeChild(link);
-        URL.revokeObjectURL(url);
-        setExportSuccessMsg('Đã xuất video thành công qua FFmpeg Mobile!');
+        const actualExt = mobileRes.formatUsed || currentFormat;
+        if (mobileRes.savedPath) {
+          setLastExportedFilePath(mobileRes.savedPath);
+          setExportSuccessMsg(`Đã xuất & lưu .${actualExt.toUpperCase()} thành công (${mobileRes.engineUsed})!`);
+        } else if (mobileRes.blob) {
+          const url = URL.createObjectURL(mobileRes.blob);
+          const link = document.createElement('a');
+          link.href = url;
+          link.download = `${cleanFileName}.${actualExt}`;
+          document.body.appendChild(link);
+          link.click();
+          document.body.removeChild(link);
+          URL.revokeObjectURL(url);
+          setExportSuccessMsg(`Đã xuất .${actualExt.toUpperCase()} thành công qua ${mobileRes.engineUsed}!`);
+        }
       } else {
-        // Mediabunny / FFmpeg Wasm / MediaRecorder Export (Web / Desktop fallback)
-        setExportStatus('Đang render video với Unified Canvas & WebGPU Engine...');
+        // Mediabunny / MediaRecorder Export
+        const selectedWebEngine = currentEngine === 'mediarecorder' ? 'mediarecorder' : 'mediabunny';
+        setExportStatus(
+          selectedWebEngine === 'mediarecorder'
+            ? 'Đang render video với HTML5 MediaRecorder...'
+            : 'Đang render video với Unified Canvas & Mediabunny WebCodecs...'
+        );
         const defaultStyle: SubtitleStyleConfig = styleConfig || {
           fontSize: 20,
           fontColor: '#ffffff',
@@ -417,7 +503,6 @@ export const ExportModal: React.FC<ExportModalProps> = ({
           outlineColor: '#000000',
         };
 
-        const formatToUse = currentFormat === 'webm' ? 'webm' : 'mp4';
         const { blob: renderedBlob, formatUsed } = await renderVideoWithSubtitles(
           videoUrl,
           subtitles,
@@ -427,8 +512,9 @@ export const ExportModal: React.FC<ExportModalProps> = ({
             onExportProgress?.(p);
             window.electronAPI?.setProgressBar?.(p.percentage / 100);
           },
-          formatToUse,
+          currentFormat,
           {
+            engine: selectedWebEngine,
             blurOverlays,
             logoOverlays,
             textOverlays,
@@ -438,23 +524,35 @@ export const ExportModal: React.FC<ExportModalProps> = ({
             videoVolume,
             videoAudioEffect: videoAudioEffect || exportSettings?.videoAudioEffect,
             videoDuration,
+            resolution: currentResolution,
             targetWidth,
             targetHeight,
             fps: targetFps,
             bitrate: targetBitrate,
+            gpuAcceleration: isGpuAccelerated,
           }
         );
 
-        const fileExt = formatUsed === 'mp4' ? 'mp4' : currentFormat === 'webm' ? 'webm' : 'mp4';
-        const url = URL.createObjectURL(renderedBlob);
-        const link = document.createElement('a');
-        link.href = url;
-        link.download = `${cleanFileName}.${fileExt}`;
-        document.body.appendChild(link);
-        link.click();
-        document.body.removeChild(link);
-        URL.revokeObjectURL(url);
-        setExportSuccessMsg('Đã render và tải về video hoàn tất!');
+        const fileExt = formatUsed || 'mp4';
+        if (isNativeCapacitor && Capacitor.getPlatform() === 'android') {
+          const saved = await saveBlobToAndroidDownloads(
+            renderedBlob,
+            `${cleanFileName}.${fileExt}`,
+            getMimeTypeForFormat(fileExt)
+          );
+          setLastExportedFilePath(saved.savedPath);
+          setExportSuccessMsg(`Đã render và lưu .${fileExt.toUpperCase()} vào thư mục Download!`);
+        } else {
+          const url = URL.createObjectURL(renderedBlob);
+          const link = document.createElement('a');
+          link.href = url;
+          link.download = `${cleanFileName}.${fileExt}`;
+          document.body.appendChild(link);
+          link.click();
+          document.body.removeChild(link);
+          URL.revokeObjectURL(url);
+          setExportSuccessMsg(`Đã render và tải về .${fileExt.toUpperCase()} hoàn tất!`);
+        }
       }
 
       window.electronAPI?.setProgressBar?.(-1);
@@ -595,6 +693,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                     <span className="text-[10px] text-zinc-400 block">Độ phân giải:</span>
                     <span className="font-medium text-zinc-200 mt-0.5 block">
                       {currentResolution === 'original' ? 'Độ phân giải gốc' : currentResolution.toUpperCase()}
+                      {resolvedDims ? ` (${resolvedDims.width}×${resolvedDims.height})` : ''}
                     </span>
                   </div>
                   <div className="p-2.5 rounded-lg bg-[#141418] border border-zinc-800/60">
@@ -616,9 +715,9 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                     </div>
                     <div>
                       <div className="text-xs font-semibold text-zinc-200 flex items-center gap-2">
-                        <span>Tăng Tốc Phần Cứng (GPU Acceleration)</span>
+                        <span>Tăng Tốc Phần Cứng (Hardware Encode)</span>
                         <span className="text-[10px] px-1.5 py-0.2 rounded bg-amber-500/15 text-amber-300 font-mono">
-                          3-5X Nhanh Hơn
+                          {isNativeCapacitor ? 'MediaCodec' : isElectron ? 'NVENC/QSV' : 'WebCodecs'}
                         </span>
                       </div>
                       <div className="text-[10.5px] text-zinc-400 font-mono mt-0.5">
